@@ -1,0 +1,27 @@
+{
+  "manifest_version": 2,
+  "name": "Axiom RSI Extractor",
+  "version": "1.0",
+  "description": "Extracts RSI value from TradingView blob iframe",
+  "permissions": [
+    "<all_urls>",
+    "webRequest",
+    "webRequestBlocking",
+	"tabs",
+    "activeTab",
+    "http://localhost:5000/",
+    "storage"
+  ],
+  "background": {
+    "scripts": ["background.js"],
+	"persistent": true
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://axiom.trade/meme/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle",
+      "all_frames": true
+    }
+  ]
+}
