@@ -50,7 +50,10 @@
 		white-space: pre-wrap;
 		font-family: monospace;
 		font-size: 14px;
-	  }
+		line-height: 1.4;
+		overflow: hidden;
+		}
+
 	</style>
 
 </head>
@@ -89,7 +92,7 @@
 		  analysis, error
 		} = token;
 
-		const format = (label, val) => `${label}: ${val !== null && val !== undefined ? val : 'N/A'}`;
+		const format = (label, val) => `${label}: ${val ?? 'N/A'}`;
 
 		const priceCol = [
 		  format('🟢 Open', open),
@@ -133,8 +136,18 @@
 			format('⚡ Momentum', analysis.momentum),
 			format('🌊 Volatility', analysis.volatility),
 			'',
-			...(analysis.notes || []).map(n => `• ${n}`)
-		  ].join('\n');
+			...(analysis.notes?.length
+				? analysis.notes.map(n => {
+					if (n.startsWith("📏")) return `📏 ${n.slice(2)}`;
+					if (n.startsWith("🚀")) return `🚀 ${n.slice(2)}`;
+					if (n.startsWith("💚")) return `💚 ${n.slice(2)}`;
+					if (n.startsWith("❤️")) return `❤️ ${n.slice(2)}`;
+					return `• ${n}`;
+				})
+				: ["• No signals"])
+			].join('\n');
+
+
 		}
       const rowId = `row-${addr}`;
       let row = document.getElementById(rowId);
@@ -196,10 +209,10 @@
     }
   }
 
-  fetch('/data?tf=1s').then(res => res.json()).then(data => {
+  fetch('/data?tf=1S').then(res => res.json()).then(data => {
     for (const addr in data) {
       if (!selectedTF[addr]) {
-        selectedTF[addr] = "1s";
+        selectedTF[addr] = "1S";
       }
     }
     refresh(); // ⏳ wait for tokens to be initialized

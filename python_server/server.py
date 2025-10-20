@@ -3,6 +3,9 @@ from datetime import datetime
 import traceback
 from analysis import analyze_token
 from indicators import get_indicators_for_token
+from pathlib import Path
+import json
+import os
 
 app = Flask(__name__)
 token_data = {}  # { address: { name: ..., timeframes: { "1s": [...] }, updated: ... } }
@@ -28,7 +31,7 @@ def data():
             continue
 
         try:
-            indicators = get_indicators_for_token(addr, tf, candles)
+            indicators = get_indicators_for_token(candles)
 
             latest = candles[-1]
             price_data = {
@@ -54,6 +57,23 @@ def data():
                 **indicators,
                 "analysis": analysis_result
             }
+            
+            # ✅ Logging to file
+            # print(f"✅ Logged {token['name']} - {tf} timeframe")
+            # log_entry = {
+            #     "name": token["name"],
+            #     "address": addr,
+            #     "timeframe": tf,
+            #     **price_data,
+            #     **indicators,
+            #     "analysis": analysis_result
+            # }
+            #
+            # log_dir = r"C:\Users\vamsh\Downloads\TA MV2\Training data"
+            # os.makedirs(log_dir, exist_ok=True)  # Ensure dir exists
+            # log_path = Path(log_dir) / "training_data.jsonl"
+            # with open(log_path, "a", encoding="utf-8") as f:
+            #     f.write(json.dumps(log_entry, ensure_ascii=False) + "\n")
 
         except Exception as e:
             error_trace = traceback.format_exc()
@@ -64,6 +84,10 @@ def data():
             }
 
     return jsonify(result)
+
+
+DATA_DIR = Path("C:/Users/vamsh/Downloads/TA MV2/CandleData")
+DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 @app.route('/receive', methods=["POST"])
 def receive():
@@ -83,7 +107,7 @@ def receive():
             return jsonify({"status": "error", "message": "Missing token address"}), 400
 
         # Initialize for new token
-        if address not in token_data:
+        if address not in token_data or isInitialData:
             token_data[address] = {
                 "name": name,
                 "timeframes": {
@@ -100,25 +124,43 @@ def receive():
             
         tf = token_data[address]["timeframes"]
 
-        for tf_key in tf.keys():            
+        for tf_key in tf.keys():
             if tf_key in candles_by_tf:
                 new_candles = list(candles_by_tf[tf_key].values())
-                tf[tf_key].extend(new_candles)
-                # Keep max N candles per timeframe
-                max_len = 300 if tf_key in ["1S", "5S", "15S", "30S"] else (200 if tf_key == "1" else 50)
-                tf[tf_key] = tf[tf_key][-max_len:]
+                print(f"  ⏱️ {tf_key}: {len(new_candles)} new candles")
+                # Deduplicate by timestamp
+                existing = {c["timestamp"]: c for c in tf[tf_key]}
+                for c in new_candles:
+                    existing[c["timestamp"]] = c
+                tf[tf_key] = list(sorted(existing.values(), key=lambda x: x["timestamp"]))
 
+                # Keep max N candles per timeframe (3 hours worth)
+                tf_seconds = timeframe_to_seconds(tf_key)
+                max_len = 18000 // tf_seconds
+                tf[tf_key] = tf[tf_key][-max_len:]
         
         
         #process_new_candles(address, candles)    
         token_data[address]["updated"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         print("Token data updated at:", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
 
-        print(f"📥 Received {len(candles_by_tf)} candles for {name} ({address})")
+        out_file = DATA_DIR / f"{address}.json"
+        with out_file.open("w") as f:
+            json.dump(token_data[address], f, indent=2)
+
+
+        #print(f"📥 Received {len(candles_by_tf)} candles for {name} ({address})")
         return jsonify({"status": "ok"})
     
     # Always return a response if payloadID is missing
     return jsonify({"status": "error", "message": "Missing or invalid payload ID"}), 400
+
+def timeframe_to_seconds(tf_key):
+    if tf_key.endswith("S"):
+        return int(tf_key[:-1])  # e.g., "15S" -> 15
+    else:
+        return int(tf_key) * 60  # e.g., "1", "3", "5" -> 60, 180, 300
+
 
 @app.after_request
 def cors_headers(resp):
