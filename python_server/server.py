@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify, render_template
+from flask import Flask, request, jsonify, render_template, make_response
 from datetime import datetime
 import traceback
 from analysis import analyze_token
@@ -8,7 +8,7 @@ import json
 import os
 
 app = Flask(__name__)
-token_data = {}  # { address: { name: ..., timeframes: { "1s": [...] }, updated: ... } }
+token_data = {}  
 
 @app.route('/')
 def dashboard():
@@ -89,8 +89,12 @@ def data():
 DATA_DIR = Path("C:/Users/vamsh/Downloads/TA MV2/CandleData")
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-@app.route('/receive', methods=["POST"])
+
+@app.route('/receive', methods=["POST", "OPTIONS"])
 def receive():
+    if request.method == "OPTIONS":
+        return _build_cors_preflight_response()
+    
     data = request.get_json()
     payloadID = data.get("id", None)
     candles_by_tf = data.get("candles", [])
@@ -164,17 +168,22 @@ def timeframe_to_seconds(tf_key):
 
 @app.after_request
 def cors_headers(resp):
-    resp.headers['Access-Control-Allow-Origin'] = '*'
+    resp.headers['Access-Control-Allow-Origin'] = 'https://axiom.trade' # Better than '*' for security
     resp.headers['Access-Control-Allow-Headers'] = '*'
     resp.headers['Access-Control-Allow-Methods'] = '*'
+    # Add this specific header for Private Network Access
+    resp.headers['Access-Control-Allow-Private-Network'] = 'true'
     return resp
+
+def _build_cors_preflight_response():
+    response = make_response()
+    response.headers["Access-Control-Allow-Origin"] = "https://axiom.trade"
+    response.headers["Access-Control-Allow-Methods"] = "POST, GET, OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type, Access-Control-Allow-Private-Network"
+    # This is the "magic" key that unlocks the loopback space
+    response.headers["Access-Control-Allow-Private-Network"] = "true"
+    return response
 
 if __name__ == '__main__':
     print("Starting server...")
     app.run(debug=False)
-
-
-# Candle {'1': {'1754166840000': {'timestamp': 1754166840000, 'open': 77238.4034895985, 'high': 77280.15006279225, 'low': 55450.13027832765, 'close': 60536.06407743671, 'volume': 15060.589273802372}, '1754166900000': {'timestamp': 1754166900000, 'open': 60536.06407743671, 'high': 68500.34510114716, 'low': 58553.26923861177, 'close': 64328.94255659289, 'volume': 8120.336672921897}, '1754166960000': {'timestamp': 1754166960000, 'open': 64328.94255659289, 'high': 83627.04970275494, 'low': 55112.86036729681, 'close': 66611.06935553355, 'volume': 17856.096628593506}, '1754167020000': {'timestamp': 1754167020000, 'open': 66611.06935553355, 'high': 66453.43957294626, 'low': 51971.30238537541, 'close': 59881.07092546184, 'volume': 8723.889263105943}, '1754167080000': {'timestamp': 1754167080000, 'open': 59881.07092546184, 'high': 61446.182538070905, 'low': 50614.18603808159, 'close': 53829.986412086175, 'volume': 4081.0638193682257}}, 
-#         '3': {'1754166960000': {'timestamp': 1754166960000, 'open': 64328.94255659289, 'high': 83627.04970275494, 'low': 50614.18603808159, 'close': 53829.986412086175, 'volume': 30661.049711067673}}, 
-#         '5': {'1754166900000': {'timestamp': 1754166900000, 'open': 60536.06407743671, 'high': 83627.04970275494, 'low': 50614.18603808159, 'close': 53829.986412086175, 'volume': 38781.38638398957}}, 
-#         '15S': {'1754167036506': {'timestamp': 1754167036506, 'open': 64249.27787270253, 'high': 64898.2604774773, 'low': 64249.27787270253, 'close': 64898.2604774773, 'volume': 0.01}}, 

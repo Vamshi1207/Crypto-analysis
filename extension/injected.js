@@ -31,11 +31,20 @@ window.addEventListener("message", (event) => {
   const { engine, datafeed } = await waitForChart();
   console.log("🔍 Available resolve keys:", Object.keys(engine._resolveRequests));
 
-  const symbolInfo = await engine._resolveRequests[token.name.toUpperCase() ];
-	if (!symbolInfo) {
-	  console.error("❌ Could not resolve symbol info for", token.name);
-	  return;
-	}
+  const mint = token.address;
+
+  // Find the key that starts with your mint address (case-insensitive)
+  const resolveKey = Object.keys(engine._resolveRequests).find(key => 
+    key.toUpperCase().startsWith(mint.toUpperCase())
+  );
+
+  const symbolInfo = engine._resolveRequests[resolveKey];
+
+  if (!symbolInfo) {
+    console.error("❌ Could not resolve symbol info for", token.name, mint);
+    return;
+  }
+
 
   const resolutions = ["1S", "5S", "15S", "30S", "1", "3", "5"];
   const secondsPerBar = {
