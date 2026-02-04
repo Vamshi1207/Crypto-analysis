@@ -76,25 +76,3 @@ function setupIframeInjection() {
     }
   });
 }
-
-// Listen for messages from iframe and send to Python server
-window.addEventListener("message", (event) => {
-  if (event.data?.type === "candles") {
-    const payload = {
-      id: event.data.id,
-      candles: event.data.payload,
-      token: event.data.token || { address: "unknown", name: "unknown" },
-      initial: event.data.initial
-    };
-
-    console.log("📨 Sending payload:", payload);
-
-    fetch("http://localhost:5000/receive", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload)
-    })
-      .then(() => console.log("✅ Sent candle data to server (ID:", payload.id, ")"))
-      .catch(err => console.error("❌ Failed to send candle data to server:", err));
-  }
-});
