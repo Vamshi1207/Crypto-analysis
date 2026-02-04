@@ -1,4 +1,5 @@
 from flask import Flask, request, jsonify, render_template, make_response
+from flask_sock import Sock
 from datetime import datetime
 import traceback
 from analysis import analyze_token
@@ -8,6 +9,7 @@ import json
 import os
 
 app = Flask(__name__)
+sock = Sock(app)
 token_data = {}  
 
 @app.route('/')
@@ -90,28 +92,22 @@ DATA_DIR = Path("C:/Users/vamsh/Downloads/TA MV2/CandleData")
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 
-@app.route('/receive', methods=["POST", "OPTIONS"])
-def receive():
-    if request.method == "OPTIONS":
-        return _build_cors_preflight_response()
-    
-    data = request.get_json()
+def _process_payload(data):
     payloadID = data.get("id", None)
     candles_by_tf = data.get("candles", [])
     token = data.get("token", {})
     address = token.get("address", "unknown")
     name = token.get("name", "Unknown")
-    isInitialData = bool(data.get("initial", "False"))  
+    is_initial_data = bool(data.get("initial", False))
 
     #print("Candle", candles_by_tf)
     
     if payloadID:
-
         if not address or address == "unknown":
-            return jsonify({"status": "error", "message": "Missing token address"}), 400
+            return {"status": "error", "message": "Missing token address"}, False
 
         # Initialize for new token
-        if address not in token_data or isInitialData:
+        if address not in token_data or is_initial_data:
             token_data[address] = {
                 "name": name,
                 "timeframes": {
@@ -154,10 +150,38 @@ def receive():
 
 
         #print(f"📥 Received {len(candles_by_tf)} candles for {name} ({address})")
-        return jsonify({"status": "ok"})
+        return {"status": "ok"}, True
     
     # Always return a response if payloadID is missing
-    return jsonify({"status": "error", "message": "Missing or invalid payload ID"}), 400
+    return {"status": "error", "message": "Missing or invalid payload ID"}, False
+
+
+@app.route('/receive', methods=["POST", "OPTIONS"])
+def receive():
+    if request.method == "OPTIONS":
+        return _build_cors_preflight_response()
+
+    data = request.get_json()
+    result, success = _process_payload(data)
+    status_code = 200 if success else 400
+    return jsonify(result), status_code
+
+
+@sock.route('/ws')
+def websocket(ws):
+    while True:
+        message = ws.receive()
+        if message is None:
+            break
+
+        try:
+            payload = json.loads(message)
+        except json.JSONDecodeError:
+            ws.send(json.dumps({"status": "error", "message": "Invalid JSON"}))
+            continue
+
+        result, _success = _process_payload(payload)
+        ws.send(json.dumps(result))
 
 def timeframe_to_seconds(tf_key):
     if tf_key.endswith("S"):
