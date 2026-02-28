@@ -88,8 +88,10 @@ def data():
     return jsonify(result)
 
 
-DATA_DIR = Path(r"C:\Users\vamsh\Downloads\TA MV2\python_server\ML_Training_datasets\CandleData")
-DATA_DIR.mkdir(parents=True, exist_ok=True)
+DATA_DIR_CANDLES = Path(r"C:\Users\vamsh\Downloads\TA MV2\python_server\ML_Training_datasets\CandleData\Candles")
+DATA_DIR_STATS = Path(r"C:\Users\vamsh\Downloads\TA MV2\python_server\ML_Training_datasets\CandleData\Stats")
+DATA_DIR_CANDLES.mkdir(parents=True, exist_ok=True)
+DATA_DIR_STATS.mkdir(parents=True, exist_ok=True)
 
 
 def _process_payload(data):
@@ -156,8 +158,8 @@ def _process_payload(data):
 
         token_snapshot = token_data[address]
 
-        candle_file = DATA_DIR / f"{address}_candles.json"
-        stats_file = DATA_DIR / f"{address}_stats.json"
+        candle_file = DATA_DIR_CANDLES / f"{address}_candles.json"
+        stats_file = DATA_DIR_STATS / f"{address}_stats.json"
 
         with candle_file.open("w", encoding="utf-8") as f:
             json.dump({
