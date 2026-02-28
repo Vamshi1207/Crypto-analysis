@@ -153,7 +153,7 @@ window.addEventListener("message", (event) => {
   console.log("✅ Initial bars and stats fetched");
   sendToParent(initialPayload, true);
   console.log("✅ Initial payload sent");
-  startSubscriptions();
+  //startSubscriptions();
 
 	const latestBars = {};
 	const lastBarTime = {};  // Track last sent bar time per resolution
