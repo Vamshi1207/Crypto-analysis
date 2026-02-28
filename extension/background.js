@@ -3,6 +3,71 @@
 // --------------------
 // Helper functions
 // --------------------
+const WS_URL = "ws://localhost:5000/ws";
+let ws;
+let wsConnected = false;
+let wsReconnectTimer = null;
+const wsQueue = [];
+
+function connectWebSocket() {
+  if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+    return;
+  }
+
+  ws = new WebSocket(WS_URL);
+
+  ws.addEventListener("open", () => {
+    wsConnected = true;
+    flushWebSocketQueue();
+    console.log("✅ [BG] WebSocket connected");
+  });
+
+  ws.addEventListener("close", () => {
+    wsConnected = false;
+    console.warn("⚠️ [BG] WebSocket closed, retrying...");
+    scheduleWebSocketReconnect();
+  });
+
+  ws.addEventListener("error", (err) => {
+    wsConnected = false;
+    console.warn("❌ [BG] WebSocket error:", err);
+    try {
+      ws.close();
+    } catch (closeErr) {
+      console.warn("❌ [BG] WebSocket close error:", closeErr);
+    }
+  });
+
+  ws.addEventListener("message", (event) => {
+    console.log("📨 [BG] WebSocket message:", event.data);
+  });
+}
+
+function scheduleWebSocketReconnect() {
+  if (wsReconnectTimer) return;
+  wsReconnectTimer = setTimeout(() => {
+    wsReconnectTimer = null;
+    connectWebSocket();
+  }, 1000);
+}
+
+function flushWebSocketQueue() {
+  while (wsQueue.length && wsConnected) {
+    ws.send(wsQueue.shift());
+  }
+}
+
+function sendToServer(payload) {
+  const message = JSON.stringify(payload);
+  if (wsConnected) {
+    ws.send(message);
+    return;
+  }
+
+  wsQueue.push(message);
+  connectWebSocket();
+}
+
 function isMemePage(url) {
   return url?.startsWith("https://axiom.trade/meme/");
 }
@@ -53,6 +118,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (!sender.tab) return;
 
   const tabId = sender.tab.id;
+  connectWebSocket();
 
   // --------------------
   // Inject script into blob iframe
@@ -94,22 +160,24 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   // Forward candle data to local server
   // --------------------
   if (msg?.type === "candles") {
-    const payload = { candles: msg.payload, token: msg.token, initial: msg.initial };
+    const payload = {
+      id: msg.id,
+      candles: msg.payload,
+      token: msg.token,
+      initial: msg.initial
+    };
 
-    fetch("http://localhost:5000/receive", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload)
-    })
-    .then(() => {
-      console.log("✅ [BG] Candles sent for", msg.token?.name);
-      sendResponse({ status: "ok" });
-    })
-    .catch(err => {
-      console.warn("❌ [BG] Failed to send:", err);
+    try {
+      sendToServer(payload);
+      console.log("✅ [BG] Candles queued for", msg.token?.name);
+      sendResponse({ status: "queued" });
+    } catch (err) {
+      console.warn("❌ [BG] Failed to queue:", err);
       sendResponse({ status: "error", error: err.toString() });
-    });
+    }
 
     return true; // keep sendResponse alive
   }
 });
+
+connectWebSocket();

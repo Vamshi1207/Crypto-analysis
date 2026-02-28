@@ -1,4 +1,5 @@
 from flask import Flask, request, jsonify, render_template, make_response
+from flask_sock import Sock
 from datetime import datetime
 import traceback
 from analysis import analyze_token
@@ -8,6 +9,7 @@ import json
 import os
 
 app = Flask(__name__)
+sock = Sock(app)
 token_data = {}  
 
 @app.route('/')
@@ -86,32 +88,34 @@ def data():
     return jsonify(result)
 
 
-DATA_DIR = Path("C:/Users/vamsh/Downloads/TA MV2/CandleData")
-DATA_DIR.mkdir(parents=True, exist_ok=True)
+DATA_DIR_CANDLES = Path(r"C:\Users\vamsh\Downloads\TA MV2\python_server\ML_Training_datasets\CandleData\Candles")
+DATA_DIR_STATS = Path(r"C:\Users\vamsh\Downloads\TA MV2\python_server\ML_Training_datasets\CandleData\Stats")
+DATA_DIR_CANDLES.mkdir(parents=True, exist_ok=True)
+DATA_DIR_STATS.mkdir(parents=True, exist_ok=True)
 
 
-@app.route('/receive', methods=["POST", "OPTIONS"])
-def receive():
-    if request.method == "OPTIONS":
-        return _build_cors_preflight_response()
-    
-    data = request.get_json()
+def _process_payload(data):
     payloadID = data.get("id", None)
-    candles_by_tf = data.get("candles", [])
+    payload_data = data.get("candles", {})
+    if isinstance(payload_data, dict) and "candles" in payload_data:
+        candles_by_tf = payload_data.get("candles", {})
+        stats_by_bucket = payload_data.get("stats", [])
+    else:
+        candles_by_tf = payload_data if isinstance(payload_data, dict) else {}
+        stats_by_bucket = data.get("stats", [])
     token = data.get("token", {})
     address = token.get("address", "unknown")
     name = token.get("name", "Unknown")
-    isInitialData = bool(data.get("initial", "False"))  
+    is_initial_data = bool(data.get("initial", False))
 
     #print("Candle", candles_by_tf)
     
     if payloadID:
-
         if not address or address == "unknown":
-            return jsonify({"status": "error", "message": "Missing token address"}), 400
+            return {"status": "error", "message": "Missing token address"}, False
 
         # Initialize for new token
-        if address not in token_data or isInitialData:
+        if address not in token_data or is_initial_data:
             token_data[address] = {
                 "name": name,
                 "timeframes": {
@@ -123,6 +127,7 @@ def receive():
                     "3": [], 
                     "5": []      
                 },
+                "stats": [],
                 "updated": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             }
             
@@ -142,22 +147,70 @@ def receive():
                 tf_seconds = timeframe_to_seconds(tf_key)
                 max_len = 18000 // tf_seconds
                 tf[tf_key] = tf[tf_key][-max_len:]
+
+        if isinstance(stats_by_bucket, list):
+            token_data[address]["stats"] = stats_by_bucket
         
         
         #process_new_candles(address, candles)    
         token_data[address]["updated"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         print("Token data updated at:", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
 
-        out_file = DATA_DIR / f"{address}.json"
-        with out_file.open("w") as f:
-            json.dump(token_data[address], f, indent=2)
+        token_snapshot = token_data[address]
+
+        candle_file = DATA_DIR_CANDLES / f"{address}_candles.json"
+        stats_file = DATA_DIR_STATS / f"{address}_stats.json"
+
+        with candle_file.open("w", encoding="utf-8") as f:
+            json.dump({
+                "name": token_snapshot["name"],
+                "address": address,
+                "timeframes": token_snapshot["timeframes"],
+                "updated": token_snapshot["updated"]
+            }, f, indent=2, ensure_ascii=False)
+
+        with stats_file.open("w", encoding="utf-8") as f:
+            json.dump({
+                "name": token_snapshot["name"],
+                "address": address,
+                "stats": token_snapshot.get("stats", []),
+                "updated": token_snapshot["updated"]
+            }, f, indent=2, ensure_ascii=False)
 
 
         #print(f"📥 Received {len(candles_by_tf)} candles for {name} ({address})")
-        return jsonify({"status": "ok"})
+        return {"status": "ok"}, True
     
     # Always return a response if payloadID is missing
-    return jsonify({"status": "error", "message": "Missing or invalid payload ID"}), 400
+    return {"status": "error", "message": "Missing or invalid payload ID"}, False
+
+
+@app.route('/receive', methods=["POST", "OPTIONS"])
+def receive():
+    if request.method == "OPTIONS":
+        return _build_cors_preflight_response()
+
+    data = request.get_json()
+    result, success = _process_payload(data)
+    status_code = 200 if success else 400
+    return jsonify(result), status_code
+
+
+@sock.route('/ws')
+def websocket(ws):
+    while True:
+        message = ws.receive()
+        if message is None:
+            break
+
+        try:
+            payload = json.loads(message)
+        except json.JSONDecodeError:
+            ws.send(json.dumps({"status": "error", "message": "Invalid JSON"}))
+            continue
+
+        result, _success = _process_payload(payload)
+        ws.send(json.dumps(result))
 
 def timeframe_to_seconds(tf_key):
     if tf_key.endswith("S"):
