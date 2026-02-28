@@ -88,13 +88,19 @@ def data():
     return jsonify(result)
 
 
-DATA_DIR = Path("C:/Users/vamsh/Downloads/TA MV2/CandleData")
+DATA_DIR = Path(r"C:\Users\vamsh\Downloads\TA MV2\python_server\ML_Training_datasets\CandleData")
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def _process_payload(data):
     payloadID = data.get("id", None)
-    candles_by_tf = data.get("candles", [])
+    payload_data = data.get("candles", {})
+    if isinstance(payload_data, dict) and "candles" in payload_data:
+        candles_by_tf = payload_data.get("candles", {})
+        stats_by_bucket = payload_data.get("stats", [])
+    else:
+        candles_by_tf = payload_data if isinstance(payload_data, dict) else {}
+        stats_by_bucket = data.get("stats", [])
     token = data.get("token", {})
     address = token.get("address", "unknown")
     name = token.get("name", "Unknown")
@@ -119,6 +125,7 @@ def _process_payload(data):
                     "3": [], 
                     "5": []      
                 },
+                "stats": [],
                 "updated": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             }
             
@@ -138,15 +145,35 @@ def _process_payload(data):
                 tf_seconds = timeframe_to_seconds(tf_key)
                 max_len = 18000 // tf_seconds
                 tf[tf_key] = tf[tf_key][-max_len:]
+
+        if isinstance(stats_by_bucket, list):
+            token_data[address]["stats"] = stats_by_bucket
         
         
         #process_new_candles(address, candles)    
         token_data[address]["updated"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         print("Token data updated at:", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
 
-        out_file = DATA_DIR / f"{address}.json"
-        with out_file.open("w") as f:
-            json.dump(token_data[address], f, indent=2)
+        token_snapshot = token_data[address]
+
+        candle_file = DATA_DIR / f"{address}_candles.json"
+        stats_file = DATA_DIR / f"{address}_stats.json"
+
+        with candle_file.open("w", encoding="utf-8") as f:
+            json.dump({
+                "name": token_snapshot["name"],
+                "address": address,
+                "timeframes": token_snapshot["timeframes"],
+                "updated": token_snapshot["updated"]
+            }, f, indent=2, ensure_ascii=False)
+
+        with stats_file.open("w", encoding="utf-8") as f:
+            json.dump({
+                "name": token_snapshot["name"],
+                "address": address,
+                "stats": token_snapshot.get("stats", []),
+                "updated": token_snapshot["updated"]
+            }, f, indent=2, ensure_ascii=False)
 
 
         #print(f"📥 Received {len(candles_by_tf)} candles for {name} ({address})")

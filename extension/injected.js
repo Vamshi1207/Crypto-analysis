@@ -62,8 +62,10 @@ window.addEventListener("message", (event) => {
 	};
 
 
-  const initialPayload = {};
-  let completed = 0;
+  const initialPayload = {
+	  candles: {},
+	  stats: []
+  };
   const payloadId = Date.now() + "_" + Math.floor(Math.random() * 10000);
   const sendToParent = (data, isInitial = false) => {
 	window.parent.postMessage({
@@ -75,52 +77,83 @@ window.addEventListener("message", (event) => {
 	}, "*");
   };
 
-  // Fetch initial bars for all resolutions
-  resolutions.forEach((res) => {
-	const now = Math.floor(Date.now() / 1000);
-	const from = now - secondsPerBar[res] * desiredBars[res];
-	const to = now;
+  const fetchInitialBars = () => Promise.all(
+	resolutions.map((res) => {
+	  const now = Math.floor(Date.now() / 1000);
+	  const from = now - secondsPerBar[res] * desiredBars[res];
+	  const to = now;
 
-	datafeed.getBars(
-	  symbolInfo,
-	  res,
-	  {
-		from,
-		to,
-		countBack: desiredBars[res],
-		firstDataRequest: true
-	  },
-	  (bars) => {
-		  if (bars && bars.length > 0) {
-			const barMap = {};
-			bars.forEach(bar => {
-			  barMap[bar.time] = {
-				timestamp: bar.time,
-				open: bar.open,
-				high: bar.high,
-				low: bar.low,
-				close: bar.close,
-				volume: bar.volume,
-				timeMs: bar.timeMs
-			  };
-			});
-			initialPayload[res] = barMap;
+	  return new Promise((resolve) => {
+		datafeed.getBars(
+		  symbolInfo,
+		  res,
+		  {
+			from,
+			to,
+			countBack: desiredBars[res],
+			firstDataRequest: true
+		  },
+		  (bars) => {
+			if (bars && bars.length > 0) {
+			  const barMap = {};
+			  bars.forEach(bar => {
+				barMap[bar.time] = {
+				  timestamp: bar.time,
+				  open: bar.open,
+				  high: bar.high,
+				  low: bar.low,
+				  close: bar.close,
+				  volume: bar.volume,
+				  timeMs: bar.timeMs
+				};
+			  });
+			  initialPayload.candles[res] = barMap;
+			}
+			resolve();
+		  },
+		  (error) => {
+			console.error("❌ Failed to fetch bars for", res, ":", error);
+			resolve();
 		  }
+		);
+	  });
+	})
+  );
 
-		completed++;
-		if (completed === resolutions.length) {
-		  console.log("✅ All initial bars fetched");
-		  sendToParent(initialPayload, true);
-		  console.log("✅ Initial payload sent");
-		  startSubscriptions();
-		}
-	  },
-	  (error) => {
-		console.error("❌ Failed to fetch bars for", res, ":", error);
-		completed++;
+  const fetchInitialStats = async () => {
+	if (!mint || mint === "unknown") {
+	  console.warn("⚠️ Skipping stats fetch, token address missing");
+	  return;
+	}
+
+	try {
+	  const response = await fetch(
+		`https://api3.axiom.trade/pair-stats?pairAddress=${encodeURIComponent(mint)}`,
+		{ credentials: "include" }
+	  );
+
+	  if (!response.ok) {
+		throw new Error(`HTTP ${response.status}`);
 	  }
-	);
-  });
+
+	  const stats = await response.json();
+	  if (!Array.isArray(stats)) {
+		console.warn("⚠️ pair-stats response is not an array", stats);
+		return;
+	  }
+
+	  initialPayload.stats = stats;
+	  console.log("✅ Initial stats fetched. Buckets count:", stats.length);
+	} catch (error) {
+	  console.error("❌ Failed to fetch initial stats:", error);
+	}
+  };
+
+  await Promise.all([fetchInitialBars(), fetchInitialStats()]);
+  console.log("✅ Initial bars and stats fetched");
+  sendToParent(initialPayload, true);
+  console.log("✅ Initial payload sent");
+  startSubscriptions();
 
 	const latestBars = {};
 	const lastBarTime = {};  // Track last sent bar time per resolution
@@ -154,7 +187,7 @@ window.addEventListener("message", (event) => {
 
 	  setInterval(() => {
   if (Object.keys(latestBars).length === 0) return;
-  sendToParent({ ...latestBars });
+  sendToParent({ candles: { ...latestBars } });
   for (const key in latestBars) delete latestBars[key];
 }, 500);
 }
