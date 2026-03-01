@@ -93,96 +93,120 @@ DATA_DIR_STATS = Path(r"C:\Users\vamsh\Downloads\TA MV2\python_server\ML_Trainin
 DATA_DIR_CANDLES.mkdir(parents=True, exist_ok=True)
 DATA_DIR_STATS.mkdir(parents=True, exist_ok=True)
 
+SECONDS_24H = 24 * 60 * 60
+
+RESOLUTIONS = ["1S", "5S", "15S", "30S", "1", "3", "5", "15", "30", "60"]
+
+SECONDS_PER_BAR = {
+    "1S": 1,
+    "5S": 5,
+    "15S": 15,
+    "30S": 30,
+    "1": 60,
+    "3": 180,
+    "5": 300,
+    "15": 900,
+    "30": 1800,
+    "60": 3600
+}
+
 
 def _process_payload(data):
-    payloadID = data.get("id", None)
+    payloadID = data.get("id")
     payload_data = data.get("candles", {})
+
     if isinstance(payload_data, dict) and "candles" in payload_data:
         candles_by_tf = payload_data.get("candles", {})
         stats_by_bucket = payload_data.get("stats", [])
     else:
         candles_by_tf = payload_data if isinstance(payload_data, dict) else {}
         stats_by_bucket = data.get("stats", [])
+
     token = data.get("token", {})
-    address = token.get("address", "unknown")
+    address = token.get("address")
     name = token.get("name", "Unknown")
     is_initial_data = bool(data.get("initial", False))
 
-    #print("Candle", candles_by_tf)
-    
-    if payloadID:
-        if not address or address == "unknown":
-            return {"status": "error", "message": "Missing token address"}, False
+    if not payloadID or not address:
+        return {"status": "error", "message": "Missing payload ID or token address"}, False
 
-        # Initialize for new token
-        if address not in token_data or is_initial_data:
-            token_data[address] = {
-                "name": name,
-                "timeframes": {
-                    "1S": [], 
-                    "5S": [], 
-                    "15S": [], 
-                    "30S": [], 
-                    "1": [], 
-                    "3": [], 
-                    "5": []      
-                },
-                "stats": [],
-                "updated": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            }
-            
-        tf = token_data[address]["timeframes"]
+    # Initialize token
+    if address not in token_data or is_initial_data:
+        token_data[address] = {
+            "name": name,
+            "timeframes": {tf: [] for tf in RESOLUTIONS},
+            "stats": [],
+            "updated": None
+        }
 
-        for tf_key in tf.keys():
-            if tf_key in candles_by_tf:
-                new_candles = list(candles_by_tf[tf_key].values())
-                print(f"  ⏱️ {tf_key}: {len(new_candles)} new candles")
-                # Deduplicate by timestamp
-                existing = {c["timestamp"]: c for c in tf[tf_key]}
-                for c in new_candles:
-                    existing[c["timestamp"]] = c
-                tf[tf_key] = list(sorted(existing.values(), key=lambda x: x["timestamp"]))
+    tf_store = token_data[address]["timeframes"]
 
-                # Keep max N candles per timeframe (3 hours worth)
-                tf_seconds = timeframe_to_seconds(tf_key)
-                max_len = 18000 // tf_seconds
-                tf[tf_key] = tf[tf_key][-max_len:]
+    # -----------------------
+    # Candles (time-based retention)
+    # -----------------------
+    for tf_key, candles in candles_by_tf.items():
+        if tf_key not in tf_store:
+            continue
 
-        if isinstance(stats_by_bucket, list):
-            token_data[address]["stats"] = stats_by_bucket
-        
-        
-        #process_new_candles(address, candles)    
-        token_data[address]["updated"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        print("Token data updated at:", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        existing = {c["timestamp"]: c for c in tf_store[tf_key]}
+        for c in candles.values():
+            existing[c["timestamp"]] = c
 
-        token_snapshot = token_data[address]
+        sorted_candles = sorted(existing.values(), key=lambda x: x["timestamp"])
 
-        candle_file = DATA_DIR_CANDLES / f"{address}_candles.json"
-        stats_file = DATA_DIR_STATS / f"{address}_stats.json"
+        max_len = SECONDS_24H // SECONDS_PER_BAR[tf_key]
+        tf_store[tf_key] = sorted_candles[-max_len:]
 
-        with candle_file.open("w", encoding="utf-8") as f:
-            json.dump({
-                "name": token_snapshot["name"],
-                "address": address,
-                "timeframes": token_snapshot["timeframes"],
-                "updated": token_snapshot["updated"]
-            }, f, indent=2, ensure_ascii=False)
+        print(f"⏱️ {tf_key}: {len(tf_store[tf_key])} candles retained")
 
-        with stats_file.open("w", encoding="utf-8") as f:
-            json.dump({
-                "name": token_snapshot["name"],
-                "address": address,
-                "stats": token_snapshot.get("stats", []),
-                "updated": token_snapshot["updated"]
-            }, f, indent=2, ensure_ascii=False)
+    # -----------------------
+    # Stats (1-minute buckets)
+    # -----------------------
+    if isinstance(stats_by_bucket, list):
+        existing_stats = {
+            s["createdAt"]: s
+            for s in token_data[address].get("stats", [])
+            if "createdAt" in s
+        }
 
+        for s in stats_by_bucket:
+            if "createdAt" in s:
+                existing_stats[s["createdAt"]] = s
 
-        #print(f"📥 Received {len(candles_by_tf)} candles for {name} ({address})")
-        return {"status": "ok"}, True
-    
-    # Always return a response if payloadID is missing
-    return {"status": "error", "message": "Missing or invalid payload ID"}, False
+        stats_sorted = sorted(
+            existing_stats.values(),
+            key=lambda x: x["createdAt"]
+        )
+
+        # Keep last 24h of stats (1440 minutes)
+        token_data[address]["stats"] = stats_sorted[-1440:]
+
+    token_data[address]["updated"] = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+
+    # -----------------------
+    # Persist to disk
+    # -----------------------
+    candle_file = DATA_DIR_CANDLES / f"{address}_candles.json"
+    stats_file = DATA_DIR_STATS / f"{address}_stats.json"
+
+    with candle_file.open("w", encoding="utf-8") as f:
+        json.dump({
+            "name": name,
+            "address": address,
+            "timeframes": tf_store,
+            "updated": token_data[address]["updated"]
+        }, f, indent=2)
+
+    with stats_file.open("w", encoding="utf-8") as f:
+        json.dump({
+            "name": name,
+            "address": address,
+            "stats": token_data[address]["stats"],
+            "updated": token_data[address]["updated"]
+        }, f, indent=2)
+
+    print(f"✅ Token {name} updated at {token_data[address]['updated']}")
+    return {"status": "ok"}, True
 
 
 @app.route('/receive', methods=["POST", "OPTIONS"])
