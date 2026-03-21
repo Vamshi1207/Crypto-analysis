@@ -88,8 +88,15 @@ def data():
     return jsonify(result)
 
 
-DATA_DIR_CANDLES = Path(r"C:\Users\vamsh\Downloads\TA MV2\python_server\ML_Training_datasets\CandleData\Candles")
-DATA_DIR_STATS = Path(r"C:\Users\vamsh\Downloads\TA MV2\python_server\ML_Training_datasets\CandleData\Stats")
+BASE_DATA_DIR = Path(
+    os.getenv(
+        "CANDLE_DATA_DIR",
+        Path(__file__).resolve().parent / "ML_Training_datasets" / "CandleData",
+    )
+)
+DATA_DIR_CANDLES = BASE_DATA_DIR / "Candles"
+DATA_DIR_STATS = BASE_DATA_DIR / "Stats"
+
 DATA_DIR_CANDLES.mkdir(parents=True, exist_ok=True)
 DATA_DIR_STATS.mkdir(parents=True, exist_ok=True)
 
