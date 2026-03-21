@@ -3,7 +3,7 @@
 // --------------------
 // Helper functions
 // --------------------
-const WS_URL = "ws://localhost:5000/ws";
+const WS_URL = "ws://localhost:8000/ws";
 let ws;
 let wsConnected = false;
 let wsReconnectTimer = null;
