@@ -1,0 +1,4 @@
+flask
+flask-sock
+numpy
+talipp

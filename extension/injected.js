@@ -47,13 +47,12 @@ window.addEventListener("message", (event) => {
 
 
   const resolutions = [
-	"1S", "5S", "15S", "30S",
+	"5S", "15S", "30S",
 	"1", "3", "5",
 	"15", "30", "60"
 	];
-	
+
   const secondsPerBar = {
-	"1S": 1,
 	"5S": 5,
 	"15S": 15,
 	"30S": 30,
@@ -66,7 +65,6 @@ window.addEventListener("message", (event) => {
 	"60": 3600
 	};
   const desiredBars = {
-	"1S": 86400,
 	"5S": 17280,
 	"15S": 5760,
 	"30S": 2880,
@@ -125,6 +123,9 @@ window.addEventListener("message", (event) => {
 				};
 			  });
 			  initialPayload.candles[res] = barMap;
+			  if (res === "1S" && bars.length < desiredBars[res]) {
+				console.warn(`⚠️ ${res} history limited by datafeed: received ${bars.length}/${desiredBars[res]} bars.`);
+			  }
 			}
 			resolve();
 		  },

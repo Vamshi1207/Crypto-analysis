@@ -1,0 +1,19 @@
+services:
+  python_server:
+    build:
+      context: ./python_server
+    container_name: crypto-analysis-python-server
+    ports:
+      - "${HOST_PORT:-5050}:${CONTAINER_PORT:-5000}"
+    environment:
+      HOST: 0.0.0.0
+      PORT: ${CONTAINER_PORT:-5000}
+      DATA_DIR: /app/data
+    volumes:
+      - ./python_server:/app
+      - ./python_server/data:/app/data
+    working_dir: /app
+    command: ["sleep", "infinity"]
+    stdin_open: true
+    tty: true
+    restart: unless-stopped

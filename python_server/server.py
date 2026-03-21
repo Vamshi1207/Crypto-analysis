@@ -95,10 +95,9 @@ DATA_DIR_STATS.mkdir(parents=True, exist_ok=True)
 
 SECONDS_24H = 24 * 60 * 60
 
-RESOLUTIONS = ["1S", "5S", "15S", "30S", "1", "3", "5", "15", "30", "60"]
+RESOLUTIONS = ["5S", "15S", "30S", "1", "3", "5", "15", "30", "60"]
 
 SECONDS_PER_BAR = {
-    "1S": 1,
     "5S": 5,
     "15S": 15,
     "30S": 30,
