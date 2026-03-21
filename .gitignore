@@ -2,3 +2,5 @@ __pycache__/
 python_server/.ipynb_checkpoints/*
 python_server/ML_Training_datasets/*
 CandleData/*
+TA/*
+BKP/*
