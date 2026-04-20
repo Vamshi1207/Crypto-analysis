@@ -53,17 +53,33 @@ function scheduleWebSocketReconnect() {
 
 function flushWebSocketQueue() {
   while (wsQueue.length && wsConnected) {
-    ws.send(wsQueue.shift());
+    const queuedMessage = wsQueue.shift();
+    console.log("📤 [BG] Flushing queued WS message", { bytes: queuedMessage.length });
+    ws.send(queuedMessage);
   }
 }
 
 function sendToServer(payload) {
   const message = JSON.stringify(payload);
   if (wsConnected) {
+    console.log("📤 [BG] Sending WS message immediately", {
+      id: payload.id,
+      token: payload.token?.name,
+      initial: payload.initial,
+      complete: payload.complete === true,
+      bytes: message.length
+    });
     ws.send(message);
     return;
   }
 
+  console.log("🕒 [BG] Queueing WS message until socket opens", {
+    id: payload.id,
+    token: payload.token?.name,
+    initial: payload.initial,
+    complete: payload.complete === true,
+    bytes: message.length
+  });
   wsQueue.push(message);
   connectWebSocket();
 }
@@ -160,11 +176,18 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   // Forward candle data to local server
   // --------------------
   if (msg?.type === "candles") {
+    console.log("📨 [BG] Received candles from content", {
+      id: msg.id,
+      token: msg.token?.name,
+      initial: msg.initial,
+      complete: msg.complete === true
+    });
     const payload = {
       id: msg.id,
       candles: msg.payload,
       token: msg.token,
-      initial: msg.initial
+      initial: msg.initial,
+      complete: Boolean(msg.complete)
     };
 
     try {

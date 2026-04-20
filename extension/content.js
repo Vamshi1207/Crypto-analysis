@@ -72,7 +72,23 @@ function setupIframeInjection() {
   // Listen for messages from iframe and forward to background
   window.addEventListener("message", (event) => {
     if (event.data?.type === "candles") {
-      chrome.runtime.sendMessage(event.data);
+      console.log("📨 [CONTENT] Forwarding candles message", {
+        id: event.data.id,
+        token: event.data.token?.name,
+        initial: event.data.initial,
+        complete: event.data.complete === true
+      });
+      try {
+        chrome.runtime.sendMessage(event.data, (response) => {
+          if (chrome.runtime.lastError) {
+            console.warn("❌ [CONTENT] sendMessage failed", chrome.runtime.lastError.message);
+            return;
+          }
+          console.log("✅ [CONTENT] Background ack", response);
+        });
+      } catch (error) {
+        console.warn("❌ [CONTENT] sendMessage threw", error);
+      }
     }
   });
 }

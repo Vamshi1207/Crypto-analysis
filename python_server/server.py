@@ -7,10 +7,12 @@ from indicators import get_indicators_for_token
 from pathlib import Path
 import json
 import os
+import shutil
 
 app = Flask(__name__)
 sock = Sock(app)
-token_data = {}  
+token_data = {}
+upload_sessions = {}
 
 @app.route('/')
 def dashboard():
@@ -96,30 +98,132 @@ BASE_DATA_DIR = Path(
 )
 DATA_DIR_CANDLES = BASE_DATA_DIR / "Candles"
 DATA_DIR_STATS = BASE_DATA_DIR / "Stats"
+DATA_DIR_TMP = BASE_DATA_DIR / "TmpUploads"
 
 DATA_DIR_CANDLES.mkdir(parents=True, exist_ok=True)
 DATA_DIR_STATS.mkdir(parents=True, exist_ok=True)
-
-SECONDS_24H = 24 * 60 * 60
+DATA_DIR_TMP.mkdir(parents=True, exist_ok=True)
 
 RESOLUTIONS = ["5S", "15S", "30S", "1", "3", "5", "15", "30", "60"]
 
-SECONDS_PER_BAR = {
-    "5S": 5,
-    "15S": 15,
-    "30S": 30,
-    "1": 60,
-    "3": 180,
-    "5": 300,
-    "15": 900,
-    "30": 1800,
-    "60": 3600
-}
+def _build_materialized_token(name, payload_id, timeframes, stats, updated):
+    token = {
+        "payload_id": payload_id,
+        "name": name,
+        "timeframes": {tf: [] for tf in RESOLUTIONS},
+        "stats": stats,
+        "updated": updated,
+    }
+    for tf in RESOLUTIONS:
+        token["timeframes"][tf] = timeframes.get(tf, [])
+    return token
+
+
+def _write_final_token_files(address, name, timeframes, stats, updated):
+    candle_file = DATA_DIR_CANDLES / f"{address}_candles.json"
+    stats_file = DATA_DIR_STATS / f"{address}_stats.json"
+
+    with candle_file.open("w", encoding="utf-8") as f:
+        json.dump({
+            "name": name,
+            "address": address,
+            "timeframes": timeframes,
+            "updated": updated
+        }, f, indent=2)
+
+    with stats_file.open("w", encoding="utf-8") as f:
+        json.dump({
+            "name": name,
+            "address": address,
+            "stats": stats,
+            "updated": updated
+        }, f, indent=2)
+
+
+def _get_or_create_upload_session(address, name, payload_id):
+    session = upload_sessions.get(address)
+    if session is not None and session.get("payload_id") == payload_id:
+        return session
+
+    session_dir = DATA_DIR_TMP / address / payload_id
+    session_dir.mkdir(parents=True, exist_ok=True)
+    session = {
+        "payload_id": payload_id,
+        "name": name,
+        "dir": session_dir,
+        "chunk_index": 0,
+        "updated": None,
+    }
+    upload_sessions[address] = session
+    return session
+
+
+def _spool_payload_chunk(session, candles_by_tf, stats_by_bucket):
+    chunk_path = session["dir"] / f"chunk_{session['chunk_index']:06d}.json"
+    with chunk_path.open("w", encoding="utf-8") as f:
+        json.dump({
+            "candles": candles_by_tf,
+            "stats": stats_by_bucket,
+        }, f, separators=(",", ":"))
+    session["chunk_index"] += 1
+
+
+def _finalize_upload_session(address, name, payload_id):
+    session = upload_sessions.get(address)
+    if session is None or session.get("payload_id") != payload_id:
+        return {"status": "error", "message": "Upload session not found"}, False
+
+    timeframe_maps = {tf: {} for tf in RESOLUTIONS}
+    stats_map = {}
+
+    for chunk_file in sorted(session["dir"].glob("chunk_*.json")):
+        with chunk_file.open("r", encoding="utf-8") as f:
+            chunk_payload = json.load(f)
+
+        for tf_key, candles in chunk_payload.get("candles", {}).items():
+            if tf_key not in timeframe_maps:
+                continue
+            for candle in candles.values():
+                timeframe_maps[tf_key][candle["timestamp"]] = candle
+
+        for stat in chunk_payload.get("stats", []):
+            if "createdAt" in stat:
+                stats_map[stat["createdAt"]] = stat
+
+    timeframes = {
+        tf: sorted(
+            timeframe_maps[tf].values(),
+            key=lambda candle: candle["timestamp"],
+        )
+        for tf in RESOLUTIONS
+    }
+    stats = sorted(
+        stats_map.values(),
+        key=lambda stat: stat["createdAt"],
+    )
+    updated = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+
+    _write_final_token_files(address, name, timeframes, stats, updated)
+    token_data[address] = _build_materialized_token(name, payload_id, timeframes, stats, updated)
+
+    shutil.rmtree(session["dir"], ignore_errors=True)
+    address_tmp_dir = DATA_DIR_TMP / address
+    try:
+        address_tmp_dir.rmdir()
+    except OSError:
+        pass
+    upload_sessions.pop(address, None)
+
+    return {
+        "status": "finalized",
+        "message": f"Finalized {sum(len(values) for values in timeframes.values())} candles",
+    }, True
 
 
 def _process_payload(data):
     payloadID = data.get("id")
     payload_data = data.get("candles", {})
+    is_complete = bool(data.get("complete", False))
 
     if isinstance(payload_data, dict) and "candles" in payload_data:
         candles_by_tf = payload_data.get("candles", {})
@@ -131,87 +235,36 @@ def _process_payload(data):
     token = data.get("token", {})
     address = token.get("address")
     name = token.get("name", "Unknown")
-    is_initial_data = bool(data.get("initial", False))
 
     if not payloadID or not address:
         return {"status": "error", "message": "Missing payload ID or token address"}, False
 
-    # Initialize token
-    if address not in token_data or is_initial_data:
-        token_data[address] = {
-            "name": name,
-            "timeframes": {tf: [] for tf in RESOLUTIONS},
-            "stats": [],
-            "updated": None
-        }
-
-    tf_store = token_data[address]["timeframes"]
-
-    # -----------------------
-    # Candles (time-based retention)
-    # -----------------------
-    for tf_key, candles in candles_by_tf.items():
-        if tf_key not in tf_store:
-            continue
-
-        existing = {c["timestamp"]: c for c in tf_store[tf_key]}
-        for c in candles.values():
-            existing[c["timestamp"]] = c
-
-        sorted_candles = sorted(existing.values(), key=lambda x: x["timestamp"])
-
-        max_len = SECONDS_24H // SECONDS_PER_BAR[tf_key]
-        tf_store[tf_key] = sorted_candles[-max_len:]
-
-        print(f"⏱️ {tf_key}: {len(tf_store[tf_key])} candles retained")
-
-    # -----------------------
-    # Stats (1-minute buckets)
-    # -----------------------
-    if isinstance(stats_by_bucket, list):
-        existing_stats = {
-            s["createdAt"]: s
-            for s in token_data[address].get("stats", [])
-            if "createdAt" in s
-        }
-
-        for s in stats_by_bucket:
-            if "createdAt" in s:
-                existing_stats[s["createdAt"]] = s
-
-        stats_sorted = sorted(
-            existing_stats.values(),
-            key=lambda x: x["createdAt"]
-        )
-
-        # Keep last 24h of stats (1440 minutes)
-        token_data[address]["stats"] = stats_sorted[-1440:]
-
-    token_data[address]["updated"] = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-
-    # -----------------------
-    # Persist to disk
-    # -----------------------
     candle_file = DATA_DIR_CANDLES / f"{address}_candles.json"
     stats_file = DATA_DIR_STATS / f"{address}_stats.json"
+    existing_session = upload_sessions.get(address)
+    same_inflight_payload = existing_session is not None and existing_session.get("payload_id") == payloadID
 
-    with candle_file.open("w", encoding="utf-8") as f:
-        json.dump({
-            "name": name,
-            "address": address,
-            "timeframes": tf_store,
-            "updated": token_data[address]["updated"]
-        }, f, indent=2)
+    if not same_inflight_payload and (candle_file.exists() or stats_file.exists()):
+        return {"status": "ignored", "message": "Token already exists"}, True
 
-    with stats_file.open("w", encoding="utf-8") as f:
-        json.dump({
-            "name": name,
-            "address": address,
-            "stats": token_data[address]["stats"],
-            "updated": token_data[address]["updated"]
-        }, f, indent=2)
+    session = _get_or_create_upload_session(address, name, payloadID)
+    session["name"] = name
+    session["updated"] = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
-    print(f"✅ Token {name} updated at {token_data[address]['updated']}")
+    if candles_by_tf or stats_by_bucket:
+        _spool_payload_chunk(session, candles_by_tf, stats_by_bucket)
+        for tf_key, candles in candles_by_tf.items():
+            if tf_key in RESOLUTIONS:
+                print(f"📥 {tf_key}: chunk stored with {len(candles)} candles")
+
+    if is_complete:
+        result, success = _finalize_upload_session(address, name, payloadID)
+        if success:
+            print(f"🏁 Token {name} finalized for payload {payloadID}")
+            print(f"🏁 Token {name} merging complete")
+        return result, success
+
+    print(f"✅ Token {name} chunk accepted at {session['updated']}")
     return {"status": "ok"}, True
 
 
@@ -231,13 +284,27 @@ def websocket(ws):
     while True:
         message = ws.receive()
         if message is None:
+            print("🔌 [WS] Client disconnected")
             break
+
+        print(f"📨 [WS] Raw message received ({len(message)} bytes)")
 
         try:
             payload = json.loads(message)
         except json.JSONDecodeError:
+            print("❌ [WS] Invalid JSON payload")
             ws.send(json.dumps({"status": "error", "message": "Invalid JSON"}))
             continue
+
+        print(
+            "📨 [WS] Parsed payload",
+            {
+                "id": payload.get("id"),
+                "token": payload.get("token", {}).get("name"),
+                "initial": payload.get("initial"),
+                "complete": payload.get("complete", False),
+            }
+        )
 
         result, _success = _process_payload(payload)
         ws.send(json.dumps(result))
