@@ -13,6 +13,9 @@ from Dataset_Prep.config import (
     max_workers,
     dashboard_host,
     dashboard_port,
+    output_dir,
+    timeframe_key,
+    use_stats,
 )
 from Dataset_Prep.progress import (
     reset_run_dir,
@@ -27,14 +30,32 @@ progress_dir = tmp_output_dir / "progress_ui"
 dashboard_process = None
 
 def get_token_ids():
-    candle_tokens = {
-        path.name.replace("_candles.json", "")
-        for path in candles_dir.glob("*_candles.json")
-    }
-    stats_tokens = {
-        path.name.replace("_stats.json", "")
-        for path in stats_dir.glob("*_stats.json")
-    }
+    import json
+    candle_tokens = set()
+    for path in candles_dir.glob("*_candles.json"):
+        try:
+            with path.open() as f:
+                data = json.load(f)
+            if data.get("timeframes", {}).get(timeframe_key):
+                token = path.name.replace("_candles.json", "")
+                candle_tokens.add(token)
+        except:
+            pass
+
+    if not use_stats:
+        return sorted(candle_tokens)
+
+    stats_tokens = set()
+    for path in stats_dir.glob("*_stats.json"):
+        try:
+            with path.open() as f:
+                data = json.load(f)
+            if data.get("stats"):
+                token = path.name.replace("_stats.json", "")
+                stats_tokens.add(token)
+        except:
+            pass
+
     return sorted(candle_tokens & stats_tokens)
 
 
@@ -59,6 +80,9 @@ if __name__ == "__main__":
     started_at = utc_now_iso()
     print(f"Found {len(token_ids)} tokens")
     reset_run_dir(progress_dir)
+    # Clean existing CSV files to prevent header duplication
+    for path in output_dir.glob("*.csv"):
+        path.unlink(missing_ok=True)
     write_overview(
         progress_dir,
         {

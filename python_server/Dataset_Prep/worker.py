@@ -13,9 +13,19 @@ from Dataset_Prep.pipeline.utils import move_processed_files
 from Dataset_Prep.config import (
     output_dir,
     chunk_size,
+    max_flush_chunk_size,
+    window_size,
+    step_size,
+    up_threshold,
+    down_threshold,
+    stable_threshold,
+    timeframe_minutes,
+    target_samples,
     timeframe_key,
     history_bars,
     prediction_horizons,
+    token_log_dir,
+    use_stats,
 )
 
 import psutil
@@ -53,21 +63,37 @@ def process_token(file_number, token_id):
         payload.update(extra)
         update_token_status(progress_dir, token_id, payload)
 
+    log_path = token_log_dir / f"{token_id}.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def write_log(message):
+        with log_path.open("a", encoding="utf-8") as f:
+            f.write(f"{utc_now_iso()} {message}\n")
+
     publish("running", "Loading token")
+    write_log("Starting token processing")
 
     try:
         # --- Load data ---
-        token_name, df_final = load_token_frame(token_id, timeframe_key)
+        token_name, df_final, diagnostics = load_token_frame(token_id, timeframe_key, use_stats)
+        write_log(
+            f"Loaded token data name={token_name} "
+            f"raw_candles={diagnostics['raw_candle_rows']} invalid_candles={diagnostics['invalid_candle_rows']} "
+            f"raw_stats={diagnostics['raw_stats_rows']} invalid_stats={diagnostics['invalid_stats_rows']} "
+            f"merged_before_dropna={diagnostics['merged_rows_before_dropna']} "
+            f"merged_after_dropna={diagnostics['merged_rows_after_dropna']}"
+        )
         publish("running", "Loaded token data")
 
         if df_final is None or df_final.empty:
+            write_log("Empty input dataframe after loading")
             move_processed_files(token_id)
             publish("empty", "Empty input dataframe", processed_steps=0, total_steps=0)
             return
 
         out_path = output_dir / f"memecoin_training_dataset_{file_number}.csv"
 
-        flush_chunk_size = min(chunk_size, 512)
+        flush_chunk_size = min(chunk_size, max_flush_chunk_size)
         buffer = []
         header_written = False
 
@@ -86,14 +112,14 @@ def process_token(file_number, token_id):
         for row in create_forward_label_dataset_stream(
             df=df_final,
             token_id=token_id,
-            window_size=400,
-            step_size=50,
-            up_threshold=20.0,
-            down_threshold=15.0,
-            stable_threshold=10.0,
-            timeframe=5,
+            window_size=window_size,
+            step_size=step_size,
+            up_threshold=up_threshold,
+            down_threshold=down_threshold,
+            stable_threshold=stable_threshold,
+            timeframe=timeframe_minutes,
             history_bars=history_bars,
-            target_samples=100,
+            target_samples=target_samples,
             prediction_horizons=prediction_horizons,
             progress_callback=handle_progress,
             show_progress=False,
@@ -120,6 +146,7 @@ def process_token(file_number, token_id):
 
                     total_rows += len(chunk_df)
                     header_written = True
+                    write_log(f"Flushed chunk rows={len(chunk_df)} total_rows={total_rows}")
                     publish("running", "Writing chunk to CSV", rows_written=total_rows, total_steps=total_steps)
 
                 buffer.clear()
@@ -144,17 +171,20 @@ def process_token(file_number, token_id):
                 )
 
                 total_rows += len(chunk_df)
+                write_log(f"Flushed final chunk rows={len(chunk_df)} total_rows={total_rows}")
                 publish("running", "Writing final chunk to CSV", rows_written=total_rows, total_steps=total_steps)
 
             buffer.clear()
 
         # --- Handle empty output ---
         if total_rows == 0:
+            write_log("No dataset rows written after processing")
             move_processed_files(token_id)
             publish("empty", "Empty dataset after processing", processed_steps=total_steps, total_steps=total_steps)
             return
 
         move_processed_files(token_id)
+        write_log(f"Completed token processing rows_written={total_rows}")
         publish(
             "done",
             "Completed",
@@ -164,6 +194,10 @@ def process_token(file_number, token_id):
         )
 
     except Exception as e:
+        import traceback
+
+        write_log(f"ERROR {type(e).__name__}: {str(e)}")
+        write_log(traceback.format_exc())
         publish("error", str(e))
         print(f"[{short_id}] ERROR → {str(e)}")
 

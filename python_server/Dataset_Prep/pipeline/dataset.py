@@ -2,6 +2,16 @@ import pandas as pd
 from tqdm import tqdm
 from indicators import IncrementalIndicatorEngine
 from Dataset_Prep.pipeline.monitor import get_memory
+from Dataset_Prep.config import (
+    window_size,
+    step_size,
+    up_threshold,
+    down_threshold,
+    stable_threshold,
+    timeframe_minutes,
+    target_samples,
+    history_bars,
+)
 
 def add_common_features(base_flattened, first_open, first_high, first_low, first_close, volume_sum, window_len, high_window, low_window, current_close, ts_i):
     base_flattened["volume_sum"] = volume_sum
@@ -22,14 +32,14 @@ def add_common_features(base_flattened, first_open, first_high, first_low, first
 def create_forward_label_dataset_stream(
     df,
     token_id,
-    window_size,
-    step_size,
-    up_threshold,
-    down_threshold,
-    stable_threshold,
-    timeframe,
-    history_bars=300,
-    target_samples=20,
+    window_size=window_size,
+    step_size=step_size,
+    up_threshold=up_threshold,
+    down_threshold=down_threshold,
+    stable_threshold=stable_threshold,
+    timeframe=timeframe_minutes,
+    history_bars=history_bars,
+    target_samples=target_samples,
     prediction_horizons=(10, 20, 30),
     progress_callback=None,
     progress_every=100,
