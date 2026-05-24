@@ -214,6 +214,9 @@ def _finalize_upload_session(address, name, payload_id):
         pass
     upload_sessions.pop(address, None)
 
+    print(f"📊 Final stats count: {len(stats)}")
+    print(f"📊 Final candles count: {sum(len(v) for v in timeframes.values())}")
+
     return {
         "status": "finalized",
         "message": f"Finalized {sum(len(values) for values in timeframes.values())} candles",
@@ -241,32 +244,43 @@ def _process_payload(data):
 
     candle_file = DATA_DIR_CANDLES / f"{address}_candles.json"
     stats_file = DATA_DIR_STATS / f"{address}_stats.json"
+
     existing_session = upload_sessions.get(address)
     same_inflight_payload = existing_session is not None and existing_session.get("payload_id") == payloadID
 
-    if not same_inflight_payload and (candle_file.exists() or stats_file.exists()):
-        return {"status": "ignored", "message": "Token already exists"}, True
+    # 🔥 FIX: allow overwrite ONLY if new payload session
+    if not same_inflight_payload:
+        if candle_file.exists() or stats_file.exists():
+            return {"status": "ignored", "message": "Token already exists"}, True
 
+
+    # 🔥 FIX: always create session (candles-first safe)
     session = _get_or_create_upload_session(address, name, payloadID)
     session["name"] = name
     session["updated"] = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
+    # 🔥 FIX: spool ANY chunk (candles or stats)
     if candles_by_tf or stats_by_bucket:
         _spool_payload_chunk(session, candles_by_tf, stats_by_bucket)
-        for tf_key, candles in candles_by_tf.items():
-            if tf_key in RESOLUTIONS:
-                print(f"📥 {tf_key}: chunk stored with {len(candles)} candles")
 
+        if candles_by_tf:
+            for tf_key, candles in candles_by_tf.items():
+                if tf_key in RESOLUTIONS:
+                    print(f"📥 {tf_key}: {len(candles)} candles")
+
+        if stats_by_bucket:
+            print(f"📥 Stats: {len(stats_by_bucket)} buckets")
+
+    # 🔥 FIX: finalize ONLY on complete
     if is_complete:
         result, success = _finalize_upload_session(address, name, payloadID)
+
         if success:
-            print(f"🏁 Token {name} finalized for payload {payloadID}")
-            print(f"🏁 Token {name} merging complete")
+            print(f"🏁 Token {name} finalized ({payloadID})")
+
         return result, success
 
-    print(f"✅ Token {name} chunk accepted at {session['updated']}")
     return {"status": "ok"}, True
-
 
 @app.route('/receive', methods=["POST", "OPTIONS"])
 def receive():
