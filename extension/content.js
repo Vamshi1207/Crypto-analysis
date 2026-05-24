@@ -40,19 +40,38 @@ function setupIframeInjection() {
       script.async = false;
 
       script.onload = () => {
-        console.log("[inject] injected.js loaded via extension URL");
-        // Send token info after small delay so injected.js can set up its message listener
-        setTimeout(() => {
-          try {
-            iframe.contentWindow.postMessage(
-              { type: "tokenInfo", address: tokenAddress, name: tokenName },
-              "*"
-            );
-          } catch (e) {
-            console.warn("[inject] postMessage failed", e);
-          }
-        }, 100);
+      console.log("[inject] injected.js loaded via extension URL");
+
+      const sendTokenInfo = () => {
+        try {
+          iframe.contentWindow.postMessage(
+            { type: "tokenInfo", address: tokenAddress, name: tokenName },
+            "*"
+          );
+          console.log("📤 Sent tokenInfo");
+        } catch (e) {
+          console.warn("[inject] postMessage failed", e);
+        }
       };
+
+      // 🔥 NEW: listen for injected.js ready signal
+      const readyListener = (event) => {
+        if (event.data?.type === "injectedReady") {
+          console.log("✅ injected.js ready");
+
+          window.removeEventListener("message", readyListener);
+          sendTokenInfo();
+        }
+      };
+
+      window.addEventListener("message", readyListener);
+
+      // 🔥 fallback (in case ready message is missed)
+      setTimeout(() => {
+        console.warn("⚠️ Fallback token send");
+        sendTokenInfo();
+      }, 1000);
+    };
 
       script.onerror = (e) => {
         console.warn("[inject] extension script load failed", e);

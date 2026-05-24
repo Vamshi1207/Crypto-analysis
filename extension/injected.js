@@ -9,6 +9,8 @@ let token = { address: "unknown", name: "unknown" };
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const encoder = new TextEncoder();
 const MAX_MESSAGE_BYTES = 8 * 1024 * 1024;
+let candlesCountByResolution = {};
+const timeframePriority = ["60", "30", "15", "5", "3", "1", "30S", "15S", "5S"];
 
 window.addEventListener("message", (event) => {
   if (event.data?.type === "tokenInfo") {
@@ -19,6 +21,25 @@ window.addEventListener("message", (event) => {
     console.log("💡 Token info received:", token);
   }
 });
+
+const waitForToken = () => {
+  return new Promise((resolve, reject) => {
+    let waited = 0;
+
+    const interval = setInterval(() => {
+      if (token.address && token.address !== "unknown") {
+        clearInterval(interval);
+        resolve(token.address);
+      }
+
+      waited += 100;
+      if (waited > 5000) {
+        clearInterval(interval);
+        reject("Token not received in time");
+      }
+    }, 100);
+  });
+};
 
 (async () => {
   const waitForChart = () => {
@@ -37,8 +58,9 @@ window.addEventListener("message", (event) => {
 
   const { engine, datafeed } = await waitForChart();
   console.log("🔍 Available resolve keys:", Object.keys(engine._resolveRequests));
+  const mint = await waitForToken();
+  console.log("✅ Using token:", mint);
 
-  const mint = token.address;
 
   // Find the key that starts with your mint address (case-insensitive)
   const resolveKey = Object.keys(engine._resolveRequests).find(key => 
@@ -83,6 +105,48 @@ window.addEventListener("message", (event) => {
 	"30": 48,
 	"60": 24
 	};
+
+
+const shouldProcessToken = async () => {
+  if (!mint || mint === "unknown") {
+    console.warn("⚠️ Invalid token, skipping");
+    return false;
+  }
+
+  try {
+    console.log("🔍 Checking token validity via stats page 1...");
+
+    const response = await fetch(
+      `https://api3.axiom.trade/pair-stats?pairAddress=${encodeURIComponent(mint)}&page=1`,
+      { credentials: "include" }
+    );
+
+    if (!response.ok) {
+      console.warn("⚠️ Stats check failed:", response.status);
+      return false;
+    }
+
+    const stats = await response.json();
+
+    if (!Array.isArray(stats)) {
+      console.warn("⚠️ Invalid stats response, skipping");
+      return false;
+    }
+
+    console.log(`📊 First page stats count: ${stats.length}`);
+
+    if (stats.length < 100) {
+      console.log("⛔ Skipping token (low activity)");
+      return false;
+    }
+
+    return true;
+
+  } catch (err) {
+    console.warn("⚠️ Stats check error, skipping:", err);
+    return false;
+  }
+};	
 
   const payloadId = Date.now() + "_" + Math.floor(Math.random() * 10000);
   console.log("🆔 Upload session started", { payloadId, token });
@@ -240,6 +304,7 @@ window.addEventListener("message", (event) => {
 	const now = Math.floor(Date.now() / 1000);
 	const pageBars = historyPageBars[res];
 	const pageSeconds = secondsPerBar[res] * pageBars;
+	const MAX_CANDLES_PER_RESOLUTION = res === "60" ? 10000 : 50000;
 	let to = now;
 	let firstRequest = true;
 	let pageCount = 0;
@@ -247,6 +312,12 @@ window.addEventListener("message", (event) => {
 	let totalBarsSent = 0;
 
 	while (true) {
+	  // Stop if we've already sent 50K candles
+	  if (totalBarsSent >= MAX_CANDLES_PER_RESOLUTION) {
+		stopReason = "reached_50k_limit";
+		break;
+	  }
+
 	  const from = Math.max(0, to - pageSeconds);
 	  const pageResult = await fetchBarsPage(res, from, to, pageBars, firstRequest);
 	  const bars = pageResult.bars;
@@ -301,6 +372,7 @@ window.addEventListener("message", (event) => {
 	console.log(
 	  `✅ [${payloadId}] ${res} history sent: ${totalBarsSent} bars across ${pageCount} page(s); stop=${stopReason}`
 	);
+	candlesCountByResolution[res] = totalBarsSent;
   };
   const fetchAndSendAllBars = async () => {
 	for (const res of resolutions) {
@@ -315,39 +387,101 @@ window.addEventListener("message", (event) => {
 	  return;
 	}
 
-	try {
-	  const response = await fetch(
-		`https://api3.axiom.trade/pair-stats?pairAddress=${encodeURIComponent(mint)}`,
-		{ credentials: "include" }
-	  );
+	let allStats = [];
+	let page = 1;
+	let baseCandles = 0;
+	let baseResolution = null;
 
-	  if (!response.ok) {
-		throw new Error(`HTTP ${response.status}`);
-	  }
-
-	  const stats = await response.json();
-	  if (!Array.isArray(stats)) {
-		console.warn("⚠️ pair-stats response is not an array", stats);
-		return;
-	  }
-
-	  initialStats = stats;
-	  console.log(`✅ [${payloadId}] Initial stats fetched. Buckets count:`, stats.length);
-	} catch (error) {
-	  console.error("❌ Failed to fetch initial stats:", error);
+	for (const tf of timeframePriority) {
+	const count = candlesCountByResolution[tf] || 0;
+	if (count > 0) {
+		baseCandles = count;
+		baseResolution = tf;
+		break;
 	}
+	}
+
+	let estimatedStats = 0;
+
+	if (baseCandles > 0 && baseResolution) {
+	const seconds = secondsPerBar[baseResolution];
+	
+	// convert candles → minutes
+	const totalMinutes = (baseCandles * seconds) / 60;
+
+	estimatedStats = Math.floor(totalMinutes);
+	}
+
+	const MAX_STATS_ITEMS = Math.min(estimatedStats, 50000);
+	console.log(`📊 Max stats to be sent ${MAX_STATS_ITEMS}`);
+
+
+	while (allStats.length < MAX_STATS_ITEMS) {
+	  try {
+		const response = await fetch(
+		  `https://api3.axiom.trade/pair-stats?pairAddress=${encodeURIComponent(mint)}&page=${page}`,
+		  { credentials: "include" }
+		);
+
+		if (!response.ok) {
+		  console.log(`⚠️ Failed to fetch stats page ${page}, stopping: ${response.status}`);
+		  break;
+		}
+
+		const stats = await response.json();
+		if (!Array.isArray(stats) || stats.length === 0) {
+		  console.log(`✅ No more stats on page ${page}, total pages: ${page - 1}`);
+		  break;
+		}
+
+		allStats.push(...stats);
+		console.log(`✅ Fetched stats page ${page}: ${stats.length} items (total so far: ${allStats.length})`);
+		page++;
+
+		// Sleep to avoid rate limiting
+		await sleep(1000);
+	  } catch (error) {
+		console.error(`❌ Error fetching stats page ${page}:`, error);
+		break;
+	  }
+	}
+
+	initialStats = allStats;
+	console.log(`✅ Initial stats fetched. Total buckets:`, allStats.length);
   };
 
   let initialStats = [];
 
-  await fetchInitialStats();
-  await sendInitialPayloadInChunks();
-  console.log(`✅ [${payloadId}] Initial stats sent`);
+  // 🔥 PRE-CHECK: Should we process this token?
+  const shouldProcess = await shouldProcessToken();
+
+  if (!shouldProcess) {
+    console.log(`⏭️ [${payloadId}] Skipping token early`);
+
+    // send finalize so background moves on
+    sendFinalizeToParent();
+
+    console.log(`🏁 [${payloadId}] Finalize (skipped token)`);
+    return;
+  }
+
+  // 🔥 STEP 1: Fetch & stream candles FIRST
   await fetchAndSendAllBars();
-  console.log(`✅ [${payloadId}] Initial payload sent`);
+  console.log(`✅ [${payloadId}] Candles streaming complete`);
+
+  // 🔥 STEP 2: Fetch stats AFTER candles
+  await fetchInitialStats();
+
+  // 🔥 STEP 3: Send stats
+  await sendInitialPayloadInChunks();
+  console.log(`✅ [${payloadId}] Stats sent`);
+
+  // 🔥 STEP 4: Finalize
   sendFinalizeToParent();
   console.log(`🏁 [${payloadId}] Finalize signal sent`);
-  //startSubscriptions();
+
+
+  //startSubscriptions();  //🔥 Start subscription
 
 	const latestBars = {};
 	const lastBarTime = {};  // Track last sent bar time per resolution
