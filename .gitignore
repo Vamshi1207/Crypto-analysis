@@ -4,3 +4,8 @@ python_server/ML_Training_datasets/*
 CandleData/*
 TA/*
 BKP/*
+.DS_Store
+extension/.ipynb_checkpoints/
+python_server/.DS_Store
+python_server/.Trash-0/
+.continue/

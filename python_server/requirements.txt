@@ -1,4 +1,10 @@
 flask
 flask-sock
 numpy
+pandas
+openpyxl
+tqdm
+scikit-learn
+xgboost
 talipp
+jupyter
