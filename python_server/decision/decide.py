@@ -12,6 +12,8 @@ import time
 from typing import Any, Optional
 
 from decision import calibrate, dataset, forecast, packet as packet_mod
+from decision import indicators_signal
+from decision import pipeline_log
 from decision import store as decision_store
 from decision.packet import (
     COVERAGE_TARGET,
@@ -96,7 +98,73 @@ def decide(
     warnings: list[str] = []
     gates_passed: list[str] = []
     gates_failed: list[str] = []
+    live_name = (live_token or {}).get("name") if live_token else None
 
+    with pipeline_log.run(prefix="dec-") as run_id:
+        pipeline_log.emit(
+            "decide",
+            "start",
+            address=address or corpus_address,
+            mint=mint,
+            symbol=live_name,
+            mode=mode.value,
+            timeframe=timeframe,
+            horizon=horizon,
+            has_live_token=live_token is not None,
+            source=(
+                (live_token or {}).get("source")
+                if live_token
+                else ("corpus" if corpus_address else "thin")
+            ),
+        )
+        try:
+            card = _decide_body(
+                address=address,
+                mint=mint,
+                mode=mode,
+                timeframe=timeframe,
+                horizon=horizon,
+                live_token=live_token,
+                corpus_address=corpus_address,
+                skip_safety=skip_safety,
+                run_safety=run_safety,
+                started=started,
+                warnings=warnings,
+                gates_passed=gates_passed,
+                gates_failed=gates_failed,
+            )
+            pipeline_log.emit_decide_card(card, run_id=run_id)
+            return card
+        except Exception as exc:
+            pipeline_log.emit(
+                "decide",
+                "error",
+                level="error",
+                address=address or corpus_address,
+                mint=mint,
+                symbol=live_name,
+                reason=f"{type(exc).__name__}: {exc}",
+                duration_ms=pipeline_log.timed_ms(started),
+            )
+            raise
+
+
+def _decide_body(
+    *,
+    address: Optional[str],
+    mint: Optional[str],
+    mode: DecideMode,
+    timeframe: str,
+    horizon: int,
+    live_token: Optional[dict[str, Any]],
+    corpus_address: Optional[str],
+    skip_safety: bool,
+    run_safety: bool,
+    started: float,
+    warnings: list[str],
+    gates_passed: list[str],
+    gates_failed: list[str],
+) -> DecisionCard:
     if mode in (DecideMode.FULL, DecideMode.DEEP):
         warnings.append(f"mode={mode.value}: running specialist desk + risk committee")
     elif mode is not DecideMode.FAST:
@@ -123,6 +191,13 @@ def decide(
                 source="live",
             )
             gates_failed.append("gate0")
+            pipeline_log.emit(
+                "gate0",
+                "fail",
+                level="warning",
+                address=address,
+                reason=f"could not resolve mint: {resolve_err}",
+            )
             return _avoid_card(
                 market_packet,
                 mode=mode,
@@ -138,6 +213,14 @@ def decide(
         if resolved_meta and resolved_meta.get("source") == "dexscreener_pair":
             warnings.append(
                 f"resolved pool→mint via DexScreener ({resolved_meta.get('mint')})"
+            )
+            pipeline_log.emit(
+                "gate0",
+                "resolve",
+                address=address,
+                mint=gate_mint,
+                symbol=resolved_meta.get("symbol"),
+                resolve_source=resolved_meta.get("source"),
             )
 
     if live_token is not None and address:
@@ -174,9 +257,24 @@ def decide(
     # --- Gate 0 ---
     if skip_safety:
         gates_passed.append("gate0_skipped")
+        pipeline_log.emit(
+            "gate0",
+            "skip",
+            address=market_packet.address,
+            mint=market_packet.mint,
+            symbol=market_packet.name,
+        )
     elif safety is None:
         gates_failed.append("gate0")
         warnings.append("safety report missing")
+        pipeline_log.emit(
+            "gate0",
+            "fail",
+            level="warning",
+            address=market_packet.address,
+            mint=market_packet.mint,
+            reason="safety unavailable",
+        )
         return _avoid_card(
             market_packet,
             mode=mode,
@@ -191,6 +289,17 @@ def decide(
         )
     elif safety.blocking:
         gates_failed.append("gate0")
+        pipeline_log.emit(
+            "gate0",
+            "fail",
+            level="warning",
+            address=market_packet.address,
+            mint=market_packet.mint,
+            symbol=market_packet.name,
+            verdict=safety.verdict.value,
+            risk_score=safety.risk_score,
+            reason=safety.summary(),
+        )
         return _avoid_card(
             market_packet,
             mode=mode,
@@ -205,6 +314,16 @@ def decide(
         )
     else:
         gates_passed.append("gate0")
+        pipeline_log.emit(
+            "gate0",
+            "pass",
+            address=market_packet.address,
+            mint=market_packet.mint,
+            symbol=market_packet.name,
+            verdict=safety.verdict.value,
+            risk_score=safety.risk_score,
+            degraded=safety.degraded,
+        )
         if safety.verdict is SafetyVerdict.CAUTION:
             warnings.append(f"safety caution: {safety.summary()}")
 
@@ -224,6 +343,16 @@ def decide(
     warnings.extend(tradable.warnings)
     if not tradable.passed:
         gates_failed.append("gate1")
+        pipeline_log.emit(
+            "gate1",
+            "fail",
+            level="warning",
+            address=market_packet.address,
+            mint=market_packet.mint,
+            symbol=market_packet.name,
+            timeframe=timeframe,
+            reason="; ".join(tradable.reasons),
+        )
         return _hold_card(
             market_packet,
             mode=mode,
@@ -238,6 +367,15 @@ def decide(
             action=Action.HOLD,
         )
     gates_passed.append("gate1")
+    pipeline_log.emit(
+        "gate1",
+        "pass",
+        address=market_packet.address,
+        mint=market_packet.mint,
+        symbol=market_packet.name,
+        timeframe=timeframe,
+        horizon=horizon,
+    )
 
     # --- Forecast + conformal ---
     tf = market_packet.timeframes[timeframe]
@@ -249,6 +387,15 @@ def decide(
         ens = calibrate.apply_conformal(ens)
     except Exception as exc:  # noqa: BLE001
         gates_failed.append("forecast")
+        pipeline_log.emit(
+            "forecast",
+            "fail",
+            level="error",
+            address=market_packet.address,
+            mint=market_packet.mint,
+            symbol=market_packet.name,
+            reason=str(exc),
+        )
         return _hold_card(
             market_packet,
             mode=mode,
@@ -262,6 +409,19 @@ def decide(
             safety=safety,
         )
     gates_passed.append("forecast")
+    pipeline_log.emit(
+        "forecast",
+        "pass",
+        address=market_packet.address,
+        mint=market_packet.mint,
+        symbol=market_packet.name,
+        p50=ens.calibrated.p50,
+        p10=ens.calibrated.p10,
+        p90=ens.calibrated.p90,
+        agreement=ens.agreement,
+        backend=ens.backend,
+        residual_count=ens.residual_count,
+    )
 
     band = ens.calibrated
     cost = market_packet.est_round_trip_cost_pct or 2.0
@@ -277,6 +437,25 @@ def decide(
     edge_ok = edge >= need_edge and profit_usd >= TARGET_PROFIT_USD
     if not edge_ok or direction is Direction.SIDEWAYS:
         gates_failed.append("gate2")
+        reason = (
+            f"edge {edge:+.2f}% (${profit_usd:+.2f} on ${SCALP_SIZE_USD:.0f}) "
+            f"below target ${TARGET_PROFIT_USD:.2f} "
+            f"(need ≥{need_edge:.2f}%, cost≈{cost:.2f}%)"
+            if not edge_ok
+            else "forecast is sideways"
+        )
+        pipeline_log.emit(
+            "gate2",
+            "fail",
+            address=market_packet.address,
+            mint=market_packet.mint,
+            symbol=market_packet.name,
+            edge=round(edge, 4),
+            cost=cost,
+            need_edge=need_edge,
+            direction=direction.value,
+            reason=reason,
+        )
         card = _card_from_forecast(
             market_packet,
             ens=ens,
@@ -285,16 +464,7 @@ def decide(
             direction=direction,
             edge=edge,
             confidence=_confidence(ens, safety, edge, passed_edge=False),
-            warnings=warnings
-            + [
-                (
-                    f"edge {edge:+.2f}% (${profit_usd:+.2f} on ${SCALP_SIZE_USD:.0f}) "
-                    f"below target ${TARGET_PROFIT_USD:.2f} "
-                    f"(need ≥{need_edge:.2f}%, cost≈{cost:.2f}%)"
-                    if not edge_ok
-                    else "forecast is sideways"
-                )
-            ],
+            warnings=warnings + [reason],
             gates_passed=gates_passed,
             gates_failed=gates_failed,
             started=started,
@@ -303,6 +473,73 @@ def decide(
         return _finalize(card, market_packet, mode=mode, started=started)
 
     gates_passed.append("gate2")
+    pipeline_log.emit(
+        "gate2",
+        "pass",
+        address=market_packet.address,
+        mint=market_packet.mint,
+        symbol=market_packet.name,
+        edge=round(edge, 4),
+        cost=cost,
+        need_edge=need_edge,
+        direction=direction.value,
+        profit_usd=round(profit_usd, 4),
+    )
+
+    # --- Indicator alignment (after edge clears; does not replace Gate 2) ---
+    ind_sig = indicators_signal.evaluate_for_direction(tf.indicators, direction)
+    pipeline_log.emit(
+        "indicators",
+        "score",
+        address=market_packet.address,
+        mint=market_packet.mint,
+        symbol=market_packet.name,
+        score=ind_sig.score,
+        available=ind_sig.available,
+        reason=ind_sig.reason,
+        votes=ind_sig.votes,
+    )
+    if ind_sig.available and (ind_sig.hard_block or not ind_sig.soft_ok):
+        gates_failed.append("indicators")
+        pipeline_log.emit(
+            "indicators",
+            "fail",
+            level="warning",
+            address=market_packet.address,
+            mint=market_packet.mint,
+            symbol=market_packet.name,
+            score=ind_sig.score,
+            reason=ind_sig.reason,
+        )
+        card = _card_from_forecast(
+            market_packet,
+            ens=ens,
+            mode=mode,
+            action=Action.HOLD,
+            direction=direction,
+            edge=edge,
+            confidence=_confidence(
+                ens,
+                safety,
+                edge,
+                passed_edge=True,
+                indicator_mult=indicators_signal.confidence_multiplier(ind_sig),
+            ),
+            warnings=warnings + [ind_sig.reason],
+            gates_passed=gates_passed,
+            gates_failed=gates_failed,
+            started=started,
+            safety=safety,
+            indicator_signal=ind_sig,
+        )
+        return _finalize(card, market_packet, mode=mode, started=started)
+
+    if ind_sig.available:
+        gates_passed.append("indicators")
+        warnings.append(ind_sig.reason)
+    else:
+        warnings.append(f"indicator gate skipped: {ind_sig.reason}")
+
     action = Action.BUY if direction is Direction.UP else Action.AVOID
     # Downside with edge → avoid (we are long-biased for memecoins).
     if direction is Direction.DOWN:
@@ -316,7 +553,13 @@ def decide(
         action=action,
         direction=direction,
         edge=edge,
-        confidence=_confidence(ens, safety, edge, passed_edge=True),
+        confidence=_confidence(
+            ens,
+            safety,
+            edge,
+            passed_edge=True,
+            indicator_mult=indicators_signal.confidence_multiplier(ind_sig),
+        ),
         warnings=warnings
         + [
             f"scalp edge {edge:+.2f}% → ${profit_usd:+.2f} on ${SCALP_SIZE_USD:.0f} "
@@ -326,6 +569,7 @@ def decide(
         gates_failed=gates_failed,
         started=started,
         safety=safety,
+        indicator_signal=ind_sig,
     )
     return _finalize(card, market_packet, mode=mode, started=started)
 
@@ -344,6 +588,7 @@ def _confidence(
     edge: float,
     *,
     passed_edge: bool,
+    indicator_mult: float = 1.0,
 ) -> float:
     base = 0.35 + 0.35 * ens.agreement
     if ens.residual_count >= 30:
@@ -354,6 +599,7 @@ def _confidence(
         base *= 0.75
     if safety and safety.degraded:
         base *= 0.9
+    base *= max(0.55, min(1.2, float(indicator_mult or 1.0)))
     return round(min(0.95, max(0.05, base)), 3)
 
 
@@ -422,6 +668,7 @@ def _card_from_forecast(
     gates_failed: list[str],
     started: float,
     safety: Optional[SafetyReport],
+    indicator_signal: Optional[indicators_signal.IndicatorSignal] = None,
 ) -> DecisionCard:
     band = ens.calibrated
     drivers = [
@@ -436,6 +683,14 @@ def _card_from_forecast(
             weight=0.2,
         )
     )
+    if indicator_signal and indicator_signal.available:
+        drivers.append(
+            Driver(
+                source="indicators",
+                claim=indicator_signal.reason,
+                weight=0.25,
+            )
+        )
     return DecisionCard(
         token={
             "address": packet.address,
@@ -447,7 +702,9 @@ def _card_from_forecast(
         timeframe=ens.timeframe,
         action=action,
         action_confidence=confidence,
-        confidence_basis="conformal_coverage + model_agreement + safety + edge",
+        confidence_basis=(
+            "conformal_coverage + model_agreement + safety + edge + indicators"
+        ),
         direction=direction,
         expected_return_pct=band,
         interval_coverage_target=ens.coverage_target,
@@ -535,6 +792,21 @@ def _finalize(
         review = vibe_mod.review_card(card, packet, mode=mode)
         card = vibe_mod.apply_review(card, review)
         card.warnings.append(f"vibe backend={review.backend}")
+        pipeline_log.emit(
+            "gate3",
+            "pass" if review.risk_pass else "fail",
+            level="info" if review.risk_pass else "warning",
+            address=packet.address,
+            mint=packet.mint,
+            symbol=packet.name,
+            risk_pass=review.risk_pass,
+            action_override=getattr(review.action_override, "value", None)
+            if review.action_override
+            else None,
+            veto=list(review.veto_reasons or [])[:5] or None,
+            backend=review.backend,
+            specialists=len(review.opinions or []),
+        )
     card.latency_ms = int((time.perf_counter() - started) * 1000)
     # Gate 4 portfolio limits checked at paper execute time.
     if "gate4" not in card.gates_passed and "gate4" not in card.gates_failed:
@@ -547,4 +819,10 @@ def _log(card: DecisionCard) -> None:
     try:
         decision_store.append("decisions", card)
     except OSError as exc:
-        print(f"⚠️ could not log decision: {exc}")
+        pipeline_log.emit(
+            "decide",
+            "log_error",
+            level="error",
+            reason=str(exc),
+            address=(card.token or {}).get("address"),
+        )

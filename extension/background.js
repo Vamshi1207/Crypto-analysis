@@ -200,7 +200,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       token: msg.token?.name,
       initial: msg.initial,
       live: msg.live === true,
-      complete: msg.complete === true
+      complete: msg.complete === true,
+      stats: Array.isArray(msg.payload?.stats) ? msg.payload.stats.length : 0
     });
     const payload = {
       id: msg.id,

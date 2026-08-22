@@ -2,17 +2,21 @@ from collections import deque
 
 from talipp.indicators import (
     ADX,
+    AO,
     ATR,
     BB,
     CCI,
     EMA,
     MACD,
+    NATR,
     OBV,
     ROC,
     RSI,
     Stoch,
+    StochRSI,
     SuperTrend,
     VWAP,
+    Williams,
 )
 
 
@@ -47,12 +51,16 @@ class IncrementalIndicatorEngine:
         self.vwap = VWAP()
         self.adx = ADX(14, 14)
         self.stoch = Stoch(14, 3)
+        self.stoch_rsi = StochRSI(14, 14, 3, 3)
         self.boll = BB(20, 2.0)
         self.obv = OBV()
         self.atr = ATR(14)
+        self.natr = NATR(14)
         self.supertrend = SuperTrend(10, 3)
         self.cci = CCI(20)
         self.roc = ROC(12)
+        self.ao = AO(5, 34)
+        self.williams = Williams(14)
 
         # We only need the recent closes for momentum and the latest close for snapshots.
         self.recent_closes = deque(maxlen=4)
@@ -80,14 +88,18 @@ class IncrementalIndicatorEngine:
         self.macd.add(close)
         self.boll.add(close)
         self.roc.add(close)
+        self.stoch_rsi.add(close)
 
         self.vwap.add(candle)
         self.adx.add(candle)
         self.stoch.add(candle)
         self.obv.add(candle)
         self.atr.add(candle)
+        self.natr.add(candle)
         self.supertrend.add(candle)
         self.cci.add(candle)
+        self.ao.add(candle)
+        self.williams.add(candle)
 
         try:
             if len(self.ema10) >= 2 and len(self.ema50) >= 2:
@@ -125,11 +137,14 @@ class IncrementalIndicatorEngine:
             "minus_di": _safe_last(self.adx, "minus_di"),
             "stoch_k": _safe_last(self.stoch, "k"),
             "stoch_d": _safe_last(self.stoch, "d"),
+            "stoch_rsi_k": _safe_last(self.stoch_rsi, "k"),
+            "stoch_rsi_d": _safe_last(self.stoch_rsi, "d"),
             "boll_upper": boll_upper,
             "boll_middle": _safe_last(self.boll, "cb"),
             "boll_lower": boll_lower,
             "boll_percent": boll_percent,
             "atr": _safe_last(self.atr),
+            "natr": _safe_last(self.natr),
             "obv": _safe_last(self.obv),
             "supertrend_value": (
                 float(supertrend_last.value) if supertrend_last is not None else None
@@ -139,6 +154,8 @@ class IncrementalIndicatorEngine:
             ),
             "cci": _safe_last(self.cci),
             "roc": _safe_last(self.roc),
+            "ao": _safe_last(self.ao),
+            "williams_r": _safe_last(self.williams),
             "momentum3": (
                 round(self.recent_closes[-1] - self.recent_closes[0], 2)
                 if len(self.recent_closes) >= 4

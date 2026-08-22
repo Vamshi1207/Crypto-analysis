@@ -224,3 +224,93 @@ def coverage_check(
         "target": COVERAGE_TARGET,
         "residuals": load_residuals().get("n", 0),
     }
+
+
+def fit_from_outcomes(
+    *,
+    coverage_target: float = COVERAGE_TARGET,
+    min_errors: int = 30,
+    merge_with_existing: bool = True,
+    days: int = 7,
+) -> dict:
+    """Refit conformal residuals from the live outcome scoreboard.
+
+    Each scored row contributes ``|realized_pct - predicted_p50|``. Paper
+    positions now stamp the DecisionCard band at entry, so these residuals
+    match the forecasts the gates actually used — unlike the corpus fit which
+    was 1m archive data applied to 5S lives.
+
+    With fewer than ``min_errors`` live residuals, keeps the existing store
+    (unless it is empty) and reports ``status=insufficient``.
+    """
+    from datetime import date, timedelta
+
+    from decision import store as decision_store
+
+    today = date.today()
+    errors: list[float] = []
+    used_days = 0
+    for offset in range(max(1, days)):
+        day = today - timedelta(days=offset)
+        rows = list(decision_store.read("outcomes", day))
+        if not rows:
+            continue
+        used_days += 1
+        for row in rows:
+            try:
+                pred = float(row.get("predicted_p50"))
+                realized = float(row.get("realized_pct"))
+            except (TypeError, ValueError):
+                continue
+            # Skip placeholder zeros that predate forecast stamping on opens.
+            if pred == 0.0 and abs(realized) > 50:
+                continue
+            errors.append(abs(realized - pred))
+
+    existing = load_residuals()
+    existing_errors = [float(e) for e in (existing.get("errors") or [])]
+    if merge_with_existing and existing_errors:
+        # Prefer live residuals; keep corpus as a floor until live is rich enough.
+        combined = errors + existing_errors
+        source = "live_outcomes+corpus"
+    else:
+        combined = list(errors)
+        source = "live_outcomes"
+
+    if len(errors) < min_errors and existing_errors:
+        return {
+            "status": "insufficient",
+            "live_n": len(errors),
+            "min_errors": min_errors,
+            "kept_existing_n": len(existing_errors),
+            "days_scanned": used_days,
+            "source": existing.get("source") or existing.get("timeframe"),
+        }
+
+    if not combined:
+        return {
+            "status": "empty",
+            "live_n": 0,
+            "min_errors": min_errors,
+            "days_scanned": used_days,
+        }
+
+    payload = {
+        "coverage_target": coverage_target,
+        "horizon": existing.get("horizon") or HORIZON_BARS,
+        "timeframe": "live",
+        "source": source,
+        "live_n": len(errors),
+        "corpus_n": len(existing_errors) if merge_with_existing else 0,
+        "days_scanned": used_days,
+        "tokens_used": None,
+        "errors": combined,
+        "error_p50": float(np.median(combined)),
+        "error_p80": float(np.quantile(combined, 0.8)),
+        "error_p90": float(np.quantile(combined, 0.9)),
+        "n": len(combined),
+    }
+    save_residuals(payload)
+    payload["status"] = "fitted"
+    # Don't dump the full error vector in API responses.
+    return {k: v for k, v in payload.items() if k != "errors"} | {"errors_n": len(combined)}

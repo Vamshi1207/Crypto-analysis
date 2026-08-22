@@ -232,15 +232,33 @@ def _forecast_specialist(card: DecisionCard, packet: MarketPacket) -> Specialist
 
 def _orderflow_specialist(card: DecisionCard, packet: MarketPacket) -> SpecialistOpinion:
     of = packet.orderflow or {}
+    # Prefer Axiom pair-stats 5m (Token Info buy/sell/vol) when streamed.
+    buys = of.get("buys_5m") if of.get("buys_5m") is not None else of.get("buys_h1")
+    sells = of.get("sells_5m") if of.get("sells_5m") is not None else of.get("sells_h1")
     ratio = of.get("buy_sell_ratio")
-    buys, sells = of.get("buys_h1"), of.get("sells_h1")
-    if isinstance(buys, int) and isinstance(sells, int) and buys + sells >= 20:
-        if sells == 0 and buys >= 20:
-            return SpecialistOpinion("orderflow", "avoid", 0.85, f"{buys} buys / 0 sells", 1.4)
+    window = "5m" if of.get("source") == "axiom_pair_stats_5m" else "h1"
+    # 5m windows are short — lower the trade-count floor vs the old h1 gate.
+    min_trades = 8 if window == "5m" else 20
+    if isinstance(buys, int) and isinstance(sells, int) and buys + sells >= min_trades:
+        if sells == 0 and buys >= min_trades:
+            return SpecialistOpinion(
+                "orderflow", "avoid", 0.85, f"{buys} buys / 0 sells ({window})", 1.4
+            )
         if ratio is not None and ratio >= 1.8:
-            return SpecialistOpinion("orderflow", "buy", 0.55, f"buy/sell {ratio}", 1.0)
+            return SpecialistOpinion(
+                "orderflow", "buy", 0.55, f"buy/sell {ratio} ({window})", 1.0
+            )
         if ratio is not None and ratio <= 0.55:
-            return SpecialistOpinion("orderflow", "avoid", 0.6, f"buy/sell {ratio}", 1.0)
+            return SpecialistOpinion(
+                "orderflow", "avoid", 0.6, f"buy/sell {ratio} ({window})", 1.0
+            )
+        return SpecialistOpinion(
+            "orderflow",
+            "hold",
+            0.5,
+            f"buy/sell {ratio} ({window}, {buys}b/{sells}s)",
+            0.9,
+        )
     return SpecialistOpinion("orderflow", "hold", 0.45, "orderflow inconclusive", 0.8)
 
 

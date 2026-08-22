@@ -70,6 +70,7 @@ def packet_from_candles(
     mint: Optional[str] = None,
     safety: Optional[SafetyReport] = None,
     market: Optional[MarketSnapshot] = None,
+    axiom_stats: Optional[list[dict[str, Any]]] = None,
     source: str = "live",
     tail: int = DEFAULT_TAIL,
     wanted: Optional[tuple[str, ...]] = None,
@@ -110,7 +111,7 @@ def packet_from_candles(
         as_of=datetime.now(timezone.utc),
         price=price if price is not None else snap.price_usd,
         timeframes=tf_packets,
-        orderflow=_orderflow_from_stats(snap),
+        orderflow=_orderflow_from_sources(snap, axiom_stats),
         safety=safety,
         market=snap,
         est_slippage_bps=slip,
@@ -168,24 +169,89 @@ def packet_from_live_token(
         timeframes=timeframes,
         mint=mint,
         safety=safety,
+        axiom_stats=token.get("stats") or [],
         source="live",
         tail=tail,
     )
 
 
-def _orderflow_from_stats(market: MarketSnapshot) -> dict[str, Any]:
-    buys = market.buys_h1
-    sells = market.sells_h1
-    ratio = None
-    if isinstance(buys, int) and isinstance(sells, int) and (buys + sells) > 0:
-        ratio = round(buys / max(sells, 1), 3)
+def _sum_stat_buckets(
+    buckets: list[dict[str, Any]],
+    *,
+    last_n: int,
+) -> dict[str, Any]:
+    """Sum Axiom pair-stats buckets. Each bucket is ~1 minute of flow."""
+    if not buckets or last_n <= 0:
+        return {}
+    window = buckets[-last_n:]
+    buys = sells = 0
+    buy_vol = sell_vol = 0.0
+    for b in window:
+        try:
+            buys += int(b.get("buyCount") or 0)
+            sells += int(b.get("sellCount") or 0)
+            buy_vol += float(b.get("buyVolumeSol") or 0.0)
+            sell_vol += float(b.get("sellVolumeSol") or 0.0)
+        except (TypeError, ValueError):
+            continue
+    total = buys + sells
+    ratio = round(buys / max(sells, 1), 3) if total > 0 else None
     return {
-        "buys_h1": buys,
-        "sells_h1": sells,
-        "buy_sell_ratio": ratio,
+        f"buys_{last_n}m": buys,
+        f"sells_{last_n}m": sells,
+        f"buy_volume_sol_{last_n}m": round(buy_vol, 6),
+        f"sell_volume_sol_{last_n}m": round(sell_vol, 6),
+        f"buy_sell_ratio_{last_n}m": ratio,
+        f"stats_buckets_{last_n}m": len(window),
+    }
+
+
+def _orderflow_from_sources(
+    market: MarketSnapshot,
+    axiom_stats: Optional[list[dict[str, Any]]] = None,
+) -> dict[str, Any]:
+    """Prefer Axiom pair-stats 5m flow; fall back to DexScreener h1."""
+    buys_h1 = market.buys_h1
+    sells_h1 = market.sells_h1
+    ratio_h1 = None
+    if isinstance(buys_h1, int) and isinstance(sells_h1, int) and (buys_h1 + sells_h1) > 0:
+        ratio_h1 = round(buys_h1 / max(sells_h1, 1), 3)
+
+    out: dict[str, Any] = {
+        "buys_h1": buys_h1,
+        "sells_h1": sells_h1,
+        "buy_sell_ratio": ratio_h1,
         "volume_h1": market.volume_h1,
         "volume_h24": market.volume_h24,
+        "source": "dexscreener_h1",
     }
+
+    buckets = [b for b in (axiom_stats or []) if isinstance(b, dict)]
+    if not buckets:
+        return out
+
+    # Sort by createdAt so "last N" is chronological even if ingest order varies.
+    def _ts(b: dict[str, Any]) -> str:
+        return str(b.get("createdAt") or "")
+
+    buckets = sorted(buckets, key=_ts)
+    out.update(_sum_stat_buckets(buckets, last_n=1))
+    out.update(_sum_stat_buckets(buckets, last_n=5))
+    # Scalp decision uses 5m as the primary imbalance signal.
+    ratio_5m = out.get("buy_sell_ratio_5m")
+    buys_5m = out.get("buys_5m")
+    sells_5m = out.get("sells_5m")
+    if isinstance(buys_5m, int) and isinstance(sells_5m, int) and buys_5m + sells_5m > 0:
+        out["buys"] = buys_5m
+        out["sells"] = sells_5m
+        out["buy_sell_ratio"] = ratio_5m
+        out["source"] = "axiom_pair_stats_5m"
+    return out
+
+
+# Back-compat alias used by older call sites / tests.
+def _orderflow_from_stats(market: MarketSnapshot) -> dict[str, Any]:
+    return _orderflow_from_sources(market, None)
 
 
 # Cost / edge thresholds used by Gate 2 (env-tunable).

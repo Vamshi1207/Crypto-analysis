@@ -17,7 +17,7 @@ from decision.schema import (
 
 def _card(action: Action = Action.BUY, edge: float = 5.0) -> DecisionCard:
     return DecisionCard(
-        token={"address": "Pool111", "mint": "Mint111", "name": "TEST", "source": "live"},
+        token={"address": "Pool111", "mint": "Mint-PipelinePool111", "name": "TEST", "source": "live"},
         horizon_bars=6,
         timeframe="5S",
         action=action,

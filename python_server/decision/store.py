@@ -68,3 +68,27 @@ def read(kind: str, day: Optional[date] = None) -> Iterator[dict[str, Any]]:
 
 def count(kind: str, day: Optional[date] = None) -> int:
     return sum(1 for _ in read(kind, day))
+
+
+def archive_today(kinds: list[str] | tuple[str, ...]) -> list[dict[str, str]]:
+    """Rename today's JSONL files aside so a new monitoring window starts empty.
+
+    History is preserved under ``store/<kind>/<day>.pre-<utc-stamp>.jsonl``.
+    """
+    stamp = datetime.now(timezone.utc).strftime("%H%M%SZ")
+    day = datetime.now(timezone.utc).date()
+    moved: list[dict[str, str]] = []
+    with _write_lock:
+        for kind in kinds:
+            src = _path_for(kind, day)
+            if not src.exists() or src.stat().st_size == 0:
+                continue
+            dst = src.with_name(f"{day.isoformat()}.pre-{stamp}.jsonl")
+            # Avoid clobbering an earlier archive in the same second.
+            n = 1
+            while dst.exists():
+                dst = src.with_name(f"{day.isoformat()}.pre-{stamp}-{n}.jsonl")
+                n += 1
+            src.rename(dst)
+            moved.append({"kind": kind, "from": str(src), "to": str(dst)})
+    return moved

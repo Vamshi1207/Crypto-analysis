@@ -23,6 +23,10 @@ from decision.config import (
 
 DEXSCREENER_TOKENS_URL = "https://api.dexscreener.com/latest/dex/tokens"
 DEXSCREENER_PAIR_URL = "https://api.dexscreener.com/latest/dex/pairs/solana"
+DEXSCREENER_BOOSTS_LATEST_URL = "https://api.dexscreener.com/token-boosts/latest/v1"
+DEXSCREENER_BOOSTS_TOP_URL = "https://api.dexscreener.com/token-boosts/top/v1"
+GECKO_BASE_URL = "https://api.geckoterminal.com/api/v2"
+GECKO_TRENDING_URL = f"{GECKO_BASE_URL}/networks/solana/trending_pools"
 
 # Jupiter has migrated hosts more than once; try the current one first and fall
 # back rather than hard-failing the sellability probe.
@@ -298,19 +302,111 @@ def fetch_dexscreener_pairs(mint: str) -> list[dict[str, Any]]:
     return cache.get_or_set("dexscreener", mint, produce)
 
 
-def fetch_sell_quote(mint: str, amount_raw: int) -> dict[str, Any]:
-    """Quote selling `amount_raw` base units of `mint` into wrapped SOL.
+def fetch_dexscreener_boosts(*, which: str = "latest") -> list[dict[str, Any]]:
+    """DexScreener paid boosts. `which` is ``latest`` or ``top``."""
 
-    Raises NoRouteError when Jupiter is reachable but cannot route the sell,
-    which is the strongest cheap signal that a token cannot be exited.
+    url = DEXSCREENER_BOOSTS_TOP_URL if which == "top" else DEXSCREENER_BOOSTS_LATEST_URL
+
+    def produce() -> list[dict[str, Any]]:
+        try:
+            response = _http().get(url)
+            response.raise_for_status()
+            body = response.json()
+        except (httpx.HTTPError, ValueError) as exc:
+            raise SourceError(f"dexscreener boosts ({which}): {exc}") from exc
+        if not isinstance(body, list):
+            raise SourceError(f"dexscreener boosts ({which}): unexpected payload")
+        return [row for row in body if isinstance(row, dict) and row.get("chainId") == "solana"]
+
+    return cache.get_or_set("dexscreener_boosts", which, produce)
+
+
+def fetch_gecko_trending_pools(*, page: int = 1) -> list[dict[str, Any]]:
+    """Solana trending pools from GeckoTerminal (keyless, ~30 rpm)."""
+
+    def produce() -> list[dict[str, Any]]:
+        try:
+            response = _http().get(GECKO_TRENDING_URL, params={"page": page})
+            response.raise_for_status()
+            body = response.json()
+        except (httpx.HTTPError, ValueError) as exc:
+            raise SourceError(f"gecko trending: {exc}") from exc
+        rows = body.get("data") or []
+        return [row for row in rows if isinstance(row, dict)]
+
+    return cache.get_or_set("gecko_trending", f"p{page}", produce)
+
+
+def fetch_gecko_ohlcv(
+    pool_address: str,
+    *,
+    timeframe: str = "minute",
+    aggregate: int = 1,
+    limit: int = 300,
+    currency: str = "usd",
+) -> list[list[float]]:
+    """Raw Gecko OHLCV rows: ``[ts_sec, open, high, low, close, volume]``.
+
+    Newest-first from the API; caller should sort ascending for the live buffer.
     """
+
+    key = f"{pool_address}:{timeframe}:{aggregate}:{limit}:{currency}"
+
+    def produce() -> list[list[float]]:
+        url = (
+            f"{GECKO_BASE_URL}/networks/solana/pools/{pool_address}"
+            f"/ohlcv/{timeframe}"
+        )
+        try:
+            response = _http().get(
+                url,
+                params={
+                    "aggregate": aggregate,
+                    "limit": limit,
+                    "currency": currency,
+                },
+            )
+            response.raise_for_status()
+            body = response.json()
+        except (httpx.HTTPError, ValueError) as exc:
+            raise SourceError(f"gecko ohlcv: {exc}") from exc
+
+        data = body.get("data") or {}
+        attrs = data.get("attributes") if isinstance(data, dict) else {}
+        rows = (attrs or {}).get("ohlcv_list") or []
+        out: list[list[float]] = []
+        for row in rows:
+            if not isinstance(row, (list, tuple)) or len(row) < 5:
+                continue
+            try:
+                out.append([float(row[i]) for i in range(6)] if len(row) >= 6 else [
+                    float(row[0]), float(row[1]), float(row[2]),
+                    float(row[3]), float(row[4]), 0.0,
+                ])
+            except (TypeError, ValueError):
+                continue
+        if not out:
+            raise SourceError("gecko ohlcv: empty series")
+        return out
+
+    return cache.get_or_set("gecko_ohlcv", key, produce)
+
+
+def fetch_jupiter_quote(
+    input_mint: str,
+    output_mint: str,
+    amount_raw: int,
+    *,
+    slippage_bps: int = 300,
+) -> dict[str, Any]:
+    """Quote a Jupiter swap. Raises NoRouteError when routable-but-impossible."""
 
     def produce() -> dict[str, Any]:
         params = {
-            "inputMint": mint,
-            "outputMint": WRAPPED_SOL_MINT,
+            "inputMint": input_mint,
+            "outputMint": output_mint,
             "amount": str(amount_raw),
-            "slippageBps": "300",
+            "slippageBps": str(slippage_bps),
             "restrictIntermediateTokens": "true",
         }
         last_error: Optional[str] = None
@@ -346,7 +442,17 @@ def fetch_sell_quote(mint: str, amount_raw: int) -> dict[str, Any]:
 
         raise SourceError(last_error or "jupiter unreachable")
 
-    return cache.get_or_set("jupiter_quote", f"{mint}:{amount_raw}", produce)
+    cache_key = f"{input_mint}->{output_mint}:{amount_raw}:{slippage_bps}"
+    return cache.get_or_set("jupiter_quote", cache_key, produce)
+
+
+def fetch_sell_quote(mint: str, amount_raw: int) -> dict[str, Any]:
+    """Quote selling `amount_raw` base units of `mint` into wrapped SOL.
+
+    Raises NoRouteError when Jupiter is reachable but cannot route the sell,
+    which is the strongest cheap signal that a token cannot be exited.
+    """
+    return fetch_jupiter_quote(mint, WRAPPED_SOL_MINT, amount_raw)
 
 
 def _safe_error_text(response: httpx.Response) -> str:

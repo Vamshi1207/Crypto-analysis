@@ -31,15 +31,41 @@ def dashboard():
 def data():
 
     tf = request.args.get("tf", "1S")
-    tf = tf.upper() 
+    tf = tf.upper()
     result = {}
+    # Prefer denser TFs when the requested one is empty (discover = 1m only).
+    fallback_order = ["5S", "15S", "30S", "1S", "1", "3", "5", "15", "30", "60"]
 
-    for addr, token in token_data.items():        
-        candles = token["timeframes"].get(tf)
+    for addr, token in token_data.items():
+        candles = (token.get("timeframes") or {}).get(tf)
+        used_tf = tf
+        if not candles:
+            for alt in fallback_order:
+                if alt == tf:
+                    continue
+                alt_rows = (token.get("timeframes") or {}).get(alt)
+                if alt_rows:
+                    candles = alt_rows
+                    used_tf = alt
+                    break
+
+        meta = {
+            "mint": token.get("mint"),
+            "discover": bool(token.get("discover")),
+            "role": token.get("role") or ("trade" if token.get("tradeable", True) else "observe"),
+            "tradeable": token.get("tradeable", True) is not False,
+            "cooled": bool(token.get("cooled")),
+            "liquidity_usd": token.get("liquidity_usd"),
+            "volume_24h_usd": token.get("volume_24h_usd"),
+            "discover_source": token.get("discover_source"),
+            "tf_used": used_tf,
+        }
+
         if not candles or len(candles) == 0:
             result[addr] = {
-                "name": token["name"],
-                "error": f"Not enough candles in timeframe '{tf}'. Got {len(candles) if candles else 0}."
+                "name": token.get("name"),
+                "error": f"Not enough candles in timeframe '{tf}'. Got 0.",
+                **meta,
             }
             continue
 
@@ -65,35 +91,21 @@ def data():
             })
 
             result[addr] = {
-                "name": token["name"],
+                "name": token.get("name"),
                 **price_data,
                 **indicators,
-                "analysis": analysis_result
+                "analysis": analysis_result,
+                "bars": len(candles),
+                **meta,
             }
-            
-            # ✅ Logging to file
-            # print(f"✅ Logged {token['name']} - {tf} timeframe")
-            # log_entry = {
-            #     "name": token["name"],
-            #     "address": addr,
-            #     "timeframe": tf,
-            #     **price_data,
-            #     **indicators,
-            #     "analysis": analysis_result
-            # }
-            #
-            # log_dir = r"C:\Users\vamsh\Downloads\TA MV2\Training data"
-            # os.makedirs(log_dir, exist_ok=True)  # Ensure dir exists
-            # log_path = Path(log_dir) / "training_data.jsonl"
-            # with open(log_path, "a", encoding="utf-8") as f:
-            #     f.write(json.dumps(log_entry, ensure_ascii=False) + "\n")
 
         except Exception as e:
             error_trace = traceback.format_exc()
             result[addr] = {
-                "name": token["name"],
+                "name": token.get("name"),
                 "error": f"{type(e).__name__}: {str(e)}",
-                "traceback": error_trace
+                "traceback": error_trace,
+                **meta,
             }
 
     return jsonify(result)
@@ -116,6 +128,7 @@ DATA_DIR_TMP.mkdir(parents=True, exist_ok=True)
 RESOLUTIONS = ["5S", "15S", "30S", "1", "3", "5", "15", "30", "60"]
 # Cap in-memory live series so long watching sessions stay bounded.
 LIVE_MAX_BARS_PER_TF = int(os.getenv("LIVE_MAX_BARS_PER_TF", "2000"))
+LIVE_MAX_STATS = int(os.getenv("LIVE_MAX_STATS", "120"))
 
 
 def _iter_candle_dicts(candles):
@@ -176,12 +189,17 @@ def _apply_live_candles(address, name, payload_id, candles_by_tf, stats_by_bucke
         for stat in stats_by_bucket:
             if isinstance(stat, dict) and "createdAt" in stat:
                 stats_map[stat["createdAt"]] = stat
-        token["stats"] = sorted(stats_map.values(), key=lambda s: s["createdAt"])
+        ordered_stats = sorted(stats_map.values(), key=lambda s: s["createdAt"])
+        if len(ordered_stats) > LIVE_MAX_STATS:
+            ordered_stats = ordered_stats[-LIVE_MAX_STATS:]
+        token["stats"] = ordered_stats
+        print(f"📊 live stats: +{len(stats_by_bucket)} → {len(token['stats'])} buckets ({name})")
 
     token_data[address] = token
     return {
         "status": "live_ok",
         "bars_merged": bars_merged,
+        "stats_count": len(token.get("stats") or []),
         "timeframes": {
             tf: len(token["timeframes"].get(tf, [])) for tf in RESOLUTIONS
         },
@@ -334,6 +352,8 @@ def _process_payload(data):
             for tf_key, candles in candles_by_tf.items():
                 if tf_key in RESOLUTIONS:
                     print(f"📡 live {tf_key}: +{len(candles)} bars → {name}")
+        if stats_by_bucket:
+            print(f"📡 live stats: +{len(stats_by_bucket)} buckets → {name}")
         return result, True
 
     candle_file = DATA_DIR_CANDLES / f"{address}_candles.json"
@@ -643,7 +663,61 @@ def portfolio_endpoint():
         body = request.get_json(silent=True) or {}
         if "kill_switch" in body:
             return jsonify(paper.set_kill_switch(bool(body.get("kill_switch"))))
-    return jsonify(paper.snapshot())
+
+    snap = paper.snapshot()
+    # Enrich open positions with live marks from the shared buffer (trading-desk PnL).
+    open_enriched = []
+    unrealized = 0.0
+    open_notional = 0.0
+    for pos in snap.get("open") or []:
+        if not isinstance(pos, dict):
+            continue
+        row = dict(pos)
+        addr = str(row.get("address") or "")
+        tok = token_data.get(addr) if addr else None
+        mark = None
+        if isinstance(tok, dict):
+            tfs = tok.get("timeframes") or {}
+            for key in ("5S", "15S", "30S", "1", "3", "5"):
+                bars = tfs.get(key) or []
+                if bars:
+                    try:
+                        mark = float(bars[-1].get("close"))
+                        break
+                    except (TypeError, ValueError, AttributeError):
+                        pass
+        entry = row.get("entry_price")
+        qty = row.get("qty")
+        u_pnl = None
+        u_pct = None
+        mark_value = None
+        try:
+            if mark is not None and entry is not None and qty is not None:
+                u_pnl = float(qty) * (float(mark) - float(entry))
+                u_pct = (float(mark) / float(entry) - 1.0) * 100.0 if float(entry) else None
+                mark_value = float(qty) * float(mark)
+                unrealized += u_pnl
+                open_notional += mark_value
+        except (TypeError, ValueError):
+            pass
+        row["mark_price"] = mark
+        row["unrealized_pnl_usd"] = None if u_pnl is None else round(u_pnl, 4)
+        row["unrealized_pct"] = None if u_pct is None else round(u_pct, 4)
+        row["mark_value_usd"] = None if mark_value is None else round(mark_value, 4)
+        open_enriched.append(row)
+
+    cash = float(snap.get("cash_usd") or 0.0)
+    realized = float(snap.get("realized_pnl_usd") or 0.0)
+    starting = 1000.0
+    equity = cash + open_notional
+    snap["open"] = open_enriched
+    snap["unrealized_pnl_usd"] = round(unrealized, 4)
+    snap["open_notional_usd"] = round(open_notional, 4)
+    snap["equity_usd"] = round(equity, 4)
+    snap["total_pnl_usd"] = round(realized + unrealized, 4)
+    snap["equity_pnl_usd"] = round(equity - starting, 4)
+    snap["starting_cash_usd"] = starting
+    return jsonify(snap)
 
 
 @app.route('/swarm', methods=["GET", "POST", "OPTIONS"])
@@ -671,6 +745,101 @@ def swarm_endpoint():
     return jsonify(swarm.status())
 
 
+@app.route('/discover', methods=["GET", "POST", "OPTIONS"])
+def discover_endpoint():
+    """Start/stop/force headless Solana discovery into token_data."""
+    if request.method == "OPTIONS":
+        return _build_cors_preflight_response()
+    from decision import discover
+
+    if request.method == "GET":
+        return jsonify(discover.status())
+
+    body = request.get_json(silent=True) or {}
+    action = (body.get("action") or "status").lower()
+    if action == "start":
+        interval = body.get("interval_s")
+        return jsonify(
+            discover.start(
+                interval_s=float(interval) if interval is not None else None,
+            )
+        )
+    if action == "stop":
+        return jsonify(discover.stop())
+    if action in ("scan", "force", "once"):
+        return jsonify(discover.scan_once())
+    return jsonify(discover.status())
+
+
+@app.route('/pipeline', methods=["GET", "OPTIONS"])
+def pipeline_endpoint():
+    """Recent structured pipeline events (discover → gates → paper → swarm)."""
+    if request.method == "OPTIONS":
+        return _build_cors_preflight_response()
+    from decision import pipeline_log
+
+    try:
+        limit = int(request.args.get("limit") or 100)
+    except (TypeError, ValueError):
+        limit = 100
+    stage = request.args.get("stage") or None
+    rows = pipeline_log.recent(limit=max(1, min(limit, 2000)), stage=stage)
+    return jsonify(
+        {
+            "n_today": pipeline_log.count_today(),
+            "returned": len(rows),
+            "stage": stage,
+            "events": rows,
+        }
+    )
+
+
+@app.route('/arb', methods=["GET", "POST", "OPTIONS"])
+def arb_endpoint():
+    """Paper-only cross-pool quote arbitrage (parallel to directional swarm)."""
+    if request.method == "OPTIONS":
+        return _build_cors_preflight_response()
+    from decision import arb
+
+    if request.method == "GET":
+        return jsonify(arb.status())
+
+    body = request.get_json(silent=True) or {}
+    action = (body.get("action") or "status").lower()
+    if action == "start":
+        interval = body.get("interval_s")
+        return jsonify(
+            arb.start(interval_s=float(interval) if interval is not None else None)
+        )
+    if action == "stop":
+        return jsonify(arb.stop())
+    if action in ("scan", "force", "once"):
+        return jsonify(arb.scan_once())
+    return jsonify(arb.status())
+
+
+@app.route('/readiness', methods=["GET", "OPTIONS"])
+def readiness_endpoint():
+    """Go / no-go scorecard for enabling LIVE_TRADING (paper must clear bars)."""
+    if request.method == "OPTIONS":
+        return _build_cors_preflight_response()
+    from decision import readiness
+
+    return jsonify(readiness.evaluate())
+
+
+@app.route('/session/reset', methods=["POST", "OPTIONS"])
+def session_reset_endpoint():
+    """Archive today's logs + reset paper/discover/arb for a clean monitor window."""
+    if request.method == "OPTIONS":
+        return _build_cors_preflight_response()
+    from decision import session as decision_session
+
+    body = request.get_json(silent=True) or {}
+    reason = str(body.get("reason") or "manual").strip() or "manual"
+    return jsonify(decision_session.reset_board(reason=reason))
+
+
 @app.route('/scoreboard', methods=["GET", "OPTIONS"])
 def scoreboard_endpoint():
     if request.method == "OPTIONS":
@@ -679,19 +848,66 @@ def scoreboard_endpoint():
     return jsonify(scoreboard.summarize())
 
 
+@app.route('/calibrate', methods=["GET", "POST", "OPTIONS"])
+def calibrate_endpoint():
+    """Inspect or refit conformal residuals from live outcome logs."""
+    if request.method == "OPTIONS":
+        return _build_cors_preflight_response()
+    from decision import calibrate as calibrate_mod
+
+    if request.method == "GET":
+        store = calibrate_mod.load_residuals()
+        return jsonify(
+            {
+                "n": store.get("n") or len(store.get("errors") or []),
+                "coverage_target": store.get("coverage_target"),
+                "timeframe": store.get("timeframe"),
+                "source": store.get("source"),
+                "error_p50": store.get("error_p50"),
+                "error_p80": store.get("error_p80"),
+                "error_p90": store.get("error_p90"),
+                "live_n": store.get("live_n"),
+                "corpus_n": store.get("corpus_n"),
+            }
+        )
+
+    body = request.get_json(silent=True) or {}
+    result = calibrate_mod.fit_from_outcomes(
+        days=int(body.get("days") or 7),
+        min_errors=int(body.get("min_errors") or 30),
+        merge_with_existing=bool(body.get("merge", True)),
+    )
+    return jsonify(result)
+
+
 @app.route('/health')
 def health():
     """Surfaces whether each tier is actually usable, not just whether we're up."""
     agy_status = agy_cli.preflight()
     from decision import forecast as forecast_mod
     from decision import calibrate as calibrate_mod
-    from decision import paper, swarm
+    from decision import arb, discover, paper, pipeline_log, readiness, swarm
 
     residuals = calibrate_mod.load_residuals()
     port = paper.snapshot()
+    disc = discover.status()
+    arb_st = arb.status()
+    ready = readiness.evaluate()
+    trade_n = sum(
+        1
+        for t in token_data.values()
+        if isinstance(t, dict) and t.get("tradeable", True) is not False
+    )
+    observe_n = sum(
+        1
+        for t in token_data.values()
+        if isinstance(t, dict) and t.get("tradeable") is False
+    )
     return jsonify({
         "server": "ok",
         "tokens_loaded": len(token_data),
+        "tokens_tradeable": trade_n,
+        "tokens_observe": observe_n,
         "cache": decision_cache.stats(),
         "agy_cli": {
             "installed": agy_status.installed,
@@ -712,6 +928,29 @@ def health():
             "kill_switch": port.get("kill_switch"),
         },
         "swarm": swarm.status(),
+        "discover": {
+            "running": disc.get("running"),
+            "ticks": disc.get("ticks"),
+            "last_scan_at": disc.get("last_scan_at"),
+            "watchlist_count": disc.get("watchlist_count"),
+            "cooling_count": disc.get("cooling_count"),
+            "last_error": disc.get("last_error"),
+        },
+        "arb": {
+            "running": arb_st.get("running"),
+            "ticks": arb_st.get("ticks"),
+            "paper_fills": arb_st.get("paper_fills"),
+            "realized_pnl_usd": arb_st.get("realized_pnl_usd"),
+            "last_error": arb_st.get("last_error"),
+        },
+        "readiness": {
+            "ready_for_live": ready.get("ready_for_live"),
+            "score": ready.get("score"),
+            "recommendation": ready.get("recommendation"),
+            "passed": ready.get("passed"),
+            "total_checks": ready.get("total_checks"),
+        },
+        "pipeline_events_today": pipeline_log.count_today(),
         "safety_checks_logged_today": decision_store.count("safety"),
         "decisions_logged_today": decision_store.count("decisions"),
     })
@@ -741,6 +980,30 @@ def _build_cors_preflight_response():
     # This is the "magic" key that unlocks the loopback space
     response.headers["Access-Control-Allow-Private-Network"] = "true"
     return response
+
+
+def _configure_background_channels() -> None:
+    """Bind discover + paper-arb to the shared live buffer; optionally auto-start."""
+    from decision import arb, discover, swarm
+
+    def _set_token(address: str, token: dict) -> None:
+        token_data[address] = token
+
+    discover.configure(set_token=_set_token, get_tokens=lambda: token_data)
+    arb.configure(get_tokens=lambda: token_data)
+    if discover.DISCOVER_ENABLED:
+        discover.start()
+        print("discover: auto-started (DISCOVER_ENABLED=1)", flush=True)
+    if arb.ARB_ENABLED:
+        arb.start()
+        print("arb: auto-started paper channel (ARB_ENABLED=1)", flush=True)
+    if os.getenv("SWARM_ENABLED", "0").strip() == "1":
+        interval = float(os.getenv("SWARM_INTERVAL_SEC", "12") or 12)
+        swarm.start(lambda: token_data, interval_s=interval, mode="full")
+        print(f"swarm: auto-started (SWARM_ENABLED=1, interval={interval}s)", flush=True)
+
+
+_configure_background_channels()
 
 if __name__ == '__main__':
     host = os.getenv('HOST', '0.0.0.0')

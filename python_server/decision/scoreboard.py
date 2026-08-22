@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, Optional
 
+from decision import pipeline_log
 from decision import store as decision_store
 
 
@@ -45,6 +46,18 @@ def record_outcome(
         decision_store.append("outcomes", record)
     except OSError:
         pass
+    pipeline_log.emit(
+        "scoreboard",
+        "outcome",
+        address=address,
+        mint=mint,
+        action=action,
+        realized_pct=record["realized_pct"],
+        error_pct=record["error_pct"],
+        covered_80=covered,
+        predicted_p50=predicted_p50,
+        timeframe=timeframe,
+    )
     return record
 
 

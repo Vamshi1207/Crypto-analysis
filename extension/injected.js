@@ -20,6 +20,9 @@ const MAX_MESSAGE_BYTES = 8 * 1024 * 1024;
 // Historical full-history dump was the old dataset-collection path.
 const LIVE_MODE = true;
 const LIVE_FLUSH_MS = 500;
+// pair-stats page 1 → Token Info 5m buy/sell/vol buckets (not full history).
+const LIVE_STATS_POLL_MS = 8000;
+const LIVE_STATS_KEEP = 10;
 const LIVE_SEED_BARS = {
   "5S": 360,   // 30 min
   "15S": 240,  // 60 min
@@ -164,7 +167,7 @@ const waitForToken = () => {
       const candleChunk = candleChunks[index];
       const barCount = Object.keys(candleChunk).length;
       totalBarsSent += barCount;
-      sendChunkToParent({ candles: { [res]: candleChunk }, stats: [] });
+      sendChunkToParent({ candles: { [res]: candleChunk } });
       console.log(
         `✅ [${payloadId}] ${res} ${label} chunk ${index + 1}/${candleChunks.length} (${barCount} bars)`
       );
@@ -237,6 +240,49 @@ const waitForToken = () => {
 
   // Pending live bar updates keyed by resolution -> timestamp -> candle
   const pendingLiveBars = {};
+  // Latest pair-stats buckets (buyCount / sellCount / volumes). Flushed with bars.
+  let pendingStats = [];
+
+  const fetchPairStatsPage1 = async () => {
+    if (!mint || mint === "unknown") return [];
+    try {
+      const response = await fetch(
+        `https://api3.axiom.trade/pair-stats?pairAddress=${encodeURIComponent(mint)}&page=1`,
+        { credentials: "include" }
+      );
+      if (!response.ok) {
+        console.warn(`⚠️ [${payloadId}] pair-stats page 1 failed: ${response.status}`);
+        return [];
+      }
+      const stats = await response.json();
+      if (!Array.isArray(stats) || !stats.length) return [];
+      // Keep the most recent buckets regardless of API sort order.
+      const sorted = [...stats].sort((a, b) => {
+        const ta = Date.parse(a?.createdAt || 0) || 0;
+        const tb = Date.parse(b?.createdAt || 0) || 0;
+        return ta - tb;
+      });
+      const keep = sorted.slice(-LIVE_STATS_KEEP);
+      console.log(
+        `📊 [${payloadId}] pair-stats: ${keep.length} buckets ` +
+          `(buys=${keep[keep.length - 1]?.buyCount ?? "?"} sells=${keep[keep.length - 1]?.sellCount ?? "?"})`
+      );
+      return keep;
+    } catch (err) {
+      console.warn(`⚠️ [${payloadId}] pair-stats fetch error:`, err);
+      return [];
+    }
+  };
+
+  function startStatsPolling() {
+    const poll = async () => {
+      const buckets = await fetchPairStatsPage1();
+      if (buckets.length) pendingStats = buckets;
+    };
+    poll();
+    setInterval(poll, LIVE_STATS_POLL_MS);
+    console.log(`📊 [${payloadId}] pair-stats polling every ${LIVE_STATS_POLL_MS}ms`);
+  }
 
   function startSubscriptions() {
     resolutions.forEach((res) => {
@@ -263,8 +309,6 @@ const waitForToken = () => {
 
     setInterval(() => {
       const resolutionsWithUpdates = Object.keys(pendingLiveBars);
-      if (!resolutionsWithUpdates.length) return;
-
       const candles = {};
       for (const res of resolutionsWithUpdates) {
         const map = pendingLiveBars[res];
@@ -273,8 +317,17 @@ const waitForToken = () => {
         delete pendingLiveBars[res];
       }
 
-      if (!Object.keys(candles).length) return;
-      sendToParent({ candles, stats: [] }, false);
+      const stats = pendingStats.length ? pendingStats : null;
+      if (stats) pendingStats = [];
+
+      if (!Object.keys(candles).length && !stats) return;
+      sendToParent(
+        {
+          candles: Object.keys(candles).length ? candles : {},
+          stats: stats || []
+        },
+        false
+      );
     }, LIVE_FLUSH_MS);
 
     console.log(`📡 [${payloadId}] Live subscriptions active for`, resolutions.join(", "));
@@ -283,8 +336,9 @@ const waitForToken = () => {
   try {
     console.log(`🌱 [${payloadId}] Seeding recent OHLCV…`);
     await seedAllResolutions();
-    console.log(`✅ [${payloadId}] Seed complete — starting live stream`);
+    console.log(`✅ [${payloadId}] Seed complete — starting live stream + pair-stats`);
     startSubscriptions();
+    startStatsPolling();
   } catch (err) {
     console.error(`❌ [${payloadId}] Live bootstrap failed:`, err);
   }

@@ -31,10 +31,18 @@ def _card(
     agreement: float = 0.8,
     band: tuple[float, float, float] = (-2.0, 7.0, 10.0),
     address: str = "Pool111",
+    mint: str | None = None,
 ) -> DecisionCard:
     rb = ReturnBand(p10=band[0], p50=band[1], p90=band[2])
+    # Unique mint per address so session-wide paper state does not trip
+    # PAPER_MAX_TRADES_PER_MINT_DAY across unrelated tests.
     return DecisionCard(
-        token={"address": address, "mint": "Mint111", "name": "TEST", "source": "live"},
+        token={
+            "address": address,
+            "mint": mint or f"Mint-{address}",
+            "name": "TEST",
+            "source": "live",
+        },
         horizon_bars=6,
         timeframe="5S",
         action=action,

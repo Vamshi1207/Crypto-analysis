@@ -1,432 +1,1048 @@
 <!doctype html>
-<html>
+<html lang="en">
 <head>
-  <title>Live Token Dashboard</title>
-	<style>
-	  body {
-		font-family: sans-serif;
-		padding: 20px;
-	  }
-	  table {
-		border-collapse: collapse;
-		width: 100%;
-		table-layout: fixed; /* ✅ Prevent column resizing */
-		margin-top: 20px;
-	  }
-	  th, td {
-		border: 1px solid #ccc;
-		padding: 8px 12px;
-		text-align: left;
-		vertical-align: top;
-		word-wrap: break-word;
-		word-break: break-word;
-		overflow-wrap: break-word;
-	  }
-	  th {
-		background-color: #f0f0f0;
-	  }
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Paper Desk</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+  <style>
+    :root {
+      --bg: #1a2230;
+      --bg-elev: #243044;
+      --bg-row: #2a3850;
+      --bg-row-hover: #334560;
+      --line: rgba(255,255,255,0.1);
+      --line-strong: rgba(255,255,255,0.16);
+      --text: #ffffff;
+      --muted: #c5d0e0;
+      --faint: #9aabc2;
+      --accent: #ffb454;
+      --buy: #3dff9a;
+      --sell: #ff6b7a;
+      --hold: #7cbcff;
+      --warn: #ffd166;
+      --mono: "JetBrains Mono", ui-monospace, monospace;
+      --sans: "DM Sans", system-ui, sans-serif;
+    }
 
-	  /* ✅ Set fixed width per column */
-	  th:nth-child(1), td:nth-child(1) { width: 100px; }  /* Token */
-	  th:nth-child(2), td:nth-child(2) { width: 200px; }  /* Safety */
-	  th:nth-child(3), td:nth-child(3) { width: 240px; }  /* Decision */
-	  th:nth-child(4), td:nth-child(4) { width: 220px; }  /* Analysis */
-	  th:nth-child(5), td:nth-child(5) { width: 180px; }  /* Price */
-	  th:nth-child(6), td:nth-child(6) { width: 180px; }  /* Momentum */
-	  th:nth-child(7), td:nth-child(7) { width: 180px; }  /* Trend */
-	  th:nth-child(8), td:nth-child(8) { width: 180px; }  /* Volatility */
+    * { box-sizing: border-box; }
+    html, body { margin: 0; min-height: 100%; }
+    body {
+      font-family: var(--sans);
+      color: var(--text);
+      background:
+        radial-gradient(1000px 480px at 90% -5%, rgba(255, 180, 84, 0.16), transparent 55%),
+        radial-gradient(800px 420px at -10% 20%, rgba(124, 188, 255, 0.14), transparent 50%),
+        radial-gradient(600px 360px at 50% 100%, rgba(61, 255, 154, 0.06), transparent 45%),
+        var(--bg);
+      background-attachment: fixed;
+      -webkit-font-smoothing: antialiased;
+    }
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { color: #ffd08a; }
+    button, select {
+      font: inherit;
+      color: inherit;
+      background: transparent;
+      border: 0;
+      cursor: pointer;
+    }
+    button:focus-visible, select:focus-visible, a:focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: 2px;
+    }
 
-	  .verdict {
-		display: inline-block;
-		padding: 2px 8px;
-		border-radius: 4px;
-		font-weight: 700;
-		font-family: sans-serif;
-		text-transform: uppercase;
-		font-size: 12px;
-		letter-spacing: 0.04em;
-	  }
-	  .verdict-safe    { background: #d7f5dd; color: #05631f; }
-	  .verdict-caution { background: #fff2cc; color: #7a5200; }
-	  .verdict-danger  { background: #fbdcdc; color: #8c1010; }
-	  .verdict-unknown { background: #e8e8e8; color: #444; }
-	  .verdict-pending { background: #e8f0fe; color: #1a4f8e; }
-	  .action-buy   { background: #d7f5dd; color: #05631f; }
-	  .action-hold  { background: #e8f0fe; color: #1a4f8e; }
-	  .action-avoid { background: #fbdcdc; color: #8c1010; }
-	  .action-reduce{ background: #fff2cc; color: #7a5200; }
+    .wrap {
+      width: min(1080px, calc(100% - 2.5rem));
+      margin: 0 auto;
+      padding: 1.75rem 0 4rem;
+    }
 
-	  .flag-critical { color: #8c1010; font-weight: 600; }
-	  .flag-high     { color: #a1440a; }
-	  .flag-medium   { color: #7a5200; }
-	  .flag-low, .flag-info { color: #555; }
-	  .stale { opacity: 0.55; }
+    /* Header */
+    .top {
+      display: flex;
+      align-items: flex-end;
+      justify-content: space-between;
+      gap: 1rem;
+      margin-bottom: 1.5rem;
+      padding-bottom: 1.1rem;
+      border-bottom: 1px solid var(--line-strong);
+    }
+    .brand {
+      margin: 0;
+      font-size: 1.55rem;
+      font-weight: 700;
+      letter-spacing: -0.03em;
+      color: var(--text);
+    }
+    .brand em {
+      font-style: normal;
+      color: var(--accent);
+      font-weight: 600;
+    }
+    .tagline {
+      margin: 0.35rem 0 0;
+      font-size: 0.92rem;
+      color: var(--muted);
+      max-width: 36rem;
+      line-height: 1.45;
+      font-weight: 400;
+    }
+    .ready-chip {
+      display: flex;
+      flex-direction: column;
+      align-items: flex-end;
+      gap: 0.35rem;
+      font-family: var(--mono);
+      font-size: 0.8rem;
+    }
+    .ready-chip .row-chip {
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+    }
+    .ready-chip .plain {
+      font-family: var(--sans);
+      font-size: 0.78rem;
+      color: var(--muted);
+      text-align: right;
+      max-width: 16rem;
+      line-height: 1.35;
+    }
+    .ready-chip .score {
+      font-size: 1.5rem;
+      font-weight: 700;
+      letter-spacing: -0.04em;
+      color: var(--text);
+    }
+    .ready-chip .tag {
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      font-size: 0.7rem;
+      font-weight: 600;
+      padding: 0.32rem 0.6rem;
+      border-radius: 999px;
+      border: 1px solid transparent;
+      background: rgba(255,255,255,0.08);
+      color: var(--muted);
+    }
+    .ready-chip .tag.go {
+      color: #052e1a;
+      background: var(--buy);
+      border-color: transparent;
+    }
+    .ready-chip .tag.almost {
+      color: #3a2a00;
+      background: var(--warn);
+      border-color: transparent;
+    }
+    .ready-chip .tag.nogo {
+      color: #3a0810;
+      background: var(--sell);
+      border-color: transparent;
+    }
 
-	  a {
-		color: #1a73e8;
-		text-decoration: none;
-	  }
-	  a:hover {
-		text-decoration: underline;
-	  }
+    /* Slim status */
+    .strip {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 1rem;
+      align-items: center;
+      margin-bottom: 1.35rem;
+      padding: 0.9rem 1rem;
+      background: var(--bg-elev);
+      border: 1px solid var(--line-strong);
+      border-radius: 12px;
+    }
+    .strip-meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.45rem 1.25rem;
+      font-family: var(--mono);
+      font-size: 0.8rem;
+      color: var(--muted);
+      line-height: 1.45;
+    }
+    .strip-meta b { color: var(--text); font-weight: 600; }
+    .strip-actions { display: flex; gap: 0.5rem; align-items: center; }
+    .btn {
+      font-family: var(--sans);
+      font-size: 0.8rem;
+      font-weight: 700;
+      letter-spacing: 0.02em;
+      padding: 0.5rem 1rem;
+      border-radius: 999px;
+      background: var(--accent);
+      color: #1a1408;
+      transition: filter 0.15s ease;
+    }
+    .btn:hover { filter: brightness(1.08); }
+    .btn.ghost {
+      background: rgba(255,255,255,0.08);
+      color: var(--text);
+      border: 1px solid var(--line-strong);
+    }
+    .btn.ghost:hover { background: rgba(255,255,255,0.14); filter: none; }
+    .links {
+      display: flex;
+      gap: 0.85rem;
+      font-family: var(--mono);
+      font-size: 0.72rem;
+      color: var(--faint);
+    }
+    .links a { color: var(--muted); }
+    .links a:hover { color: var(--accent); }
 
-	  td.token-name {
-		white-space: normal !important;
-	  }
+    /* Account / PnL board */
+    .account {
+      display: grid;
+      grid-template-columns: repeat(6, 1fr);
+      gap: 0.65rem;
+      margin-bottom: 1rem;
+    }
+    @media (max-width: 980px) {
+      .account { grid-template-columns: repeat(3, 1fr); }
+    }
+    @media (max-width: 560px) {
+      .account { grid-template-columns: repeat(2, 1fr); }
+    }
+    .metric {
+      background: var(--bg-elev);
+      border: 1px solid var(--line-strong);
+      border-radius: 12px;
+      padding: 0.75rem 0.85rem;
+      min-height: 4.4rem;
+    }
+    .metric .label {
+      display: flex;
+      align-items: center;
+      gap: 0.35rem;
+      font-size: 0.68rem;
+      font-weight: 650;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      color: var(--muted);
+      margin-bottom: 0.35rem;
+    }
+    .metric .hint {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 0.95rem;
+      height: 0.95rem;
+      border-radius: 50%;
+      border: 1px solid var(--line-strong);
+      font-size: 0.62rem;
+      color: var(--faint);
+      cursor: help;
+    }
+    .metric .val {
+      font-family: var(--mono);
+      font-size: 1.15rem;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      color: var(--text);
+    }
+    .metric .val.pos { color: var(--buy); }
+    .metric .val.neg { color: var(--sell); }
+    .metric .sublabel {
+      margin-top: 0.2rem;
+      font-family: var(--mono);
+      font-size: 0.68rem;
+      color: var(--faint);
+    }
 
-	  td.metrics {
-		white-space: pre-wrap;
-		font-family: monospace;
-		font-size: 14px;
-		line-height: 1.4;
-		overflow: hidden;
-		}
+    .panel {
+      background: var(--bg-elev);
+      border: 1px solid var(--line-strong);
+      border-radius: 14px;
+      margin-bottom: 1rem;
+      overflow: hidden;
+    }
+    .panel-h {
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+      gap: 0.75rem;
+      padding: 0.75rem 1rem;
+      border-bottom: 1px solid var(--line);
+    }
+    .panel-h h2 {
+      margin: 0;
+      font-size: 0.85rem;
+      font-weight: 700;
+      letter-spacing: 0.02em;
+    }
+    .panel-h span {
+      font-family: var(--mono);
+      font-size: 0.7rem;
+      color: var(--muted);
+    }
+    .pos-table, .close-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-family: var(--mono);
+      font-size: 0.78rem;
+    }
+    .pos-table th, .close-table th {
+      text-align: left;
+      font-size: 0.62rem;
+      font-weight: 650;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+      color: var(--muted);
+      padding: 0.55rem 0.85rem;
+      border-bottom: 1px solid var(--line);
+    }
+    .pos-table td, .close-table td {
+      padding: 0.65rem 0.85rem;
+      border-top: 1px solid var(--line);
+      color: var(--text);
+      vertical-align: top;
+    }
+    .pos-table tr:first-child td, .close-table tr:first-child td { border-top: 0; }
+    .muted-cell { color: var(--muted); }
+    .empty-row {
+      padding: 1.1rem 1rem;
+      color: var(--muted);
+      font-size: 0.85rem;
+    }
 
-	</style>
+    /* Filters */
+    .bar {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 1rem;
+      margin-bottom: 0.75rem;
+    }
+    .tabs {
+      display: inline-flex;
+      gap: 0.2rem;
+      padding: 0.22rem;
+      background: var(--bg-elev);
+      border: 1px solid var(--line-strong);
+      border-radius: 999px;
+    }
+    .tabs button {
+      font-size: 0.8rem;
+      font-weight: 650;
+      color: var(--muted);
+      padding: 0.4rem 0.85rem;
+      border-radius: 999px;
+    }
+    .tabs button.on {
+      background: var(--accent);
+      color: #1a1408;
+    }
+    .count {
+      font-family: var(--mono);
+      font-size: 0.75rem;
+      color: var(--muted);
+    }
 
+    .colhead {
+      display: grid;
+      grid-template-columns: minmax(120px, 1.4fr) 0.9fr 0.7fr 0.9fr 0.7fr 0.55fr;
+      gap: 0.5rem;
+      padding: 0.55rem 1.05rem;
+      background: rgba(0,0,0,0.18);
+      border-bottom: 1px solid var(--line);
+      font-family: var(--mono);
+      font-size: 0.62rem;
+      font-weight: 650;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+      color: var(--muted);
+    }
+    .colhead span[title] { cursor: help; border-bottom: 1px dotted rgba(255,255,255,0.25); }
+
+    /* Table-like list */
+    .list {
+      border: 1px solid var(--line-strong);
+      border-radius: 14px;
+      overflow: hidden;
+      background: var(--bg-elev);
+      box-shadow: 0 12px 40px rgba(0,0,0,0.22);
+    }
+    .row {
+      display: grid;
+      grid-template-columns: minmax(120px, 1.4fr) 0.9fr 0.7fr 0.9fr 0.7fr 0.55fr;
+      gap: 0.5rem;
+      align-items: center;
+      padding: 0.95rem 1.05rem;
+      border-top: 1px solid var(--line);
+      background: transparent;
+      transition: background 0.15s ease;
+      cursor: pointer;
+      text-align: left;
+      width: 100%;
+    }
+    .list > .row:first-of-type { border-top: 0; }
+    .row:hover, .row.open { background: var(--bg-row-hover); }
+    .row.observe { opacity: 0.88; }
+    @media (max-width: 820px) {
+      .row, .colhead {
+        grid-template-columns: 1fr 1fr;
+        gap: 0.4rem 0.75rem;
+      }
+      .row .c-ta, .row .c-role, .colhead .c-ta, .colhead .c-role { display: none; }
+    }
+
+    .name {
+      font-weight: 700;
+      font-size: 1rem;
+      letter-spacing: -0.02em;
+      color: var(--text);
+    }
+    .name a { color: inherit; }
+    .name a:hover { color: var(--accent); }
+    .sub {
+      margin-top: 0.2rem;
+      font-family: var(--mono);
+      font-size: 0.7rem;
+      color: var(--muted);
+    }
+    .mono {
+      font-family: var(--mono);
+      font-size: 0.86rem;
+      font-weight: 600;
+      color: var(--text);
+    }
+    .pill {
+      display: inline-block;
+      font-family: var(--mono);
+      font-size: 0.68rem;
+      font-weight: 700;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      padding: 0.28rem 0.55rem;
+      border-radius: 999px;
+    }
+    .pill.buy { color: #042816; background: var(--buy); }
+    .pill.hold { color: #062039; background: var(--hold); }
+    .pill.avoid, .pill.reduce { color: #3a0810; background: var(--sell); }
+    .pill.pending, .pill.unknown, .pill.watch {
+      color: var(--text);
+      background: rgba(255,255,255,0.12);
+    }
+    .pill.safe { color: #042816; background: var(--buy); }
+    .pill.caution { color: #3a2a00; background: var(--warn); }
+    .pill.danger { color: #3a0810; background: var(--sell); }
+
+    .edge.pos, .pnl.pos { color: var(--buy); }
+    .edge.neg, .pnl.neg { color: var(--sell); }
+    .ta.pos { color: var(--buy); }
+    .ta.neg { color: var(--sell); }
+    .role {
+      font-family: var(--mono);
+      font-size: 0.68rem;
+      font-weight: 600;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      color: var(--muted);
+    }
+    .role.trade { color: var(--accent); }
+
+    .detail {
+      display: none;
+      padding: 0 1.05rem 1rem;
+      background: rgba(0,0,0,0.18);
+    }
+    .row.open + .detail { display: block; border-top: 1px solid var(--line); }
+    .detail-grid {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 0.85rem;
+      padding-top: 0.85rem;
+      font-family: var(--mono);
+      font-size: 0.78rem;
+      color: var(--muted);
+    }
+    @media (max-width: 720px) {
+      .detail-grid { grid-template-columns: 1fr 1fr; }
+    }
+    .detail-grid strong {
+      display: block;
+      color: var(--faint);
+      font-weight: 600;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      font-size: 0.62rem;
+      margin-bottom: 0.25rem;
+    }
+    .detail-grid span { color: var(--text); font-weight: 600; }
+
+    .empty {
+      padding: 3rem 1rem;
+      text-align: center;
+      color: var(--muted);
+      font-size: 0.95rem;
+    }
+
+    .glossary {
+      margin-top: 1.25rem;
+      padding: 1rem 1.1rem;
+      background: var(--bg-elev);
+      border: 1px solid var(--line-strong);
+      border-radius: 14px;
+    }
+    .glossary h2 {
+      margin: 0 0 0.65rem;
+      font-size: 0.95rem;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+    }
+    .glossary p.lead {
+      margin: 0 0 0.85rem;
+      font-size: 0.85rem;
+      color: var(--muted);
+      line-height: 1.5;
+      max-width: 46rem;
+    }
+    .legend {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 0.65rem 1.25rem;
+      font-size: 0.8rem;
+      color: var(--muted);
+      line-height: 1.45;
+    }
+    @media (max-width: 720px) {
+      .legend { grid-template-columns: 1fr; }
+    }
+    .legend b { color: var(--text); font-weight: 650; }
+    .foot {
+      margin-top: 1rem;
+      font-size: 0.85rem;
+      color: var(--muted);
+      line-height: 1.55;
+      max-width: 48rem;
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      .row, .btn { transition: none; }
+    }
+  </style>
 </head>
 <body>
-  <h2>📊 Live Token Indicator Dashboard</h2>
-  <div id="pipeline-bar" style="margin:12px 0;padding:10px 12px;background:#f7f7f7;border:1px solid #ddd;font-family:monospace;font-size:13px;line-height:1.5">
-    <div><b>Paper</b>: <span id="paper-stat">loading…</span>
-      &nbsp;|&nbsp; <b>Swarm</b>: <span id="swarm-stat">…</span>
-      <button id="swarm-toggle" type="button" style="margin-left:8px">Start swarm</button>
-      <a href="/portfolio" target="_blank" style="margin-left:8px">portfolio</a>
-      <a href="/scoreboard" target="_blank" style="margin-left:8px">scoreboard</a>
-      <a href="/health" target="_blank" style="margin-left:8px">health</a>
+  <div class="wrap">
+    <header class="top">
+      <div>
+        <h1 class="brand">Paper <em>Desk</em></h1>
+        <p class="tagline">Fake-money practice board. Nothing here spends real crypto until you deliberately turn live trading on.</p>
+      </div>
+      <div class="ready-chip" title="Score out of 100 for whether paper results are strong enough to consider real money. Hover terms in the glossary below.">
+        <div class="row-chip">
+          <span class="score" id="ready-score">—</span>
+          <span class="tag nogo" id="ready-verdict">…</span>
+        </div>
+        <div class="plain" id="ready-plain">Checking practice results…</div>
+      </div>
+    </header>
+
+    <section class="account" aria-label="Your practice account">
+      <div class="metric">
+        <div class="label">Total value <span class="hint" title="What your practice account is worth right now: leftover cash plus the current value of any open trades. You start with $1000 fake dollars.">?</span></div>
+        <div class="val" id="m-equity">—</div>
+        <div class="sublabel" id="m-equity-sub">vs $1000 start</div>
+      </div>
+      <div class="metric">
+        <div class="label">Sitting cash <span class="hint" title="Fake dollars not currently tied up in a trade. Available to open a new practice buy.">?</span></div>
+        <div class="val" id="m-cash">—</div>
+        <div class="sublabel">not in a trade</div>
+      </div>
+      <div class="metric">
+        <div class="label">Profit locked in <span class="hint" title="Money won or lost on trades that already finished (sold). Includes fees. This number only moves when a trade closes.">?</span></div>
+        <div class="val" id="m-realized">—</div>
+        <div class="sublabel" id="m-realized-sub">finished trades</div>
+      </div>
+      <div class="metric">
+        <div class="label">Open gain/loss <span class="hint" title="If you sold every open trade right now at the latest price, roughly how much you’d be up or down (before exit fees). It can change every few seconds.">?</span></div>
+        <div class="val" id="m-unrealized">—</div>
+        <div class="sublabel" id="m-unrealized-sub">still open</div>
+      </div>
+      <div class="metric">
+        <div class="label">Quick trades today <span class="hint" title="Scalps = short buy-then-sell bets on one token. This is the total fake profit/loss from those finished trades today. “Avg / trade” is the typical result per close.">?</span></div>
+        <div class="val" id="m-scalp">—</div>
+        <div class="sublabel" id="m-scalp-sub">closes · avg / trade</div>
+      </div>
+      <div class="metric">
+        <div class="label">Price-gap trades today <span class="hint" title="Arb = spotting the same token cheaper in one pool than another and booking a paper “buy low / sell high” fill. Separate from quick directional scalps.">?</span></div>
+        <div class="val" id="m-arb">—</div>
+        <div class="sublabel" id="m-arb-sub">fills · avg / fill</div>
+      </div>
+    </section>
+
+    <div class="strip">
+      <div>
+        <div class="strip-meta" id="strip-meta">Loading…</div>
+        <div class="links" style="margin-top:0.55rem">
+          <a href="/portfolio" target="_blank" rel="noopener">portfolio JSON</a>
+          <a href="/readiness" target="_blank" rel="noopener">readiness</a>
+          <a href="/scoreboard" target="_blank" rel="noopener">scoreboard</a>
+          <a href="/health" target="_blank" rel="noopener">health</a>
+          <a href="/discover" target="_blank" rel="noopener">discover</a>
+          <a href="/arb" target="_blank" rel="noopener">arb</a>
+        </div>
+      </div>
+      <div class="strip-actions">
+        <button type="button" class="btn ghost" id="session-reset" title="Archive today's logs, reset practice cash to $1000, clear pauses">Reset board</button>
+        <button type="button" class="btn ghost" id="swarm-toggle">Start auto-trader</button>
+      </div>
     </div>
+
+    <section class="panel" aria-label="Trades still open">
+      <div class="panel-h">
+        <h2>Trades still open</h2>
+        <span id="open-count">0 open</span>
+      </div>
+      <div id="open-body"><div class="empty-row">No open practice trades right now.</div></div>
+    </section>
+
+    <section class="panel" aria-label="Recently finished trades">
+      <div class="panel-h">
+        <h2>Recently finished</h2>
+        <span id="closed-count">—</span>
+      </div>
+      <div id="closed-body"><div class="empty-row">No finished trades yet this session.</div></div>
+    </section>
+
+    <div class="bar">
+      <div class="tabs" role="tablist">
+        <button type="button" class="on" data-filter="trade" title="Tokens the bot is allowed to buy/sell in practice">Active hunt</button>
+        <button type="button" data-filter="observe" title="Tokens on the board for watching only (paused or cooling down)">Watch only</button>
+        <button type="button" data-filter="all">All tokens</button>
+      </div>
+      <div class="count" id="count"></div>
+    </div>
+
+    <div class="list" id="list">
+      <div class="colhead">
+        <span title="Coin name. “Liq” = money in the pool; “vol24h” = how much traded in the last day.">Token</span>
+        <span title="Latest price from the candle chart the bot is watching.">Price</span>
+        <span title="What the bot would do: buy, hold (wait), avoid (skip), or watch (not hunting this one).">Bot says</span>
+        <span title="After fees, how much % the forecast thinks you might make. Roughly +2.5% on a $40 trade ≈ $1 target.">Expected edge</span>
+        <span class="c-ta" title="Do chart indicators agree with a buy? Positive = supportive; negative can block a buy.">Chart agree?</span>
+        <span class="c-role" title="Active hunt = bot may trade. Watch only = shown on the board but not traded right now.">Role</span>
+      </div>
+      <div class="empty" id="empty">Waiting for tokens to appear…</div>
+    </div>
+
+    <section class="glossary" aria-label="Plain-English glossary">
+      <h2>Plain English</h2>
+      <p class="lead">This board practices with fake money so you can see whether the bot’s ideas actually make a dollar after fees — before any real wallet is used.</p>
+      <div class="legend">
+        <div><b>Total value</b> — your practice account balance (cash + open trades).</div>
+        <div><b>Profit locked in</b> — wins/losses from trades already sold.</div>
+        <div><b>Open gain/loss</b> — paper profit if you closed open trades at the latest price.</div>
+        <div><b>Quick trade (scalp)</b> — buy a coin, sell soon, aim for about $1 net after fees.</div>
+        <div><b>Price-gap trade (arb)</b> — same coin priced differently in two places; paper “buy cheap / sell rich.”</div>
+        <div><b>Expected edge</b> — forecast upside minus fees. Positive is hopeful; it still has to clear the ~$1 target.</div>
+        <div><b>Chart agree? (TA)</b> — do RSI/MACD-style signals support the buy, or fight it?</div>
+        <div><b>Active hunt / Watch only</b> — hunting tokens can be traded; watch-only are paused or cooling down.</div>
+        <div><b>Readiness score</b> — checklist score for “is practice strong enough to consider real money?” Keep live trading off until it says ready.</div>
+        <div><b>Reset board</b> — archive today’s logs and start a clean practice score from $1000 again.</div>
+        <div><b>Fees / slip</b> — trading isn’t free: pool fees plus price moving while you buy/sell. The bot subtracts these before calling something a good idea.</div>
+        <div><b>Pipeline</b> — the step-by-step checks (safety → forecast → costs → risk → paper buy/sell).</div>
+      </div>
+    </section>
+    <p class="foot" id="ready-rec"></p>
   </div>
-  <table>
-    <thead>
-      <tr>
-        <th>🪙 Token</th>
-        <th>🛡️ Safety</th>
-        <th>🎯 Decision</th>
-        <th>🧠 Analysis</th>
-        <th>📊 Price & Volume</th>
-        <th>⚡ Momentum</th>
-        <th>📈 Trend</th>
-        <th>🌊 Volatility</th>
-      </tr>
-    </thead>
-    <tbody id="tokenTable"></tbody>
-  </table>
 
   <script>
-  const timeframes = ["1S", "5S", "15S", "30S", "1", "3", "5"];
   const selectedTF = {};
+  let filter = "trade";
+  let openAddr = null;
+  let lastTokens = {};
 
-  // The table refreshes twice a second; the safety sources are rate limited and
-  // authorities barely change. Cache per mint and only re-check occasionally.
   const SAFETY_TTL_MS = 60000;
-  const safetyCache = {};   // addr -> { report, fetchedAt }
-  const safetyInFlight = {};
-
   const DECIDE_TTL_MS = 30000;
+  const safetyCache = {};
+  const safetyInFlight = {};
   const decideCache = {};
   const decideInFlight = {};
 
+  function fmtNum(v, d = 2) {
+    if (v == null || Number.isNaN(Number(v))) return "—";
+    return Number(v).toFixed(d);
+  }
+  function fmtMoney(v, d = 2) {
+    if (v == null || Number.isNaN(Number(v))) return "—";
+    const n = Number(v);
+    const sign = n > 0 ? "+" : "";
+    return `${sign}$${Math.abs(n).toFixed(d)}`;
+  }
+  function fmtMoneyAbs(v, d = 2) {
+    if (v == null || Number.isNaN(Number(v))) return "—";
+    return `$${Number(v).toFixed(d)}`;
+  }
+  function pnlClass(v) {
+    if (v == null || Number.isNaN(Number(v))) return "";
+    const n = Number(v);
+    if (n > 0) return "pos";
+    if (n < 0) return "neg";
+    return "";
+  }
+  function fmtPct(v) {
+    if (v == null || Number.isNaN(Number(v))) return "—";
+    const n = Number(v);
+    return `${n >= 0 ? "+" : ""}${n.toFixed(2)}%`;
+  }
+  function fmtUsd(v) {
+    if (v == null || Number.isNaN(Number(v))) return "—";
+    const n = Number(v);
+    if (Math.abs(n) >= 1e6) return `$${(n / 1e6).toFixed(2)}M`;
+    if (Math.abs(n) >= 1e3) return `$${(n / 1e3).toFixed(1)}k`;
+    return `$${n.toFixed(0)}`;
+  }
+  function fmtPrice(v) {
+    if (v == null || Number.isNaN(Number(v))) return "—";
+    const n = Number(v);
+    if (n >= 1) return n.toFixed(4);
+    if (n >= 0.001) return n.toFixed(6);
+    return n.toExponential(2);
+  }
+  function esc(s) {
+    return String(s ?? "")
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
+  }
+  function setMetric(id, valueHtml, cls = "") {
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.className = "val " + cls;
+    el.innerHTML = valueHtml;
+  }
+
   function requestSafety(addr) {
     const cached = safetyCache[addr];
-    const fresh = cached && (Date.now() - cached.fetchedAt) < SAFETY_TTL_MS;
-    if (fresh || safetyInFlight[addr]) return cached;
-
+    if ((cached && Date.now() - cached.fetchedAt < SAFETY_TTL_MS) || safetyInFlight[addr]) return cached;
     safetyInFlight[addr] = true;
     fetch(`/safety?mint=${encodeURIComponent(addr)}`)
-      .then(res => res.json())
+      .then(r => r.json())
       .then(report => { safetyCache[addr] = { report, fetchedAt: Date.now() }; })
-      .catch(err => {
-        safetyCache[addr] = {
-          report: { verdict: 'unknown', summary: String(err), flags: [] },
-          fetchedAt: Date.now()
-        };
-      })
+      .catch(() => { safetyCache[addr] = { report: { verdict: "unknown" }, fetchedAt: Date.now() }; })
       .finally(() => { delete safetyInFlight[addr]; });
-
-    return cached;  // may be stale, rendered dimmed until the new one lands
-  }
-
-  function renderSafety(cell, addr) {
-    const entry = requestSafety(addr);
-    if (!entry) {
-      cell.innerHTML = '<span class="verdict verdict-pending">checking…</span>';
-      return;
-    }
-
-    const r = entry.report;
-    const stale = (Date.now() - entry.fetchedAt) > SAFETY_TTL_MS;
-    const verdict = (r.verdict || 'unknown').toLowerCase();
-
-    const parts = [
-      `<span class="verdict verdict-${verdict}">${verdict}</span>`,
-      ` <small>score ${r.risk_score ?? '?'}${r.degraded ? ' · partial' : ''}</small>`
-    ];
-
-    const m = r.market || {};
-    if (m.liquidity_usd_total != null) {
-      parts.push(`<div><small>liq $${Math.round(m.liquidity_usd_total).toLocaleString()}`
-        + (m.pool_age_min != null ? ` · ${Math.round(m.pool_age_min)}m old` : '')
-        + `</small></div>`);
-    }
-    const sell = r.sellability || {};
-    if (sell.sellable === true) {
-      parts.push(`<div><small>exit ok${sell.price_impact_pct != null ? ` · ${sell.price_impact_pct}% impact` : ''}</small></div>`);
-    } else if (sell.sellable === false) {
-      parts.push('<div class="flag-critical"><small>NO EXIT ROUTE</small></div>');
-    }
-
-    for (const f of (r.flags || []).slice(0, 4)) {
-      parts.push(`<div class="flag-${f.severity}"><small>• ${f.message}</small></div>`);
-    }
-
-    cell.innerHTML = parts.join('');
-    cell.classList.toggle('stale', stale);
-  }
-
-  function requestDecide(addr, tf) {
-    const key = `${addr}:${tf || '1'}`;
-    const cached = decideCache[key];
-    const fresh = cached && (Date.now() - cached.fetchedAt) < DECIDE_TTL_MS;
-    if (fresh || decideInFlight[key]) return cached;
-
-    decideInFlight[key] = true;
-    const decideTf = (tf === '1S' || tf === '5S' || tf === '15S' || tf === '30S') ? '1' : (tf || '1');
-    fetch(`/decide?address=${encodeURIComponent(addr)}&tf=${encodeURIComponent(decideTf)}&mode=full`)
-      .then(res => res.json())
-      .then(card => { decideCache[key] = { card, fetchedAt: Date.now() }; })
-      .catch(err => {
-        decideCache[key] = {
-          card: { action: 'hold', summary: String(err), warnings: [String(err)] },
-          fetchedAt: Date.now()
-        };
-      })
-      .finally(() => { delete decideInFlight[key]; });
-
     return cached;
   }
 
-  function renderDecide(cell, addr, tf) {
-    const entry = requestDecide(addr, tf);
-    if (!entry) {
-      cell.innerHTML = '<span class="verdict verdict-pending">deciding…</span>';
+  function requestDecide(addr, tf) {
+    const decideTf = (tf === "1S" || tf === "5S" || tf === "15S" || tf === "30S") ? "1" : (tf || "1");
+    const key = `${addr}:${decideTf}`;
+    const cached = decideCache[key];
+    if ((cached && Date.now() - cached.fetchedAt < DECIDE_TTL_MS) || decideInFlight[key]) return cached;
+    decideInFlight[key] = true;
+    fetch(`/decide?address=${encodeURIComponent(addr)}&tf=${encodeURIComponent(decideTf)}&mode=full`)
+      .then(r => r.json())
+      .then(card => { decideCache[key] = { card, fetchedAt: Date.now() }; })
+      .catch(err => { decideCache[key] = { card: { action: "hold", summary: String(err) }, fetchedAt: Date.now() }; })
+      .finally(() => { delete decideInFlight[key]; });
+    return cached;
+  }
+
+  function taScoreFromToken(token) {
+    const votes = [];
+    if (token.rsi != null) votes.push((Number(token.rsi) - 50) / 40);
+    if (token.macd_hist != null) votes.push(Math.max(-1, Math.min(1, Number(token.macd_hist) * 50)));
+    if (token.plus_di != null && token.minus_di != null) votes.push(Math.max(-1, Math.min(1, (Number(token.plus_di) - Number(token.minus_di)) / 25)));
+    if (token.stoch_rsi_k != null) votes.push((Number(token.stoch_rsi_k) - 50) / 50);
+    else if (token.stoch_k != null) votes.push((Number(token.stoch_k) - 50) / 50);
+    if (token.williams_r != null) votes.push((Number(token.williams_r) + 50) / 50);
+    if (!votes.length) return null;
+    return votes.reduce((a, b) => a + b, 0) / votes.length;
+  }
+
+  function renderOpenPositions(port) {
+    const rows = port.open || [];
+    document.getElementById("open-count").textContent = `${rows.length} open · ${fmtMoneyAbs(port.open_notional_usd)} in trades`;
+    if (!rows.length) {
+      document.getElementById("open-body").innerHTML = `<div class="empty-row">No open practice trades right now.</div>`;
       return;
     }
-    const c = entry.card;
-    const stale = (Date.now() - entry.fetchedAt) > DECIDE_TTL_MS;
-    if (c.error) {
-      cell.innerHTML = `<small>${c.error}</small>`;
+    const body = rows.map(p => {
+      const u = p.unrealized_pnl_usd;
+      return `<tr>
+        <td><b>${esc(p.name || "—")}</b><div class="muted-cell">${esc((p.id || "").slice(0, 8))}</div></td>
+        <td>${fmtMoneyAbs(p.size_usd)}<div class="muted-cell">qty ${fmtNum(p.qty, 2)}</div></td>
+        <td>${fmtPrice(p.entry_price)}</td>
+        <td>${fmtPrice(p.mark_price)}</td>
+        <td class="pnl ${pnlClass(u)}">${fmtMoney(u)} <span class="muted-cell">${fmtPct(p.unrealized_pct)}</span></td>
+        <td class="muted-cell">take profit ${fmtMoneyAbs(p.target_profit_usd)} · stop loss ${fmtMoneyAbs(p.stop_loss_usd)}</td>
+      </tr>`;
+    }).join("");
+    document.getElementById("open-body").innerHTML = `
+      <table class="pos-table">
+        <thead><tr>
+          <th title="Which coin this practice trade is in">Coin</th>
+          <th title="How many fake dollars went into this trade">Size</th>
+          <th title="Price when the practice buy filled">Bought at</th>
+          <th title="Latest price on the board">Now</th>
+          <th title="Paper gain/loss if sold at the latest price (before exit fees)">Open P/L</th>
+          <th title="Auto-sell when up this much, or cut losses when down this much">Exit plan</th>
+        </tr></thead>
+        <tbody>${body}</tbody>
+      </table>`;
+  }
+
+  function renderClosed(port) {
+    const rows = (port.closed_recent || []).slice().reverse().slice(0, 8);
+    document.getElementById("closed-count").textContent = `${port.closed_count || 0} finished total`;
+    if (!rows.length) {
+      document.getElementById("closed-body").innerHTML = `<div class="empty-row">No finished trades yet this session.</div>`;
       return;
     }
-    const action = (c.action || 'hold').toLowerCase();
-    const band = c.expected_return_pct || {};
-    const parts = [
-      `<span class="verdict action-${action}">${action}</span>`,
-      ` <small>${c.direction || ''} · ${(c.action_confidence != null ? Math.round(c.action_confidence*100)+'%' : '')}</small>`,
-      `<div><small>p50 ${fmtPct(band.p50)}  [${fmtPct(band.p10)}, ${fmtPct(band.p90)}]</small></div>`,
-      `<div><small>edge ${fmtPct(c.cost_adjusted_edge_pct)} · ${c.forecast?.backend || '?'}</small></div>`,
-    ];
-    if (c.token?.mint && c.token.mint !== addr) {
-      parts.push(`<div><small>mint ${String(c.token.mint).slice(0, 6)}…${String(c.token.mint).slice(-4)}</small></div>`);
-    }
-    if (c.gates_failed && c.gates_failed.length) {
-      parts.push(`<div><small>blocked: ${c.gates_failed.join(', ')}</small></div>`);
-    }
-    cell.innerHTML = parts.join('');
-    cell.classList.toggle('stale', stale);
+    const body = rows.map(p => {
+      const pnl = p.realized_pnl_usd;
+      return `<tr>
+        <td><b>${esc(p.name || "—")}</b></td>
+        <td class="pnl ${pnlClass(pnl)}">${fmtMoney(pnl)}</td>
+        <td class="muted-cell">${esc(p.close_reason || "—")}</td>
+        <td class="muted-cell">${esc((p.closed_at || "").replace("T", " ").slice(0, 19))}Z</td>
+      </tr>`;
+    }).join("");
+    document.getElementById("closed-body").innerHTML = `
+      <table class="close-table">
+        <thead><tr>
+          <th>Coin</th>
+          <th title="Final profit or loss after fees">Final P/L</th>
+          <th title="Why it sold: hit profit target, stop loss, or time limit">Why sold</th>
+          <th>When</th>
+        </tr></thead>
+        <tbody>${body}</tbody>
+      </table>`;
   }
 
-  function fmtPct(v) {
-    if (v == null || Number.isNaN(Number(v))) return 'n/a';
-    const n = Number(v);
-    return `${n >= 0 ? '+' : ''}${n.toFixed(2)}%`;
-  }
+  function renderRow(addr, token) {
+    const tradeable = token.tradeable !== false;
+    const role = token.role || (tradeable ? "trade" : "observe");
+    const tf = selectedTF[addr] || token.tf_used || "1";
+    const name = token.name || addr.slice(0, 8);
+    const isOpen = openAddr === addr;
 
-	async function refresh() {
-	  for (const addr in selectedTF) {
-		const tf = selectedTF[addr] || "1S";
-		const res = await fetch(`/data?tf=${tf}`);
-		const allTokens = await res.json();
-		const token = allTokens[addr];
-		if (!token) continue;
-
-		const {
-		  name, rsi, ema200, macd_line, macd_signal, macd_hist,
-		  stoch_k, stoch_d, vwap, adx, plus_di, minus_di,
-		  boll_upper, boll_middle, boll_lower, open, high, low, close, volume, timestamp,
-		  analysis, error
-		} = token;
-
-		const format = (label, val) => `${label}: ${val ?? 'N/A'}`;
-
-		const priceCol = [
-		  format('🟢 Open', open),
-		  format('🔺 High', high),
-		  format('🔻 Low', low),
-		  format('⚪ Close', close),
-		  format('💰 Volume', volume),
-		  format('⏱️ Time', timestamp)
-		].join('\n');
-
-		const momentumCol = [
-		  format('📊 RSI (14)', rsi),
-		  format('🟣 MACD', macd_line),
-		  format('🔵 Signal', macd_signal),
-		  format('📊 Histogram', macd_hist),
-		  format('⚡ %K', stoch_k),
-		  format('⚡ %D', stoch_d)
-		].join('\n');
-
-		const trendCol = [
-		  format('📉 EMA 200', ema200),
-		  format('💧 VWAP', vwap),
-		  format('📐 ADX', adx),
-		  `➕ +DI / ➖ -DI: ${plus_di ?? 'N/A'} / ${minus_di ?? 'N/A'}`
-		].join('\n');
-
-		const volatilityCol = [
-		  format('🔺 Upper BB', boll_upper),
-		  format('🔸 Mid BB', boll_middle),
-		  format('🔻 Lower BB', boll_lower)
-		].join('\n');
-
-		let analysisCol = 'N/A';
-		if (token.error) {
-		  analysisCol = `❌ Error: ${token.error}\n\n${token.traceback}`;
-		} else if (analysis) {
-		  analysisCol = [
-			`🧠 Summary: ${analysis.overall ?? 'N/A'}`,
-			`🔁 ChoCH: ${analysis.choch ?? 'N/A'}`,
-			format('📈 Trend', analysis.trend_strength),
-			format('⚡ Momentum', analysis.momentum),
-			format('🌊 Volatility', analysis.volatility),
-			'',
-			...(analysis.notes?.length
-				? analysis.notes.map(n => {
-					if (n.startsWith("📏")) return `📏 ${n.slice(2)}`;
-					if (n.startsWith("🚀")) return `🚀 ${n.slice(2)}`;
-					if (n.startsWith("💚")) return `💚 ${n.slice(2)}`;
-					if (n.startsWith("❤️")) return `❤️ ${n.slice(2)}`;
-					return `• ${n}`;
-				})
-				: ["• No signals"])
-			].join('\n');
-
-
-		}
-      const rowId = `row-${addr}`;
-      let row = document.getElementById(rowId);
-
-      // Create row if it doesn't exist
-      if (!row) {
-        row = document.createElement('tr');
-        row.id = rowId;
-
-        const nameCell = document.createElement('td');
-        nameCell.classList.add('token-name');
-        const link = document.createElement('a');
-        link.href = 'https://axiom.trade/meme/' + addr;
-        link.target = '_blank';
-        link.innerText = name;
-        nameCell.appendChild(link);
-
-        const select = document.createElement('select');
-        for (const optionTF of timeframes) {
-          const opt = document.createElement('option');
-          opt.value = optionTF;
-          opt.textContent = optionTF;
-          if (optionTF === tf) opt.selected = true;
-          select.appendChild(opt);
-        }
-        select.onchange = (e) => {
-          selectedTF[addr] = e.target.value;
-          refresh();
-        };
-        nameCell.appendChild(document.createElement('br'));
-        nameCell.appendChild(select);
-
-        const safetyCell = document.createElement('td');
-        safetyCell.classList.add('safety');
-
-        const decideCell = document.createElement('td');
-        decideCell.classList.add('decide');
-
-        const analysisCell = document.createElement('td');
-        analysisCell.classList.add('metrics');
-
-        const col1 = document.createElement('td');
-        const col2 = document.createElement('td');
-        const col3 = document.createElement('td');
-        const col4 = document.createElement('td');
-        [col1, col2, col3, col4].forEach(col => col.classList.add('metrics'));
-
-        row.appendChild(nameCell);
-        row.appendChild(safetyCell);
-        row.appendChild(decideCell);
-        row.appendChild(analysisCell);
-        row.appendChild(col1);
-        row.appendChild(col2);
-        row.appendChild(col3);
-        row.appendChild(col4);
-
-        document.getElementById('tokenTable').appendChild(row);
+    let action = "—";
+    let edge = null;
+    let safety = "—";
+    let taClaim = null;
+    let conf = null;
+    if (tradeable) {
+      const d = requestDecide(addr, tf);
+      const s = requestSafety(addr);
+      if (d && d.card) {
+        action = (d.card.action || "hold").toLowerCase();
+        edge = d.card.cost_adjusted_edge_pct;
+        conf = d.card.action_confidence;
+        const ind = (d.card.drivers || []).find(x => x.source === "indicators");
+        if (ind) taClaim = ind.claim;
+      } else {
+        action = "…";
       }
-
-      // Update values in-place
-      const cells = row.children;
-      renderSafety(cells[1], addr);
-      renderDecide(cells[2], addr, tf);
-      cells[3].innerText = analysisCol;
-      cells[4].innerText = priceCol;
-      cells[5].innerText = momentumCol;
-      cells[6].innerText = trendCol;
-      cells[7].innerText = volatilityCol;
+      if (s && s.report) safety = (s.report.verdict || "unknown").toLowerCase();
+    } else {
+      action = "watch";
     }
+
+    const ta = taScoreFromToken(token);
+    const taTxt = ta == null ? "—" : `${ta >= 0 ? "+" : ""}${ta.toFixed(2)}`;
+    const edgeTxt = edge == null ? "—" : fmtPct(edge);
+    const edgeCls = edge == null ? "" : (Number(edge) >= 0 ? "pos" : "neg");
+    const taCls = ta == null ? "" : (ta >= 0 ? "pos" : "neg");
+
+    return `
+      <button type="button" class="row ${role} ${isOpen ? "open" : ""}" data-addr="${esc(addr)}">
+        <div>
+          <div class="name"><a href="https://axiom.trade/meme/${esc(addr)}" target="_blank" rel="noopener" onclick="event.stopPropagation()">${esc(name)}</a></div>
+          <div class="sub">${token.observe_lite ? "lite · " : ""}${fmtUsd(token.liquidity_usd)} liq · ${fmtUsd(token.volume_24h_usd)} vol24h</div>
+        </div>
+        <div class="mono">${fmtPrice(token.close)}</div>
+        <div><span class="pill ${esc(action)}">${esc(action)}</span>${conf != null ? `<div class="sub">conf ${Math.round(conf * 100)}%</div>` : ""}</div>
+        <div class="mono edge ${edgeCls}" title="Expected edge after fees">${edgeTxt}</div>
+        <div class="mono ta c-ta ${taCls}" title="${esc(taClaim || "Do charts agree with a buy?")}">${taTxt}</div>
+        <div class="role c-role ${esc(role)}">${esc(role === "trade" ? "hunt" : (role === "observe" ? "watch" : role))}</div>
+      </button>
+      <div class="detail">
+        <div class="detail-grid">
+          <div><strong>Safety</strong><span class="pill ${esc(safety)}">${esc(safety)}</span></div>
+          <div><strong>RSI</strong><span>${fmtNum(token.rsi, 1)}</span></div>
+          <div><strong>MACD hist</strong><span>${fmtNum(token.macd_hist, 5)}</span></div>
+          <div><strong>StochRSI</strong><span>${fmtNum(token.stoch_rsi_k, 1)}</span></div>
+          <div><strong>Williams</strong><span>${fmtNum(token.williams_r, 1)}</span></div>
+          <div><strong>ADX</strong><span>${fmtNum(token.adx, 1)}</span></div>
+          <div><strong>CCI</strong><span>${fmtNum(token.cci, 1)}</span></div>
+          <div><strong>AO</strong><span>${fmtNum(token.ao, 4)}</span></div>
+        </div>
+      </div>`;
   }
 
-  async function refreshPipelineBar() {
-    try {
-      const [port, swarm] = await Promise.all([
-        fetch('/portfolio').then(r => r.json()),
-        fetch('/swarm').then(r => r.json()),
-      ]);
-      const paperEl = document.getElementById('paper-stat');
-      const swarmEl = document.getElementById('swarm-stat');
-      const btn = document.getElementById('swarm-toggle');
-      if (paperEl) {
-        paperEl.textContent = `open=${port.open_count||0} pnl=$${(port.realized_pnl_usd||0).toFixed(2)} cash=$${(port.cash_usd||0).toFixed(0)} kill=${port.kill_switch}`;
-      }
-      if (swarmEl) {
-        swarmEl.textContent = swarm.running ? `running ticks=${swarm.ticks||0}` : 'stopped';
-      }
-      if (btn) btn.textContent = swarm.running ? 'Stop swarm' : 'Start swarm';
-    } catch (e) { /* ignore */ }
-  }
+  async function refresh() {
+    const res = await fetch("/data?tf=1");
+    const all = await res.json();
+    lastTokens = all;
+    const list = document.getElementById("list");
+    const addrs = Object.keys(all);
 
-  document.getElementById('swarm-toggle')?.addEventListener('click', async () => {
-    const swarm = await fetch('/swarm').then(r => r.json());
-    const action = swarm.running ? 'stop' : 'start';
-    await fetch('/swarm', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ action, mode: 'full', interval_s: 15 })
+    for (const a of Object.keys(selectedTF)) if (!all[a]) delete selectedTF[a];
+    for (const a of addrs) if (!selectedTF[a]) selectedTF[a] = all[a].tf_used || "1";
+
+    const COLHEAD = `
+      <div class="colhead">
+        <span title="Coin name. Liq = money in the pool; vol24h = traded in the last day.">Token</span>
+        <span title="Latest price from the candle chart the bot is watching.">Price</span>
+        <span title="What the bot would do: buy, hold (wait), avoid (skip), or watch.">Bot says</span>
+        <span title="After fees, how much % the forecast thinks you might make. About +2.5% on $40 ≈ $1 target.">Expected edge</span>
+        <span class="c-ta" title="Do chart indicators agree with a buy?">Chart agree?</span>
+        <span class="c-role" title="hunt = bot may trade; watch = board only.">Role</span>
+      </div>`;
+
+    const visible = addrs.filter(a => {
+      const role = all[a].role || (all[a].tradeable === false ? "observe" : "trade");
+      return filter === "all" || role === filter;
     });
-    refreshPipelineBar();
-  });
 
-  fetch('/data?tf=1S').then(res => res.json()).then(data => {
-    for (const addr in data) {
-      if (!selectedTF[addr]) {
-        selectedTF[addr] = "1S";
-      }
+    document.getElementById("count").textContent = `${visible.length} shown · ${addrs.length} loaded`;
+
+    const filterLabel = filter === "trade" ? "active-hunt" : (filter === "observe" ? "watch-only" : "");
+    if (!visible.length) {
+      list.innerHTML = COLHEAD + `<div class="empty" id="empty">No ${filterLabel || ""} tokens on the board right now.</div>`;
+      return;
     }
-    refresh(); // ⏳ wait for tokens to be initialized
+
+    list.innerHTML = COLHEAD + visible.map(a => renderRow(a, all[a])).join("");
+
+    list.querySelectorAll(".row").forEach(btn => {
+      btn.addEventListener("click", () => {
+        openAddr = openAddr === btn.dataset.addr ? null : btn.dataset.addr;
+        refresh();
+      });
+    });
+  }
+
+  async function refreshOps() {
+    try {
+      const [port, swarm, health, ready, arb] = await Promise.all([
+        fetch("/portfolio").then(r => r.json()),
+        fetch("/swarm").then(r => r.json()),
+        fetch("/health").then(r => r.json()),
+        fetch("/readiness").then(r => r.json()),
+        fetch("/arb").then(r => r.json()),
+      ]);
+      const t = ready.today || {};
+      const eq = port.equity_usd;
+      const eqPnl = port.equity_pnl_usd;
+      setMetric("m-equity", fmtMoneyAbs(eq), pnlClass(eqPnl));
+      document.getElementById("m-equity-sub").textContent =
+        `${fmtMoney(eqPnl)} vs $1000 start`;
+      setMetric("m-cash", fmtMoneyAbs(port.cash_usd));
+      setMetric("m-realized", fmtMoney(port.realized_pnl_usd), pnlClass(port.realized_pnl_usd));
+      document.getElementById("m-realized-sub").textContent =
+        `${port.closed_count || 0} finished · emergency stop ${port.kill_switch ? "ON" : "off"}`;
+      setMetric("m-unrealized", fmtMoney(port.unrealized_pnl_usd), pnlClass(port.unrealized_pnl_usd));
+      document.getElementById("m-unrealized-sub").textContent =
+        `${port.open_count || 0} open · ${fmtMoneyAbs(port.open_notional_usd)} in trades`;
+      setMetric("m-scalp", fmtMoney(t.scalp_pnl_sum), pnlClass(t.scalp_pnl_sum));
+      document.getElementById("m-scalp-sub").textContent =
+        `${t.scalp_closes || 0} closes · avg ${fmtMoney(t.scalp_ev, 3)}`;
+      setMetric("m-arb", fmtMoney(t.arb_pnl_sum), pnlClass(t.arb_pnl_sum));
+      document.getElementById("m-arb-sub").textContent =
+        `${t.arb_fills || 0} fills · avg ${fmtMoney(t.arb_ev, 3)}`;
+
+      renderOpenPositions(port);
+      renderClosed(port);
+
+      document.getElementById("strip-meta").innerHTML =
+        `<span>auto-trader <b>${swarm.running ? "on" : "off"}</b> · ${swarm.ticks || 0} checks</span>` +
+        `<span>finder <b>${(health.discover && health.discover.running) ? "on" : "off"}</b> · ${health.tokens_tradeable || 0} hunting / ${health.tokens_observe || 0} watching</span>` +
+        `<span>price-gap <b>${arb.running ? "on" : "off"}</b> · ${arb.paper_fills || 0} fills</span>` +
+        `<span>bot opinions today <b>${t.decisions || 0}</b> · buys <b>${(t.actions && t.actions.buy) || 0}</b></span>`;
+
+      document.getElementById("swarm-toggle").textContent = swarm.running ? "Pause auto-trader" : "Start auto-trader";
+
+      const score = ready.score != null ? ready.score : "—";
+      document.getElementById("ready-score").textContent = score;
+      const verd = document.getElementById("ready-verdict");
+      const plain = document.getElementById("ready-plain");
+      const n = Number(score);
+      let cls = "nogo";
+      let label = "KEEP PRACTICE";
+      let plainTxt = "Not enough solid practice results yet — keep fake-money mode on.";
+      if (ready.ready_for_live) {
+        cls = "go";
+        label = "LOOKS READY";
+        plainTxt = "Practice checklist cleared. Still double-check before any real money.";
+      } else if (n >= 50) {
+        cls = "almost";
+        label = "GETTING THERE";
+        plainTxt = "Results look promising, but the sample is still thin.";
+      }
+      verd.className = "tag " + cls;
+      verd.textContent = label;
+      plain.textContent = plainTxt;
+      document.getElementById("ready-rec").textContent = ready.recommendation || "";
+    } catch (e) {}
+  }
+
+  document.getElementById("swarm-toggle").addEventListener("click", async () => {
+    const swarm = await fetch("/swarm").then(r => r.json());
+    await fetch("/swarm", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: swarm.running ? "stop" : "start", mode: "full", interval_s: 12 }),
+    });
+    refreshOps();
   });
 
-  setInterval(refresh, 500);
-  refreshPipelineBar();
-  setInterval(refreshPipelineBar, 5000);
-</script>
+  document.getElementById("session-reset").addEventListener("click", async () => {
+    const ok = window.confirm(
+      "Reset monitoring board?\n\n" +
+      "• Archives today's decision/paper/outcome/pipeline logs\n" +
+      "• Resets paper cash to $1000 (closes book)\n" +
+      "• Clears discover cool-offs and arb session counters\n" +
+      "• Triggers a fresh discover scan"
+    );
+    if (!ok) return;
+    const btn = document.getElementById("session-reset");
+    btn.disabled = true;
+    btn.textContent = "Resetting…";
+    try {
+      const res = await fetch("/session/reset", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ reason: "dashboard" }),
+      });
+      const data = await res.json();
+      if (data.status !== "ok") {
+        window.alert("Reset failed: " + (data.error || res.status));
+      } else {
+        document.getElementById("strip-meta").textContent =
+          `Board reset ${data.started_at || "now"} · monitoring from this point`;
+      }
+    } catch (e) {
+      window.alert("Reset failed: " + e);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = "Reset board";
+      refreshOps();
+      refresh();
+    }
+  });
 
+  document.querySelectorAll(".tabs button").forEach(btn => {
+    btn.addEventListener("click", () => {
+      document.querySelectorAll(".tabs button").forEach(b => b.classList.remove("on"));
+      btn.classList.add("on");
+      filter = btn.dataset.filter;
+      refresh();
+    });
+  });
 
+  refresh();
+  refreshOps();
+  setInterval(refresh, 3000);
+  setInterval(refreshOps, 4000);
+  </script>
 </body>
 </html>

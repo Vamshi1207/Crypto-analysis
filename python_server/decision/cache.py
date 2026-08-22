@@ -22,6 +22,10 @@ _DEFAULT_TTLS = {
     # Price and liquidity move constantly; keep this short.
     "dexscreener": 15.0,
     "dexscreener_pair": 60.0,
+    # Discovery feeds — longer TTLs to stay inside free-tier rpm.
+    "dexscreener_boosts": 60.0,
+    "gecko_trending": 60.0,
+    "gecko_ohlcv": 30.0,
     # Pool→mint mapping is effectively permanent for a given pool address.
     "resolve_mint": 3600.0,
     "jupiter_quote": 20.0,

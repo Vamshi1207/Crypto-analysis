@@ -32,6 +32,16 @@ def isolated_store(tmp_path, monkeypatch):
     return tmp_path / "store"
 
 
+@pytest.fixture(autouse=True)
+def paper_concentration_headroom(monkeypatch):
+    """Paper portfolio is process-global; give tests headroom unless they tighten caps."""
+    from decision import paper
+
+    monkeypatch.setattr(paper, "MAX_TRADES_PER_MINT_DAY", 50)
+    monkeypatch.setattr(paper, "MAX_NOTIONAL_PER_MINT_DAY", 10_000.0)
+    monkeypatch.setattr(paper, "MAX_DAILY_LOSS_PER_MINT", 10_000.0)
+
+
 @pytest.fixture(scope="session")
 def corpus_tokens():
     tokens = dataset.list_tokens()
