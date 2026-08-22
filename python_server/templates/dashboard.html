@@ -639,14 +639,14 @@
         <div><b>Profit locked in</b> — wins/losses from trades already sold.</div>
         <div><b>Open gain/loss</b> — paper profit if you closed open trades at the latest price.</div>
         <div><b>Quick trade (scalp)</b> — buy a coin, sell soon, aim for about $1 net after fees.</div>
-        <div><b>Price-gap trade (arb)</b> — same coin priced differently in two places; paper “buy cheap / sell rich.”</div>
+        <div><b>Price-gap trade (arb)</b> — same coin priced differently in two places; paper “buy cheap / sell rich.” Books a <em>conservative</em> profit (assumes the gap shrinks + fees). No timer cool-down by default — if analysis still says yes, it can jump in again.</div>
         <div><b>Expected edge</b> — forecast upside minus fees. Positive is hopeful; it still has to clear the ~$1 target.</div>
         <div><b>Chart agree? (TA)</b> — do RSI/MACD-style signals support the buy, or fight it?</div>
         <div><b>Active hunt / Watch only</b> — hunting tokens can be traded; watch-only are paused or cooling down.</div>
         <div><b>Readiness score</b> — checklist score for “is practice strong enough to consider real money?” Keep live trading off until it says ready.</div>
         <div><b>Reset board</b> — archive today’s logs and start a clean practice score from $1000 again.</div>
         <div><b>Fees / slip</b> — trading isn’t free: pool fees plus price moving while you buy/sell. The bot subtracts these before calling something a good idea.</div>
-        <div><b>Pipeline</b> — the step-by-step checks (safety → forecast → costs → risk → paper buy/sell).</div>
+        <div><b>Add-on lot</b> — if the bot already holds a coin and analysis still says “buy for profit,” it can open another separate ~$40 lot (each with its own take-profit / stop), as long as cash and book limits allow.</div>
       </div>
     </section>
     <p class="foot" id="ready-rec"></p>

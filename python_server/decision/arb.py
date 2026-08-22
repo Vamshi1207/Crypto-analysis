@@ -4,9 +4,16 @@ This is the useful slice of the viral “ms arb bot” idea — detect when the 
 mint prints different USD prices on two DEXes/pools, size the gap against real
 round-trip costs, and book a paper atomic round-trip when net edge clears.
 
-It does **not** do mempool racing or Jito bundles yet. Quotes come from
-DexScreener (and optional Jupiter cross-check). True millisecond racing needs a
-paid Geyser/gRPC or Jito path; this channel proves whether gaps survive *our*
+Honesty upgrades (paper still optimistic vs live MEV/latency, but less naive):
+- Size capped by a fraction of the thinner pool (cannot always deploy $40).
+- Per-mint cooldown + daily fill cap (no double-counting every tick).
+- Cross-DEX only (same-venue gaps are often noise).
+- Half-gap stress gate: if the spread halves, edge must still clear the hurdle.
+- Jupiter sell-route check; impact haircut applied twice (buy+sell legs).
+- Booked PnL uses the **conservative** (stressed) net, not the raw Dex gap.
+
+It does **not** do mempool racing or Jito bundles yet. True millisecond racing
+needs paid Geyser/gRPC or Jito; this channel asks whether gaps survive *our*
 cost model before any live tips are spent.
 """
 
@@ -17,7 +24,7 @@ import threading
 import time
 import uuid
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Any, Callable, Optional
 
 from decision import costs
@@ -28,6 +35,7 @@ from decision.sources import (
     NoRouteError,
     SourceError,
     fetch_dexscreener_pairs,
+    fetch_jupiter_quote,
     fetch_mint_account,
     fetch_sell_quote,
 )
@@ -37,13 +45,27 @@ INTERVAL_SEC = _env_float("ARB_INTERVAL_SEC", 20.0)
 MIN_EDGE_PCT = _env_float("ARB_MIN_EDGE_PCT", 0.8)
 MIN_POOL_LIQ_USD = _env_float("ARB_MIN_POOL_LIQ_USD", 8_000.0)
 SIZE_USD = _env_float("ARB_SIZE_USD", 40.0)
+MIN_SIZE_USD = _env_float("ARB_MIN_SIZE_USD", 10.0)
+# Never take more than this fraction of the thinner pool's USD liquidity.
+MAX_POOL_FRAC = _env_float("ARB_MAX_POOL_FRAC", 0.005)
 MAX_PER_TICK = _env_int("ARB_MAX_PER_TICK", 3)
+# Quiet period after a paper fill on a mint. 0 = off (re-enter whenever analysis clears).
+MINT_COOLDOWN_SEC = _env_float("ARB_MINT_COOLDOWN_SEC", 0.0)
+# Max paper fills per mint per UTC day. 0 = unlimited (analysis gates only).
+MAX_FILLS_PER_MINT_DAY = _env_int("ARB_MAX_FILLS_PER_MINT_DAY", 0)
+# Require buy/sell on different DEX ids (cross-venue).
+REQUIRE_CROSS_DEX = os.getenv("ARB_REQUIRE_CROSS_DEX", "1").strip() == "1"
+# Only book if (gross * stress_frac - costs) still clears MIN_EDGE.
+STRESS_GAP_FRAC = _env_float("ARB_STRESS_GAP_FRAC", 0.5)
 # Arb legs are two swaps; reuse the shared cost model (fees + slip + tip).
-# Optional override if you want a tighter assumed slip for liquid pairs.
 ARB_SLIP_PCT = _env_float("ARB_SLIP_PCT", 0.0)  # 0 = use costs.DEFAULT_ENTRY_SLIP_PCT
-# Paper fills only count when Jupiter can route the size (default on).
 REQUIRE_JUPITER = os.getenv("ARB_REQUIRE_JUPITER", "1").strip() == "1"
-MAX_JUPITER_IMPACT_PCT = _env_float("ARB_MAX_JUPITER_IMPACT_PCT", 5.0)
+MAX_JUPITER_IMPACT_PCT = _env_float("ARB_MAX_JUPITER_IMPACT_PCT", 3.0)
+# Multiply sell-leg impact by this to approximate buy+sell impact.
+JUPITER_IMPACT_LEGS = _env_float("ARB_JUPITER_IMPACT_LEGS", 2.0)
+# Also try SOL→mint Jupiter quote when we can price SOL.
+REQUIRE_BUY_ROUTE = os.getenv("ARB_REQUIRE_BUY_ROUTE", "1").strip() == "1"
+SOL_USD_FALLBACK = _env_float("ARB_SOL_USD_FALLBACK", 140.0)
 
 
 @dataclass
@@ -64,8 +86,10 @@ class ArbOpportunity:
     gross_pct: float
     cost_pct: float
     net_pct: float
+    stress_net_pct: float
     size_usd: float
     expected_pnl_usd: float
+    stress_pnl_usd: float
 
 
 @dataclass
@@ -77,6 +101,9 @@ class ArbState:
     opportunities_seen: int = 0
     paper_fills: int = 0
     realized_pnl_usd: float = 0.0
+    skipped_cooldown: int = 0
+    skipped_jupiter: int = 0
+    skipped_stress: int = 0
     last_opps: list[dict[str, Any]] = field(default_factory=list)
 
 
@@ -85,6 +112,10 @@ _thread: Optional[threading.Thread] = None
 _stop = threading.Event()
 _state = ArbState()
 _get_tokens: Optional[Callable[[], dict[str, Any]]] = None
+# mint → cool-until unix; mint → (utc-day-iso, fill_count)
+_cool_until: dict[str, float] = {}
+_fills_today: dict[str, tuple[str, int]] = {}
+_sol_usd_cache: tuple[float, float] = (0.0, 0.0)  # (unix_ts, usd)
 
 
 def configure(*, get_tokens: Callable[[], dict[str, Any]]) -> None:
@@ -93,7 +124,7 @@ def configure(*, get_tokens: Callable[[], dict[str, Any]]) -> None:
 
 
 def reset_counters() -> dict[str, Any]:
-    """Zero session stats (keeps the loop running if already started)."""
+    """Zero session stats + cool-downs (keeps the loop running if already started)."""
     with _lock:
         _state.ticks = 0
         _state.last_tick_at = None
@@ -101,13 +132,19 @@ def reset_counters() -> dict[str, Any]:
         _state.opportunities_seen = 0
         _state.paper_fills = 0
         _state.realized_pnl_usd = 0.0
+        _state.skipped_cooldown = 0
+        _state.skipped_jupiter = 0
+        _state.skipped_stress = 0
         _state.last_opps = []
+        _cool_until.clear()
+        _fills_today.clear()
     pipeline_log.emit("arb", "reset", level="warning")
     return status()
 
 
 def status() -> dict[str, Any]:
     with _lock:
+        cooling = sum(1 for t in _cool_until.values() if t > time.time())
         return {
             "running": _state.running,
             "ticks": _state.ticks,
@@ -116,20 +153,33 @@ def status() -> dict[str, Any]:
             "opportunities_seen": _state.opportunities_seen,
             "paper_fills": _state.paper_fills,
             "realized_pnl_usd": round(_state.realized_pnl_usd, 4),
+            "skipped_cooldown": _state.skipped_cooldown,
+            "skipped_jupiter": _state.skipped_jupiter,
+            "skipped_stress": _state.skipped_stress,
+            "cooling_mints": cooling,
             "last_opps": list(_state.last_opps)[:20],
             "limits": {
                 "interval_sec": INTERVAL_SEC,
                 "min_edge_pct": MIN_EDGE_PCT,
                 "min_pool_liq_usd": MIN_POOL_LIQ_USD,
                 "size_usd": SIZE_USD,
+                "min_size_usd": MIN_SIZE_USD,
+                "max_pool_frac": MAX_POOL_FRAC,
                 "max_per_tick": MAX_PER_TICK,
+                "mint_cooldown_sec": MINT_COOLDOWN_SEC,
+                "max_fills_per_mint_day": MAX_FILLS_PER_MINT_DAY,
+                "require_cross_dex": REQUIRE_CROSS_DEX,
+                "stress_gap_frac": STRESS_GAP_FRAC,
                 "require_jupiter": REQUIRE_JUPITER,
                 "max_jupiter_impact_pct": MAX_JUPITER_IMPACT_PCT,
+                "jupiter_impact_legs": JUPITER_IMPACT_LEGS,
+                "require_buy_route": REQUIRE_BUY_ROUTE,
             },
             "enabled_env": ARB_ENABLED,
             "live_trading": False,
             "note": (
-                "paper-only cross-pool quote arb; Jupiter sim gate before fills; "
+                "paper-only cross-pool arb; entries gated by analysis "
+                "(stress gap + Jupiter + liq size), not by default timers; "
                 "ms racing needs paid Geyser/Jito later"
             ),
         }
@@ -179,6 +229,9 @@ def scan_once() -> dict[str, Any]:
                 _state.opportunities_seen += int(result.get("opportunities_n") or 0)
                 _state.paper_fills += int(result.get("fills_n") or 0)
                 _state.realized_pnl_usd += float(result.get("pnl_usd") or 0.0)
+                _state.skipped_cooldown += int(result.get("skipped_cooldown_n") or 0)
+                _state.skipped_jupiter += int(result.get("skipped_jupiter_n") or 0)
+                _state.skipped_stress += int(result.get("skipped_stress_n") or 0)
                 _state.last_opps = list(result.get("opportunities") or [])[:20]
             pipeline_log.emit(
                 "arb",
@@ -188,6 +241,8 @@ def scan_once() -> dict[str, Any]:
                 opportunities_n=result.get("opportunities_n"),
                 fills_n=result.get("fills_n"),
                 pnl_usd=result.get("pnl_usd"),
+                skipped_cooldown_n=result.get("skipped_cooldown_n"),
+                skipped_jupiter_n=result.get("skipped_jupiter_n"),
             )
             return result
         except Exception as exc:  # noqa: BLE001
@@ -223,6 +278,15 @@ def _universe_mints() -> list[tuple[str, str]]:
     return out
 
 
+def _sized_usd(buy: PoolQuote, sell: PoolQuote) -> Optional[float]:
+    """Cap notional by thinner-pool liquidity; None if below minimum."""
+    thin = min(buy.liquidity_usd, sell.liquidity_usd)
+    capped = min(SIZE_USD, thin * MAX_POOL_FRAC)
+    if capped < MIN_SIZE_USD:
+        return None
+    return round(capped, 4)
+
+
 def find_opportunities(mint: str, *, symbol: str = "") -> list[ArbOpportunity]:
     """Compare DexScreener pool mid prices for one mint; return positive-net opps."""
     try:
@@ -245,15 +309,25 @@ def find_opportunities(mint: str, *, symbol: str = "") -> list[ArbOpportunity]:
     if len(quotes) < 2:
         return []
 
-    # Cheapest venue to buy, richest to sell — classic cross-pool arb shape.
     buy = min(quotes, key=lambda x: x.price_usd)
     sell = max(quotes, key=lambda x: x.price_usd)
     if buy.pair == sell.pair or buy.price_usd <= 0:
+        return []
+    if REQUIRE_CROSS_DEX and buy.dex == sell.dex:
+        pipeline_log.emit(
+            "arb",
+            "same_dex_skip",
+            mint=mint,
+            symbol=symbol or buy.symbol,
+            dex=buy.dex,
+        )
         return []
 
     gross = (sell.price_usd / buy.price_usd - 1.0) * 100.0
     cost = _arb_cost_pct()
     net = gross - cost
+    stress_net = gross * STRESS_GAP_FRAC - cost
+    size = _sized_usd(buy, sell)
     pipeline_log.emit(
         "arb",
         "spread",
@@ -264,13 +338,27 @@ def find_opportunities(mint: str, *, symbol: str = "") -> list[ArbOpportunity]:
         gross_pct=round(gross, 4),
         cost_pct=round(cost, 4),
         net_pct=round(net, 4),
+        stress_net_pct=round(stress_net, 4),
+        size_usd=size,
         buy_liq=buy.liquidity_usd,
         sell_liq=sell.liquidity_usd,
     )
+    if size is None:
+        return []
     if net < MIN_EDGE_PCT:
         return []
+    if stress_net < MIN_EDGE_PCT:
+        pipeline_log.emit(
+            "arb",
+            "stress_skip",
+            level="warning",
+            mint=mint,
+            symbol=symbol or buy.symbol,
+            stress_net_pct=round(stress_net, 4),
+            need=MIN_EDGE_PCT,
+        )
+        return []
 
-    size = SIZE_USD
     return [
         ArbOpportunity(
             mint=mint,
@@ -280,15 +368,16 @@ def find_opportunities(mint: str, *, symbol: str = "") -> list[ArbOpportunity]:
             gross_pct=round(gross, 4),
             cost_pct=round(cost, 4),
             net_pct=round(net, 4),
+            stress_net_pct=round(stress_net, 4),
             size_usd=size,
             expected_pnl_usd=round(size * net / 100.0, 4),
+            stress_pnl_usd=round(size * stress_net / 100.0, 4),
         )
     ]
 
 
 def _arb_cost_pct() -> float:
     slip = ARB_SLIP_PCT if ARB_SLIP_PCT > 0 else None
-    # Two swap legs through different pools — model as full round trip.
     return costs.round_trip_cost_pct(
         price_impact_pct=slip if slip else None,
         slippage_bps=None if slip else None,
@@ -300,12 +389,10 @@ def _quote_from_pair(pair: dict[str, Any], *, mint: str) -> Optional[PoolQuote]:
     quote = pair.get("quoteToken") or {}
     base_addr = base.get("address") or ""
     quote_addr = quote.get("address") or ""
-    # PriceUsd on DexScreener is for the pair's base token.
     if base_addr == mint:
         price_raw = pair.get("priceUsd")
         symbol = base.get("symbol") or ""
     elif quote_addr == mint:
-        # Rare: mint on quote side — invert if we have priceNative, else skip.
         return None
     else:
         return None
@@ -325,25 +412,96 @@ def _quote_from_pair(pair: dict[str, Any], *, mint: str) -> Optional[PoolQuote]:
     )
 
 
+def _mint_blocked(mint: str) -> Optional[str]:
+    """Optional timer/quota barriers. Both default off — analysis decides.
+
+    Returns a skip reason only when the corresponding limit is explicitly > 0.
+    """
+    now = time.time()
+    with _lock:
+        if MINT_COOLDOWN_SEC > 0:
+            until = _cool_until.get(mint)
+            if until and until > now:
+                return f"cooldown {int(until - now)}s"
+            if until and until <= now:
+                _cool_until.pop(mint, None)
+
+        if MAX_FILLS_PER_MINT_DAY > 0:
+            day = date.today().isoformat()
+            prev = _fills_today.get(mint)
+            if prev and prev[0] == day and prev[1] >= MAX_FILLS_PER_MINT_DAY:
+                return f"mint daily cap {prev[1]}/{MAX_FILLS_PER_MINT_DAY}"
+            if prev and prev[0] != day:
+                _fills_today.pop(mint, None)
+    return None
+
+
+def _record_fill_limits(mint: str) -> None:
+    """Track optional cool-down / daily counts when those limits are enabled."""
+    day = date.today().isoformat()
+    with _lock:
+        if MINT_COOLDOWN_SEC > 0:
+            _cool_until[mint] = time.time() + MINT_COOLDOWN_SEC
+        if MAX_FILLS_PER_MINT_DAY > 0:
+            prev = _fills_today.get(mint)
+            if prev and prev[0] == day:
+                _fills_today[mint] = (day, prev[1] + 1)
+            else:
+                _fills_today[mint] = (day, 1)
+
+
 def _scan_and_maybe_fill() -> dict[str, Any]:
     universe = _universe_mints()
     opps: list[ArbOpportunity] = []
     for mint, symbol in universe:
         opps.extend(find_opportunities(mint, symbol=symbol))
 
-    opps.sort(key=lambda o: o.net_pct, reverse=True)
+    opps.sort(key=lambda o: o.stress_net_pct, reverse=True)
     fills: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
+    skipped_cooldown_n = 0
+    skipped_jupiter_n = 0
+    skipped_stress_n = 0
     pnl_total = 0.0
-    for opp in opps[:MAX_PER_TICK]:
-        ok, jup = _jupiter_verify(opp)
-        if not ok:
+
+    for opp in opps:
+        if len(fills) >= MAX_PER_TICK:
+            break
+
+        blocked = _mint_blocked(opp.mint)
+        if blocked:
+            skipped_cooldown_n += 1
             skipped.append(
                 {
                     "mint": opp.mint,
                     "symbol": opp.symbol,
                     "net_pct": opp.net_pct,
-                    "reason": jup.get("reason") or "jupiter_reject",
+                    "reason": blocked,
+                }
+            )
+            pipeline_log.emit(
+                "arb",
+                "cooldown_skip",
+                mint=opp.mint,
+                symbol=opp.symbol,
+                reason=blocked,
+            )
+            continue
+
+        ok, jup = _jupiter_verify(opp)
+        if not ok:
+            reason = str(jup.get("reason") or "jupiter_reject")
+            if "stress" in reason or "impact-adjusted" in reason:
+                skipped_stress_n += 1
+            else:
+                skipped_jupiter_n += 1
+            skipped.append(
+                {
+                    "mint": opp.mint,
+                    "symbol": opp.symbol,
+                    "net_pct": opp.net_pct,
+                    "stress_net_pct": opp.stress_net_pct,
+                    "reason": reason,
                     "jupiter": jup,
                 }
             )
@@ -357,7 +515,9 @@ def _scan_and_maybe_fill() -> dict[str, Any]:
                 impact_pct=jup.get("impact_pct"),
             )
             continue
+
         fill = _paper_fill(opp, jupiter=jup)
+        _record_fill_limits(opp.mint)
         fills.append(fill)
         pnl_total += float(fill.get("realized_pnl_usd") or 0.0)
 
@@ -367,6 +527,9 @@ def _scan_and_maybe_fill() -> dict[str, Any]:
         "opportunities_n": len(opps),
         "fills_n": len(fills),
         "skipped_n": len(skipped),
+        "skipped_cooldown_n": skipped_cooldown_n,
+        "skipped_jupiter_n": skipped_jupiter_n,
+        "skipped_stress_n": skipped_stress_n,
         "pnl_usd": round(pnl_total, 4),
         "opportunities": [_opp_dict(o) for o in opps[:20]],
         "fills": fills,
@@ -374,14 +537,43 @@ def _scan_and_maybe_fill() -> dict[str, Any]:
     }
 
 
-def _jupiter_verify(opp: ArbOpportunity) -> tuple[bool, dict[str, Any]]:
-    """Confirm Jupiter can route ~SIZE_USD of this mint before booking paper PnL.
+def _estimate_sol_usd() -> float:
+    """Best-effort SOL/USD for buy-leg sizing; cached briefly."""
+    global _sol_usd_cache
+    now = time.time()
+    ts, cached = _sol_usd_cache
+    if cached > 0 and now - ts < 60.0:
+        return cached
 
-    Cross-pool Dex gaps often look free but are not executable. A successful
-    sell quote at our size (with bounded impact) is the cheap paper filter.
-    """
+    # Prefer a SOL-priced meme pair already on the board is hard; use fallback
+    # unless DexScreener returns a direct SOL/USDC style hit via WSOL pairs.
+    usd = SOL_USD_FALLBACK
+    try:
+        pairs = fetch_dexscreener_pairs(WRAPPED_SOL_MINT)
+        for pair in pairs[:8]:
+            try:
+                px = float(pair.get("priceUsd") or 0)
+            except (TypeError, ValueError):
+                continue
+            # WSOL as base should print ~SOL USD; sanity band.
+            if 20.0 <= px <= 1000.0:
+                usd = px
+                break
+    except SourceError:
+        pass
+    _sol_usd_cache = (now, usd)
+    return usd
+
+
+def _jupiter_verify(opp: ArbOpportunity) -> tuple[bool, dict[str, Any]]:
+    """Confirm Jupiter can route our sized notional before booking paper PnL."""
     if not REQUIRE_JUPITER:
-        return True, {"verified": False, "reason": "jupiter_not_required"}
+        booked = min(opp.net_pct, opp.stress_net_pct)
+        return True, {
+            "verified": False,
+            "reason": "jupiter_not_required",
+            "booked_net_pct": round(booked, 4),
+        }
 
     price = float(opp.buy.price_usd or 0.0)
     if price <= 0:
@@ -393,62 +585,108 @@ def _jupiter_verify(opp: ArbOpportunity) -> tuple[bool, dict[str, Any]]:
     except (SourceError, TypeError, ValueError) as exc:
         return False, {"verified": False, "reason": f"mint_meta: {exc}"}
 
-    amount_raw = int((SIZE_USD / price) * (10**decimals))
+    amount_raw = int((opp.size_usd / price) * (10**decimals))
     if amount_raw <= 0:
         return False, {"verified": False, "reason": "size_rounds_to_zero"}
 
+    buy_impact = None
+    if REQUIRE_BUY_ROUTE:
+        sol_usd = _estimate_sol_usd()
+        lamports = int((opp.size_usd / sol_usd) * (10**9))
+        if lamports <= 0:
+            return False, {"verified": False, "reason": "buy_size_rounds_to_zero"}
+        try:
+            buy_q = fetch_jupiter_quote(WRAPPED_SOL_MINT, opp.mint, lamports)
+        except NoRouteError as exc:
+            return False, {"verified": False, "reason": f"no_buy_route: {exc}"}
+        except SourceError as exc:
+            return False, {"verified": False, "reason": f"jupiter_buy_unavailable: {exc}"}
+        buy_impact = _impact_pct(buy_q)
+
     try:
-        quote = fetch_sell_quote(opp.mint, amount_raw)
+        sell_q = fetch_sell_quote(opp.mint, amount_raw)
     except NoRouteError as exc:
         return False, {"verified": False, "reason": f"no_route: {exc}"}
     except SourceError as exc:
-        # Outage: do not invent fills — wait for a real quote.
         return False, {"verified": False, "reason": f"jupiter_unavailable: {exc}"}
 
-    impact_raw = quote.get("priceImpactPct")
-    try:
-        impact_pct = float(impact_raw) * 100.0 if impact_raw is not None else None
-    except (TypeError, ValueError):
+    sell_impact = _impact_pct(sell_q)
+    impacts = [x for x in (buy_impact, sell_impact) if x is not None]
+    if not impacts and sell_impact is None:
         impact_pct = None
+        impact_rt = None
+    elif impacts:
+        # Prefer measured sum of legs; else 2× sell as proxy.
+        if buy_impact is not None and sell_impact is not None:
+            impact_rt = buy_impact + sell_impact
+            impact_pct = sell_impact
+        else:
+            impact_pct = sell_impact if sell_impact is not None else buy_impact
+            impact_rt = float(impact_pct) * JUPITER_IMPACT_LEGS
+    else:
+        impact_pct = None
+        impact_rt = None
 
     if impact_pct is not None and impact_pct > MAX_JUPITER_IMPACT_PCT:
         return False, {
             "verified": False,
             "reason": f"impact {impact_pct:.2f}% > {MAX_JUPITER_IMPACT_PCT}",
             "impact_pct": round(impact_pct, 4),
+            "impact_rt_pct": None if impact_rt is None else round(impact_rt, 4),
         }
 
-    # Haircut expected edge by measured sell impact (buy impact ~ similar).
-    adj_net = opp.net_pct
-    if impact_pct is not None:
-        adj_net = opp.net_pct - impact_pct
-        if adj_net < MIN_EDGE_PCT:
-            return False, {
-                "verified": False,
-                "reason": f"impact-adjusted net {adj_net:.2f}% < {MIN_EDGE_PCT}",
-                "impact_pct": round(impact_pct, 4),
-                "adj_net_pct": round(adj_net, 4),
-            }
+    # Conservative book: stress gap, then subtract round-trip Jupiter impact.
+    booked = opp.stress_net_pct
+    if impact_rt is not None:
+        booked = opp.stress_net_pct - impact_rt
+    if booked < MIN_EDGE_PCT:
+        return False, {
+            "verified": False,
+            "reason": (
+                f"stress/impact net {booked:.2f}% < {MIN_EDGE_PCT}"
+            ),
+            "impact_pct": None if impact_pct is None else round(impact_pct, 4),
+            "impact_rt_pct": None if impact_rt is None else round(impact_rt, 4),
+            "booked_net_pct": round(booked, 4),
+            "optimistic_net_pct": opp.net_pct,
+            "stress_net_pct": opp.stress_net_pct,
+        }
 
     return True, {
         "verified": True,
         "impact_pct": None if impact_pct is None else round(impact_pct, 4),
-        "adj_net_pct": round(adj_net, 4),
-        "out_amount": quote.get("outAmount"),
+        "impact_rt_pct": None if impact_rt is None else round(impact_rt, 4),
+        "buy_impact_pct": None if buy_impact is None else round(buy_impact, 4),
+        "sell_impact_pct": None if sell_impact is None else round(sell_impact, 4),
+        "booked_net_pct": round(booked, 4),
+        "optimistic_net_pct": opp.net_pct,
+        "stress_net_pct": opp.stress_net_pct,
+        "out_amount": sell_q.get("outAmount"),
         "amount_raw": amount_raw,
+        "size_usd": opp.size_usd,
     }
 
 
+def _impact_pct(quote: dict[str, Any]) -> Optional[float]:
+    impact_raw = quote.get("priceImpactPct")
+    try:
+        if impact_raw is None:
+            return None
+        return float(impact_raw) * 100.0
+    except (TypeError, ValueError):
+        return None
+
+
 def _paper_fill(opp: ArbOpportunity, *, jupiter: Optional[dict[str, Any]] = None) -> dict[str, Any]:
-    """Simulate an atomic buy@cheap / sell@rich fill. No wallet touch."""
-    adj = None
-    if jupiter and jupiter.get("adj_net_pct") is not None:
+    """Simulate an atomic buy@cheap / sell@rich fill. Books conservative net."""
+    booked = opp.stress_net_pct
+    if jupiter and jupiter.get("booked_net_pct") is not None:
         try:
-            adj = float(jupiter["adj_net_pct"])
+            booked = float(jupiter["booked_net_pct"])
         except (TypeError, ValueError):
-            adj = None
-    net_for_pnl = adj if adj is not None else opp.net_pct
-    pnl = round(opp.size_usd * net_for_pnl / 100.0, 4)
+            booked = opp.stress_net_pct
+    pnl = round(opp.size_usd * booked / 100.0, 4)
+    optimistic_pnl = round(opp.size_usd * opp.net_pct / 100.0, 4)
     record = {
         "event": "paper_arb",
         "id": str(uuid.uuid4())[:8],
@@ -461,11 +699,14 @@ def _paper_fill(opp: ArbOpportunity, *, jupiter: Optional[dict[str, Any]] = None
         "gross_pct": opp.gross_pct,
         "cost_pct": opp.cost_pct,
         "net_pct": opp.net_pct,
-        "adj_net_pct": net_for_pnl,
+        "stress_net_pct": opp.stress_net_pct,
+        "adj_net_pct": booked,
+        "booked_net_pct": booked,
+        "optimistic_pnl_usd": optimistic_pnl,
         "size_usd": opp.size_usd,
         "realized_pnl_usd": pnl,
         "filled_at": datetime.now(timezone.utc).isoformat(),
-        "mode": "paper_atomic_sim",
+        "mode": "paper_atomic_sim_conservative",
         "jupiter": jupiter or {},
     }
     try:
@@ -478,11 +719,11 @@ def _paper_fill(opp: ArbOpportunity, *, jupiter: Optional[dict[str, Any]] = None
                 "timeframe": "arb",
                 "horizon_bars": 0,
                 "action": "paper_arb",
-                "predicted_p50": net_for_pnl,
-                "predicted_p10": net_for_pnl,
-                "predicted_p90": net_for_pnl,
-                "realized_pct": net_for_pnl,
-                "error_pct": 0.0,
+                "predicted_p50": booked,
+                "predicted_p10": booked,
+                "predicted_p90": opp.net_pct,
+                "realized_pct": booked,
+                "error_pct": round(opp.net_pct - booked, 4),
                 "covered_80": True,
                 "entry_price": opp.buy.price_usd,
                 "exit_price": opp.sell.price_usd,
@@ -497,8 +738,11 @@ def _paper_fill(opp: ArbOpportunity, *, jupiter: Optional[dict[str, Any]] = None
         mint=opp.mint,
         symbol=opp.symbol,
         net_pct=opp.net_pct,
-        adj_net_pct=net_for_pnl,
+        stress_net_pct=opp.stress_net_pct,
+        booked_net_pct=booked,
         realized_pnl_usd=pnl,
+        optimistic_pnl_usd=optimistic_pnl,
+        size_usd=opp.size_usd,
         buy_dex=opp.buy.dex,
         sell_dex=opp.sell.dex,
         jupiter_verified=bool((jupiter or {}).get("verified")),
@@ -513,8 +757,10 @@ def _opp_dict(opp: ArbOpportunity) -> dict[str, Any]:
         "gross_pct": opp.gross_pct,
         "cost_pct": opp.cost_pct,
         "net_pct": opp.net_pct,
+        "stress_net_pct": opp.stress_net_pct,
         "size_usd": opp.size_usd,
         "expected_pnl_usd": opp.expected_pnl_usd,
+        "stress_pnl_usd": opp.stress_pnl_usd,
         "buy": asdict(opp.buy),
         "sell": asdict(opp.sell),
     }

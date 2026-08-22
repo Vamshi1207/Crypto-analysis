@@ -53,6 +53,30 @@ def test_mark_mode_still_gaps_but_caps_max_loss(monkeypatch):
     assert "gap capped" in (pos.get("close_reason") or "")
 
 
+def test_add_on_allowed_when_analysis_buys_again(monkeypatch):
+    monkeypatch.setattr(paper, "ALLOW_ADD_ON", True)
+    monkeypatch.setattr(paper, "MAX_OPEN_POSITIONS", 5)
+    monkeypatch.setattr(paper, "MAX_NOTIONAL_USD", 500.0)
+    monkeypatch.setattr(paper, "MAX_TRADES_PER_MINT_DAY", 0)
+    card = _card(address="AddOnPool", band=(-5.0, 8.0, 20.0))
+    first = paper.execute_decision(card, mark_price=10.0)
+    second = paper.execute_decision(card, mark_price=10.2)
+    assert first["status"] == "opened"
+    assert second["status"] == "opened"
+    assert second.get("add_on") is True
+    open_same = [p for p in paper.snapshot()["open"] if p["address"] == "AddOnPool"]
+    assert len(open_same) == 2
+
+
+def test_add_on_can_be_disabled(monkeypatch):
+    monkeypatch.setattr(paper, "ALLOW_ADD_ON", False)
+    card = _card(address="NoAddPool", band=(-5.0, 8.0, 20.0))
+    assert paper.execute_decision(card, mark_price=10.0)["status"] == "opened"
+    again = paper.execute_decision(card, mark_price=10.0)
+    assert again["status"] == "skipped"
+    assert "already open" in again["reason"]
+
+
 def test_mint_daily_trade_cap_blocks_reentry(monkeypatch):
     monkeypatch.setattr(paper, "MAX_TRADES_PER_MINT_DAY", 2)
     mint = "MintCapAAA1111111111111111111111111111111"

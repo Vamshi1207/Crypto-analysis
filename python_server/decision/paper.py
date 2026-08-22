@@ -27,20 +27,22 @@ MAX_NOTIONAL_USD = _env_float("PAPER_MAX_NOTIONAL_USD", 200.0)
 STOP_LOSS_USD = _env_float("PAPER_STOP_LOSS_USD", 1.5)
 MAX_HOLD_SEC = _env_float("PAPER_MAX_HOLD_SEC", 600.0)
 KILL_SWITCH = os.getenv("PAPER_KILL_SWITCH", "0") == "1"
-# Quiet period after closing a token before it may be re-entered. Without this
-# the swarm re-buys on the very next tick after a stop, churning fees into the
-# same adverse move.
-REENTRY_COOLDOWN_SEC = _env_float("PAPER_REENTRY_COOLDOWN_SEC", 120.0)
+# Quiet period after a close before the same token may be re-entered.
+# 0 = off — if Gate 2 still sees edge, paper may re-buy immediately.
+REENTRY_COOLDOWN_SEC = _env_float("PAPER_REENTRY_COOLDOWN_SEC", 0.0)
 # How stop exits are filled when price gaps through the barrier.
 #   barrier — exit at the price that realizes exactly -stop_loss_usd (limit-stop ideal)
 #   mark    — exit at the jumped mark (live-like; can blow past the dollar stop)
 STOP_FILL_MODE = os.getenv("PAPER_STOP_FILL_MODE", "barrier").strip().lower()
 # Absolute floor even in mark mode: never book worse than this fraction of size.
 MAX_LOSS_PCT = _env_float("PAPER_MAX_LOSS_PCT", 8.0)
-# Concentration: one mint must not dominate the day's sample / PnL.
-MAX_TRADES_PER_MINT_DAY = _env_int("PAPER_MAX_TRADES_PER_MINT_DAY", 4)
-MAX_NOTIONAL_PER_MINT_DAY = _env_float("PAPER_MAX_NOTIONAL_PER_MINT_DAY", 120.0)
+# Concentration: 0 = unlimited (analysis / portfolio cash decide). Loss cap still applies.
+MAX_TRADES_PER_MINT_DAY = _env_int("PAPER_MAX_TRADES_PER_MINT_DAY", 0)
+MAX_NOTIONAL_PER_MINT_DAY = _env_float("PAPER_MAX_NOTIONAL_PER_MINT_DAY", 0.0)
 MAX_DAILY_LOSS_PER_MINT = _env_float("PAPER_MAX_DAILY_LOSS_PER_MINT", 5.0)
+# If decide still clears edge while a lot is open, open another lot (pyramid).
+# Each lot keeps its own take-profit / stop. Still bound by cash + max open/notional.
+ALLOW_ADD_ON = os.getenv("PAPER_ALLOW_ADD_ON", "1").strip() == "1"
 
 
 @dataclass
@@ -116,6 +118,7 @@ def snapshot() -> dict[str, Any]:
                 "max_trades_per_mint_day": MAX_TRADES_PER_MINT_DAY,
                 "max_notional_per_mint_day": MAX_NOTIONAL_PER_MINT_DAY,
                 "max_daily_loss_per_mint": MAX_DAILY_LOSS_PER_MINT,
+                "allow_add_on": ALLOW_ADD_ON,
             },
         }
 
@@ -288,7 +291,10 @@ def _execute_decision_inner(
     qty = size / fill_price
 
     with _lock:
-        if any(p.address == address and p.status == "open" for p in _state.open):
+        already = [
+            p for p in _state.open if p.address == address and p.status == "open"
+        ]
+        if already and not ALLOW_ADD_ON:
             return {"status": "skipped", "reason": "already open for address"}
         cooling = _cooldown_remaining(address)
         if cooling > 0:
@@ -339,12 +345,31 @@ def _execute_decision_inner(
             horizon_bars=int(card.horizon_bars or 0),
         )
         _state.open.append(pos)
-        record = {"event": "open", "position": asdict(pos), "card_summary": card.summary()}
+        add_on = len(already) > 0
+        record = {
+            "event": "open",
+            "add_on": add_on,
+            "open_lots_for_address": len(already) + 1,
+            "position": asdict(pos),
+            "card_summary": card.summary(),
+        }
         try:
             decision_store.append("paper", record)
         except OSError:
             pass
-        return {"status": "opened", "position": asdict(pos)}
+        pipeline_log.emit(
+            "paper",
+            "add_on" if add_on else "open",
+            address=address,
+            mint=mint,
+            size_usd=size,
+            lots=len(already) + 1,
+        )
+        return {
+            "status": "opened",
+            "add_on": add_on,
+            "position": asdict(pos),
+        }
 
 
 def mark_and_maybe_exit(
@@ -531,14 +556,14 @@ def _concentration_block(*, mint: Optional[str], address: str, size: float) -> O
         notional += pos.size_usd
         realized += float(pos.realized_pnl_usd or 0.0)
 
-    if trades >= MAX_TRADES_PER_MINT_DAY:
+    if MAX_TRADES_PER_MINT_DAY > 0 and trades >= MAX_TRADES_PER_MINT_DAY:
         return f"mint daily trade cap {trades}/{MAX_TRADES_PER_MINT_DAY}"
-    if notional + size > MAX_NOTIONAL_PER_MINT_DAY:
+    if MAX_NOTIONAL_PER_MINT_DAY > 0 and notional + size > MAX_NOTIONAL_PER_MINT_DAY:
         return (
             f"mint daily notional ${notional + size:.0f} > "
             f"${MAX_NOTIONAL_PER_MINT_DAY:.0f}"
         )
-    if realized <= -MAX_DAILY_LOSS_PER_MINT:
+    if MAX_DAILY_LOSS_PER_MINT > 0 and realized <= -MAX_DAILY_LOSS_PER_MINT:
         return f"mint daily loss ${realized:.2f} hit -${MAX_DAILY_LOSS_PER_MINT:.2f} cap"
     return None
 

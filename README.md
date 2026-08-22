@@ -16,7 +16,7 @@ Personal **practice** trading desk for Solana memecoins. It finds coins, runs a 
 | **Profit locked in** | Wins/losses from trades already sold (fees included). |
 | **Open gain/loss** | If you sold open trades *right now*, roughly how much you’d be up/down. |
 | **Quick trade (scalp)** | Buy a coin, sell soon; aim for about **$1 net** on a ~$40 size after fees. |
-| **Price-gap trade (arb)** | Same coin cheaper in one pool than another; paper “buy low / sell high.” |
+| **Price-gap trade (arb)** | Same coin cheaper in one pool than another; paper “buy low / sell high.” Books **conservative** PnL (half-gap stress + Jupiter impact). Timer cool-downs are **off by default** — if analysis still clears, it may re-enter. |
 | **Expected edge** | Forecast upside **minus** fees. Positive is hopeful; it still must clear the ~$1 target. |
 | **Chart agree? (TA)** | Do RSI/MACD-style signals support a buy, or fight it? |
 | **Active hunt / Watch only** | Hunting = bot may trade. Watch only = on the board but paused/cooling. |

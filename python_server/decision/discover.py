@@ -45,7 +45,8 @@ SAFETY_CACHE_SEC = _env_float("DISCOVER_SAFETY_CACHE_SEC", 600.0)
 # After this many consecutive Gate-2 / no-edge holds, park the mint so the
 # scanner rotates into the rest of the universe instead of babysitting it.
 NO_EDGE_STREAK = _env_int("DISCOVER_NO_EDGE_STREAK", 3)
-NO_EDGE_COOLDOWN_SEC = _env_float("DISCOVER_NO_EDGE_COOLDOWN_SEC", 1800.0)
+# 0 = do not time-park; next discover/swarm pass may re-evaluate immediately.
+NO_EDGE_COOLDOWN_SEC = _env_float("DISCOVER_NO_EDGE_COOLDOWN_SEC", 0.0)
 # Walk this many filtered names trying to fill the watchlist (past cool-downs).
 EXPLORE_MULTIPLIER = _env_int("DISCOVER_EXPLORE_MULTIPLIER", 5)
 
@@ -270,6 +271,20 @@ def _park_mint(
     reason: str,
     edge: Optional[float],
 ) -> None:
+    # Timer park is optional. When cooldown is 0, keep evaluating — do not
+    # hide the mint behind a clock if a later decide might find edge.
+    if NO_EDGE_COOLDOWN_SEC <= 0:
+        _no_edge_streak.pop(mint, None)
+        pipeline_log.emit(
+            "discover",
+            "no_edge_keep_evaluating",
+            mint=mint,
+            symbol=symbol,
+            reason=reason,
+            edge=edge,
+        )
+        return
+
     until = time.time() + NO_EDGE_COOLDOWN_SEC
     _cool_until[mint] = until
     _cool_meta[mint] = {
