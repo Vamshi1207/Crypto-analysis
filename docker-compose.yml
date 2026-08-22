@@ -6,13 +6,52 @@ services:
     ports:
       - "${HOST_PORT:-5050}:${CONTAINER_PORT:-5000}"
       - "${DATASET_PREP_DASHBOARD_HOST_PORT:-8765}:${DATASET_PREP_DASHBOARD_CONTAINER_PORT:-8765}"
+    # Pass the whole file so DECIDE_/PAPER_/VIBE_/EXEC_ tuning knobs actually
+    # reach the process. Listing vars one by one silently dropped every knob
+    # that was not enumerated below. `environment:` still wins on conflicts.
+    env_file:
+      - .env
     environment:
       HOST: 0.0.0.0
       PORT: ${CONTAINER_PORT:-5000}
       DATA_DIR: /app/data
+
+      # --- Antigravity CLI (agy) — replaces deprecated Gemini CLI ---
+      # Force the remote/SSH OAuth flow so login prints a URL instead of
+      # trying to open a browser that does not exist in the container.
+      # https://antigravity.google/docs/cli/install/
+      SSH_CONNECTION: "172.17.0.1 22 172.17.0.2 22"
+      SSH_CLIENT: "172.17.0.1 22 22"
+      AGY_MODEL: ${AGY_MODEL:-}
+      # Optional: API-key auth instead of Google Sign-In (headless/CI).
+      # Requires ~/.gemini/antigravity-cli/settings.json modelProvider=gemini
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+
+      # --- LLM providers ---
+      NVIDIA_KEY: ${NVIDIA_KEY:-}
+      NVIDIA_BASE_URL: ${NVIDIA_BASE_URL:-https://integrate.api.nvidia.com/v1}
+      NEMOTRON_MODEL: ${NEMOTRON_MODEL:-nvidia/nemotron-3-nano-30b-a3b}
+      OLLAMA_HOST: ${OLLAMA_HOST:-http://host.docker.internal:11434}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen2.5:14b}
+
+      # --- Solana data ---
+      HELIUS_API_KEY: ${HELIUS_API_KEY:-}
+      SOLANA_RPC_URL: ${SOLANA_RPC_URL:-}
+      BIRDEYE_API_KEY: ${BIRDEYE_API_KEY:-}
+
+      # --- Safety thresholds ---
+      SAFETY_MIN_LIQUIDITY_USD: ${SAFETY_MIN_LIQUIDITY_USD:-5000}
+      SAFETY_MAX_TOP10_PCT: ${SAFETY_MAX_TOP10_PCT:-55}
+      SAFETY_MIN_POOL_AGE_MIN: ${SAFETY_MIN_POOL_AGE_MIN:-5}
+
+      LIVE_TRADING: ${LIVE_TRADING:-0}
     volumes:
       - ./python_server:/app
       - ./python_server/data:/app/data
+      # Persists the one-time agy Google Sign-In across restarts/rebuilds
+      - ./.gemini:/root/.gemini
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     working_dir: /app
     command: ["sleep", "infinity"]
     stdin_open: true

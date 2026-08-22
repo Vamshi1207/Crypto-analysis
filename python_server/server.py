@@ -4,9 +4,18 @@ from datetime import datetime
 import traceback
 from analysis import analyze_token
 from indicators import get_indicators_for_token
+from decision import cache as decision_cache
+from decision import agy_cli
+from decision import store as decision_store
+from decision.decide import decide as run_decide
+from decision.replay import pick_continuous_live_token
+from decision.safety import check_token
+from decision.schema import DecideMode
+from decision.sources import SourceError, resolve_to_mint
 from pathlib import Path
 import json
 import os
+import portguard
 import shutil
 
 app = Flask(__name__)
@@ -105,6 +114,79 @@ DATA_DIR_STATS.mkdir(parents=True, exist_ok=True)
 DATA_DIR_TMP.mkdir(parents=True, exist_ok=True)
 
 RESOLUTIONS = ["5S", "15S", "30S", "1", "3", "5", "15", "30", "60"]
+# Cap in-memory live series so long watching sessions stay bounded.
+LIVE_MAX_BARS_PER_TF = int(os.getenv("LIVE_MAX_BARS_PER_TF", "2000"))
+
+
+def _iter_candle_dicts(candles):
+    """Accept list-of-candles or timestamp->candle dict from the extension."""
+    if isinstance(candles, dict):
+        return list(candles.values())
+    if isinstance(candles, list):
+        return candles
+    return []
+
+
+def _apply_live_candles(address, name, payload_id, candles_by_tf, stats_by_bucket):
+    """Merge incremental live OHLCV into token_data (no disk finalize required)."""
+    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    token = token_data.get(address)
+    if token is None:
+        token = {
+            "payload_id": payload_id,
+            "name": name,
+            "timeframes": {tf: [] for tf in RESOLUTIONS},
+            "stats": [],
+            "updated": now,
+            "live": True,
+        }
+    else:
+        token["name"] = name or token.get("name", "Unknown")
+        token["payload_id"] = payload_id or token.get("payload_id")
+        token["live"] = True
+        token["updated"] = now
+        if "timeframes" not in token:
+            token["timeframes"] = {tf: [] for tf in RESOLUTIONS}
+
+    bars_merged = 0
+    for tf_key, candles in (candles_by_tf or {}).items():
+        if tf_key not in RESOLUTIONS:
+            continue
+        existing = {
+            c["timestamp"]: c
+            for c in token["timeframes"].get(tf_key, [])
+            if isinstance(c, dict) and "timestamp" in c
+        }
+        for candle in _iter_candle_dicts(candles):
+            if not isinstance(candle, dict) or "timestamp" not in candle:
+                continue
+            existing[candle["timestamp"]] = candle
+            bars_merged += 1
+        ordered = sorted(existing.values(), key=lambda c: c["timestamp"])
+        if len(ordered) > LIVE_MAX_BARS_PER_TF:
+            ordered = ordered[-LIVE_MAX_BARS_PER_TF:]
+        token["timeframes"][tf_key] = ordered
+
+    if stats_by_bucket:
+        stats_map = {
+            s.get("createdAt"): s
+            for s in token.get("stats", [])
+            if isinstance(s, dict) and s.get("createdAt") is not None
+        }
+        for stat in stats_by_bucket:
+            if isinstance(stat, dict) and "createdAt" in stat:
+                stats_map[stat["createdAt"]] = stat
+        token["stats"] = sorted(stats_map.values(), key=lambda s: s["createdAt"])
+
+    token_data[address] = token
+    return {
+        "status": "live_ok",
+        "bars_merged": bars_merged,
+        "timeframes": {
+            tf: len(token["timeframes"].get(tf, [])) for tf in RESOLUTIONS
+        },
+    }
+
 
 def _build_materialized_token(name, payload_id, timeframes, stats, updated):
     token = {
@@ -227,6 +309,7 @@ def _process_payload(data):
     payloadID = data.get("id")
     payload_data = data.get("candles", {})
     is_complete = bool(data.get("complete", False))
+    is_live = bool(data.get("live", False))
 
     if isinstance(payload_data, dict) and "candles" in payload_data:
         candles_by_tf = payload_data.get("candles", {})
@@ -241,6 +324,17 @@ def _process_payload(data):
 
     if not payloadID or not address:
         return {"status": "error", "message": "Missing payload ID or token address"}, False
+
+    # Live stream path: merge into memory immediately; skip historical spool/ignore.
+    if is_live:
+        result = _apply_live_candles(
+            address, name, payloadID, candles_by_tf, stats_by_bucket
+        )
+        if candles_by_tf:
+            for tf_key, candles in candles_by_tf.items():
+                if tf_key in RESOLUTIONS:
+                    print(f"📡 live {tf_key}: +{len(candles)} bars → {name}")
+        return result, True
 
     candle_file = DATA_DIR_CANDLES / f"{address}_candles.json"
     stats_file = DATA_DIR_STATS / f"{address}_stats.json"
@@ -316,12 +410,312 @@ def websocket(ws):
                 "id": payload.get("id"),
                 "token": payload.get("token", {}).get("name"),
                 "initial": payload.get("initial"),
+                "live": payload.get("live", False),
                 "complete": payload.get("complete", False),
             }
         )
 
         result, _success = _process_payload(payload)
         ws.send(json.dumps(result))
+
+@app.route('/safety', methods=["GET", "POST", "OPTIONS"])
+def safety():
+    """Gate 0: on-chain screening. Accepts a mint *or* an Axiom pool address."""
+    if request.method == "OPTIONS":
+        return _build_cors_preflight_response()
+
+    if request.method == "POST":
+        body = request.get_json(silent=True) or {}
+        address = body.get("mint") or body.get("address") or ""
+    else:
+        address = request.args.get("mint") or request.args.get("address") or ""
+
+    if not address:
+        return jsonify({"error": "provide a 'mint' (or 'address') parameter"}), 400
+
+    try:
+        resolved = resolve_to_mint(address)
+        report = check_token(resolved["mint"])
+    except SourceError as exc:
+        return jsonify({"error": f"could not resolve address: {exc}", "address": address}), 404
+    except Exception as exc:
+        return jsonify({
+            "error": f"{type(exc).__name__}: {exc}",
+            "traceback": traceback.format_exc(),
+        }), 500
+
+    payload = report.model_dump(mode="json")
+    payload["summary"] = report.summary()
+    payload["blocking"] = report.blocking
+    # Surface the pool→mint mapping so the dashboard/extension can learn the mint.
+    payload["resolved"] = resolved
+
+    try:
+        decision_store.append("safety", payload)
+    except OSError as exc:
+        # A failed write must not deny a caller its safety verdict.
+        print(f"⚠️ could not log safety report: {exc}")
+
+    return jsonify(payload)
+
+
+@app.route('/decide', methods=["GET", "POST", "OPTIONS"])
+def decide_endpoint():
+    """Gates 0–2 + calibrated forecast → DecisionCard. Default mode=fast."""
+    if request.method == "OPTIONS":
+        return _build_cors_preflight_response()
+
+    if request.method == "POST":
+        body = request.get_json(silent=True) or {}
+    else:
+        body = request.args.to_dict()
+
+    mode = body.get("mode", "fast")
+    timeframe = body.get("tf") or body.get("timeframe") or "1"
+    address = body.get("address") or body.get("mint") or ""
+    source = (body.get("source") or "live").lower()
+    corpus_address = body.get("corpus") or (address if source == "corpus" else None)
+
+    try:
+        horizon = int(body.get("horizon") or 10)
+    except (TypeError, ValueError):
+        horizon = 10
+
+    # source=live_replay: pick a contiguous OHLCV run from the candle corpus and
+    # feed it through the same path as extension live data (no Gate 0 on stale pools).
+    if source in ("live_replay", "replay", "continuous"):
+        try:
+            picked = pick_continuous_live_token(
+                min_bars=int(body.get("min_bars") or 128),
+                tail=int(body.get("tail") or 512),
+            )
+        except Exception as exc:
+            return jsonify({"error": f"replay pick failed: {exc}"}), 404
+
+        # Inject into the live buffer so the dashboard can see it too.
+        token_data[picked["address"]] = {
+            "name": picked["name"],
+            "timeframes": dict(picked["live_token"]["timeframes"]),
+            "stats": [],
+            "updated": "replay",
+            "payload_id": "replay",
+        }
+        try:
+            card = run_decide(
+                address=picked["address"],
+                live_token=picked["live_token"],
+                mode=DecideMode(mode),
+                timeframe=picked["timeframe"],
+                horizon=horizon,
+                skip_safety=True,
+                run_safety=False,
+            )
+        except Exception as exc:
+            return jsonify({
+                "error": f"{type(exc).__name__}: {exc}",
+                "traceback": traceback.format_exc(),
+            }), 500
+
+        payload = card.model_dump(mode="json")
+        payload["summary"] = card.summary()
+        payload["replay"] = {
+            "address": picked["address"],
+            "name": picked["name"],
+            "timeframe": picked["timeframe"],
+            "continuous_bars": picked["continuous_bars"],
+            "live_bars": picked["live_bars"],
+            "first_ts": picked["first_ts"],
+            "last_ts": picked["last_ts"],
+        }
+        return jsonify(payload)
+
+    if not address and not corpus_address:
+        return jsonify({"error": "provide address/mint, or source=corpus|live_replay"}), 400
+
+    live_token = None
+    run_safety = source != "corpus"
+    if source != "corpus" and address:
+        # Prefer live candles from the extension ingest buffer.
+        live_token = token_data.get(address)
+        if live_token is None and not run_safety:
+            return jsonify({"error": f"no live candles for {address}"}), 404
+
+    try:
+        if source == "corpus":
+            card = run_decide(
+                corpus_address=corpus_address or address,
+                mode=DecideMode(mode),
+                timeframe=timeframe,
+                horizon=horizon,
+                run_safety=False,
+            )
+        elif live_token is not None:
+            # address is the Axiom URL key (often a pool). decide() resolves SPL mint.
+            card = run_decide(
+                address=address,
+                live_token=live_token,
+                mode=DecideMode(mode),
+                timeframe=timeframe,
+                horizon=horizon,
+                run_safety=True,
+            )
+            resolved_mint = (card.token or {}).get("mint")
+            if resolved_mint:
+                live_token["mint"] = resolved_mint
+                token_data[address] = live_token
+        else:
+            # No candles yet — still run Gate 0 so the UI can show a block.
+            card = run_decide(
+                address=address,
+                mode=DecideMode(mode),
+                timeframe=timeframe,
+                horizon=horizon,
+                run_safety=True,
+            )
+    except FileNotFoundError as exc:
+        return jsonify({"error": str(exc)}), 404
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except Exception as exc:
+        return jsonify({
+            "error": f"{type(exc).__name__}: {exc}",
+            "traceback": traceback.format_exc(),
+        }), 500
+
+    payload = card.model_dump(mode="json")
+    payload["summary"] = card.summary()
+    return jsonify(payload)
+
+
+@app.route('/execute', methods=["GET", "POST", "OPTIONS"])
+def execute_endpoint():
+    """Phase 4: decide + paper-execute for an address."""
+    if request.method == "OPTIONS":
+        return _build_cors_preflight_response()
+
+    from decision import paper
+
+    body = request.get_json(silent=True) or {} if request.method == "POST" else request.args.to_dict()
+    address = body.get("address") or body.get("mint") or ""
+    mode = body.get("mode", "full")
+    if not address:
+        return jsonify({"error": "address required"}), 400
+
+    live_token = token_data.get(address)
+    try:
+        card = run_decide(
+            address=address,
+            live_token=live_token,
+            mode=DecideMode(mode),
+            timeframe=body.get("tf") or "1",
+            run_safety=True,
+        )
+    except Exception as exc:
+        return jsonify({"error": f"{type(exc).__name__}: {exc}"}), 500
+
+    mark = None
+    if live_token:
+        for tf in ("5S", "15S", "30S", "1"):
+            rows = (live_token.get("timeframes") or {}).get(tf) or []
+            if rows:
+                mark = rows[-1].get("close")
+                break
+    result = paper.execute_decision(card, mark_price=mark)
+    exits = []
+    if mark is not None:
+        exits = paper.mark_and_maybe_exit(address=address, mark_price=float(mark))
+    return jsonify({
+        "decision": card.model_dump(mode="json"),
+        "summary": card.summary(),
+        "execute": result,
+        "exits": exits,
+        "portfolio": paper.snapshot(),
+    })
+
+
+@app.route('/portfolio', methods=["GET", "POST", "OPTIONS"])
+def portfolio_endpoint():
+    if request.method == "OPTIONS":
+        return _build_cors_preflight_response()
+    from decision import paper
+
+    if request.method == "POST":
+        body = request.get_json(silent=True) or {}
+        if "kill_switch" in body:
+            return jsonify(paper.set_kill_switch(bool(body.get("kill_switch"))))
+    return jsonify(paper.snapshot())
+
+
+@app.route('/swarm', methods=["GET", "POST", "OPTIONS"])
+def swarm_endpoint():
+    """Start/stop continuous decide→paper swarm over live token_data."""
+    if request.method == "OPTIONS":
+        return _build_cors_preflight_response()
+    from decision import swarm
+
+    if request.method == "GET":
+        return jsonify(swarm.status())
+
+    body = request.get_json(silent=True) or {}
+    action = (body.get("action") or "status").lower()
+    if action == "start":
+        return jsonify(
+            swarm.start(
+                lambda: token_data,
+                interval_s=float(body.get("interval_s") or 15),
+                mode=body.get("mode") or "full",
+            )
+        )
+    if action == "stop":
+        return jsonify(swarm.stop())
+    return jsonify(swarm.status())
+
+
+@app.route('/scoreboard', methods=["GET", "OPTIONS"])
+def scoreboard_endpoint():
+    if request.method == "OPTIONS":
+        return _build_cors_preflight_response()
+    from decision import scoreboard
+    return jsonify(scoreboard.summarize())
+
+
+@app.route('/health')
+def health():
+    """Surfaces whether each tier is actually usable, not just whether we're up."""
+    agy_status = agy_cli.preflight()
+    from decision import forecast as forecast_mod
+    from decision import calibrate as calibrate_mod
+    from decision import paper, swarm
+
+    residuals = calibrate_mod.load_residuals()
+    port = paper.snapshot()
+    return jsonify({
+        "server": "ok",
+        "tokens_loaded": len(token_data),
+        "cache": decision_cache.stats(),
+        "agy_cli": {
+            "installed": agy_status.installed,
+            "authenticated": agy_status.authenticated,
+            "model": agy_status.model,
+            "detail": agy_status.detail,
+        },
+        "forecast_backends": forecast_mod.available_backends(),
+        "calibration": {
+            "residuals": residuals.get("n", 0),
+            "coverage_target": residuals.get("coverage_target"),
+            "error_p80": residuals.get("error_p80"),
+        },
+        "live_trading": os.getenv("LIVE_TRADING", "0") == "1",
+        "paper": {
+            "open": port.get("open_count"),
+            "realized_pnl_usd": port.get("realized_pnl_usd"),
+            "kill_switch": port.get("kill_switch"),
+        },
+        "swarm": swarm.status(),
+        "safety_checks_logged_today": decision_store.count("safety"),
+        "decisions_logged_today": decision_store.count("decisions"),
+    })
+
 
 def timeframe_to_seconds(tf_key):
     if tf_key.endswith("S"):
@@ -351,6 +745,14 @@ def _build_cors_preflight_response():
 if __name__ == '__main__':
     host = os.getenv('HOST', '0.0.0.0')
     port = int(os.getenv('PORT', '8000'))
+
+    # Hand restarts routinely leave the previous instance owning the port.
+    # Set SERVER_RECLAIM_PORT=0 to bind strictly and fail instead.
+    if os.getenv('SERVER_RECLAIM_PORT', '1') == '1':
+        for stale in portguard.reclaim(port):
+            print(f"reclaimed port {port} from stale instance pid {stale}")
+        if portguard.port_is_listening(port):
+            print(f"warning: port {port} still has a LISTEN socket", flush=True)
 
     print(f"Starting server on {host}:{port}...")
     app.run(host=host, port=port, debug=False)

@@ -1,0 +1,21 @@
+# The whole directory is bind-mounted at runtime, so the image only needs source.
+# Without this the build context is multiple GB of candle data.
+ML_Training_datasets/
+CandleData/
+TA/
+BKP/
+data/
+store/
+
+__pycache__/
+**/__pycache__/
+*.pyc
+.ipynb_checkpoints/
+**/.ipynb_checkpoints/
+.Trash-0/
+.DS_Store
+
+*.parquet
+*.csv
+*.xlsx
+*.joblib

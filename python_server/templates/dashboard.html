@@ -28,11 +28,39 @@
 
 	  /* ✅ Set fixed width per column */
 	  th:nth-child(1), td:nth-child(1) { width: 100px; }  /* Token */
-	  th:nth-child(2), td:nth-child(2) { width: 260px; }  /* Analysis */
-	  th:nth-child(3), td:nth-child(3) { width: 200px; }  /* Price */
-	  th:nth-child(4), td:nth-child(4) { width: 200px; }  /* Momentum */
-	  th:nth-child(5), td:nth-child(5) { width: 200px; }  /* Trend */
-	  th:nth-child(6), td:nth-child(6) { width: 200px; }  /* Volatility */
+	  th:nth-child(2), td:nth-child(2) { width: 200px; }  /* Safety */
+	  th:nth-child(3), td:nth-child(3) { width: 240px; }  /* Decision */
+	  th:nth-child(4), td:nth-child(4) { width: 220px; }  /* Analysis */
+	  th:nth-child(5), td:nth-child(5) { width: 180px; }  /* Price */
+	  th:nth-child(6), td:nth-child(6) { width: 180px; }  /* Momentum */
+	  th:nth-child(7), td:nth-child(7) { width: 180px; }  /* Trend */
+	  th:nth-child(8), td:nth-child(8) { width: 180px; }  /* Volatility */
+
+	  .verdict {
+		display: inline-block;
+		padding: 2px 8px;
+		border-radius: 4px;
+		font-weight: 700;
+		font-family: sans-serif;
+		text-transform: uppercase;
+		font-size: 12px;
+		letter-spacing: 0.04em;
+	  }
+	  .verdict-safe    { background: #d7f5dd; color: #05631f; }
+	  .verdict-caution { background: #fff2cc; color: #7a5200; }
+	  .verdict-danger  { background: #fbdcdc; color: #8c1010; }
+	  .verdict-unknown { background: #e8e8e8; color: #444; }
+	  .verdict-pending { background: #e8f0fe; color: #1a4f8e; }
+	  .action-buy   { background: #d7f5dd; color: #05631f; }
+	  .action-hold  { background: #e8f0fe; color: #1a4f8e; }
+	  .action-avoid { background: #fbdcdc; color: #8c1010; }
+	  .action-reduce{ background: #fff2cc; color: #7a5200; }
+
+	  .flag-critical { color: #8c1010; font-weight: 600; }
+	  .flag-high     { color: #a1440a; }
+	  .flag-medium   { color: #7a5200; }
+	  .flag-low, .flag-info { color: #555; }
+	  .stale { opacity: 0.55; }
 
 	  a {
 		color: #1a73e8;
@@ -59,10 +87,21 @@
 </head>
 <body>
   <h2>📊 Live Token Indicator Dashboard</h2>
+  <div id="pipeline-bar" style="margin:12px 0;padding:10px 12px;background:#f7f7f7;border:1px solid #ddd;font-family:monospace;font-size:13px;line-height:1.5">
+    <div><b>Paper</b>: <span id="paper-stat">loading…</span>
+      &nbsp;|&nbsp; <b>Swarm</b>: <span id="swarm-stat">…</span>
+      <button id="swarm-toggle" type="button" style="margin-left:8px">Start swarm</button>
+      <a href="/portfolio" target="_blank" style="margin-left:8px">portfolio</a>
+      <a href="/scoreboard" target="_blank" style="margin-left:8px">scoreboard</a>
+      <a href="/health" target="_blank" style="margin-left:8px">health</a>
+    </div>
+  </div>
   <table>
     <thead>
       <tr>
         <th>🪙 Token</th>
+        <th>🛡️ Safety</th>
+        <th>🎯 Decision</th>
         <th>🧠 Analysis</th>
         <th>📊 Price & Volume</th>
         <th>⚡ Momentum</th>
@@ -76,6 +115,131 @@
   <script>
   const timeframes = ["1S", "5S", "15S", "30S", "1", "3", "5"];
   const selectedTF = {};
+
+  // The table refreshes twice a second; the safety sources are rate limited and
+  // authorities barely change. Cache per mint and only re-check occasionally.
+  const SAFETY_TTL_MS = 60000;
+  const safetyCache = {};   // addr -> { report, fetchedAt }
+  const safetyInFlight = {};
+
+  const DECIDE_TTL_MS = 30000;
+  const decideCache = {};
+  const decideInFlight = {};
+
+  function requestSafety(addr) {
+    const cached = safetyCache[addr];
+    const fresh = cached && (Date.now() - cached.fetchedAt) < SAFETY_TTL_MS;
+    if (fresh || safetyInFlight[addr]) return cached;
+
+    safetyInFlight[addr] = true;
+    fetch(`/safety?mint=${encodeURIComponent(addr)}`)
+      .then(res => res.json())
+      .then(report => { safetyCache[addr] = { report, fetchedAt: Date.now() }; })
+      .catch(err => {
+        safetyCache[addr] = {
+          report: { verdict: 'unknown', summary: String(err), flags: [] },
+          fetchedAt: Date.now()
+        };
+      })
+      .finally(() => { delete safetyInFlight[addr]; });
+
+    return cached;  // may be stale, rendered dimmed until the new one lands
+  }
+
+  function renderSafety(cell, addr) {
+    const entry = requestSafety(addr);
+    if (!entry) {
+      cell.innerHTML = '<span class="verdict verdict-pending">checking…</span>';
+      return;
+    }
+
+    const r = entry.report;
+    const stale = (Date.now() - entry.fetchedAt) > SAFETY_TTL_MS;
+    const verdict = (r.verdict || 'unknown').toLowerCase();
+
+    const parts = [
+      `<span class="verdict verdict-${verdict}">${verdict}</span>`,
+      ` <small>score ${r.risk_score ?? '?'}${r.degraded ? ' · partial' : ''}</small>`
+    ];
+
+    const m = r.market || {};
+    if (m.liquidity_usd_total != null) {
+      parts.push(`<div><small>liq $${Math.round(m.liquidity_usd_total).toLocaleString()}`
+        + (m.pool_age_min != null ? ` · ${Math.round(m.pool_age_min)}m old` : '')
+        + `</small></div>`);
+    }
+    const sell = r.sellability || {};
+    if (sell.sellable === true) {
+      parts.push(`<div><small>exit ok${sell.price_impact_pct != null ? ` · ${sell.price_impact_pct}% impact` : ''}</small></div>`);
+    } else if (sell.sellable === false) {
+      parts.push('<div class="flag-critical"><small>NO EXIT ROUTE</small></div>');
+    }
+
+    for (const f of (r.flags || []).slice(0, 4)) {
+      parts.push(`<div class="flag-${f.severity}"><small>• ${f.message}</small></div>`);
+    }
+
+    cell.innerHTML = parts.join('');
+    cell.classList.toggle('stale', stale);
+  }
+
+  function requestDecide(addr, tf) {
+    const key = `${addr}:${tf || '1'}`;
+    const cached = decideCache[key];
+    const fresh = cached && (Date.now() - cached.fetchedAt) < DECIDE_TTL_MS;
+    if (fresh || decideInFlight[key]) return cached;
+
+    decideInFlight[key] = true;
+    const decideTf = (tf === '1S' || tf === '5S' || tf === '15S' || tf === '30S') ? '1' : (tf || '1');
+    fetch(`/decide?address=${encodeURIComponent(addr)}&tf=${encodeURIComponent(decideTf)}&mode=full`)
+      .then(res => res.json())
+      .then(card => { decideCache[key] = { card, fetchedAt: Date.now() }; })
+      .catch(err => {
+        decideCache[key] = {
+          card: { action: 'hold', summary: String(err), warnings: [String(err)] },
+          fetchedAt: Date.now()
+        };
+      })
+      .finally(() => { delete decideInFlight[key]; });
+
+    return cached;
+  }
+
+  function renderDecide(cell, addr, tf) {
+    const entry = requestDecide(addr, tf);
+    if (!entry) {
+      cell.innerHTML = '<span class="verdict verdict-pending">deciding…</span>';
+      return;
+    }
+    const c = entry.card;
+    const stale = (Date.now() - entry.fetchedAt) > DECIDE_TTL_MS;
+    if (c.error) {
+      cell.innerHTML = `<small>${c.error}</small>`;
+      return;
+    }
+    const action = (c.action || 'hold').toLowerCase();
+    const band = c.expected_return_pct || {};
+    const parts = [
+      `<span class="verdict action-${action}">${action}</span>`,
+      ` <small>${c.direction || ''} · ${(c.action_confidence != null ? Math.round(c.action_confidence*100)+'%' : '')}</small>`,
+      `<div><small>p50 ${fmtPct(band.p50)}  [${fmtPct(band.p10)}, ${fmtPct(band.p90)}]</small></div>`,
+      `<div><small>edge ${fmtPct(c.cost_adjusted_edge_pct)} · ${c.forecast?.backend || '?'}</small></div>`,
+    ];
+    if (c.token?.mint && c.token.mint !== addr) {
+      parts.push(`<div><small>mint ${String(c.token.mint).slice(0, 6)}…${String(c.token.mint).slice(-4)}</small></div>`);
+    }
+    if (c.gates_failed && c.gates_failed.length) {
+      parts.push(`<div><small>blocked: ${c.gates_failed.join(', ')}</small></div>`);
+    }
+    cell.innerHTML = parts.join('');
+    cell.classList.toggle('stale', stale);
+  }
+
+  function fmtPct(v) {
+    if (v == null || Number.isNaN(Number(v))) return 'n/a';
+    const n = Number(v);
+    return `${n >= 0 ? '+' : ''}${n.toFixed(2)}%`;
+  }
 
 	async function refresh() {
 	  for (const addr in selectedTF) {
@@ -180,6 +344,12 @@
         nameCell.appendChild(document.createElement('br'));
         nameCell.appendChild(select);
 
+        const safetyCell = document.createElement('td');
+        safetyCell.classList.add('safety');
+
+        const decideCell = document.createElement('td');
+        decideCell.classList.add('decide');
+
         const analysisCell = document.createElement('td');
         analysisCell.classList.add('metrics');
 
@@ -190,6 +360,8 @@
         [col1, col2, col3, col4].forEach(col => col.classList.add('metrics'));
 
         row.appendChild(nameCell);
+        row.appendChild(safetyCell);
+        row.appendChild(decideCell);
         row.appendChild(analysisCell);
         row.appendChild(col1);
         row.appendChild(col2);
@@ -201,13 +373,45 @@
 
       // Update values in-place
       const cells = row.children;
-      cells[1].innerText = analysisCol;
-      cells[2].innerText = priceCol;
-      cells[3].innerText = momentumCol;
-      cells[4].innerText = trendCol;
-      cells[5].innerText = volatilityCol;
+      renderSafety(cells[1], addr);
+      renderDecide(cells[2], addr, tf);
+      cells[3].innerText = analysisCol;
+      cells[4].innerText = priceCol;
+      cells[5].innerText = momentumCol;
+      cells[6].innerText = trendCol;
+      cells[7].innerText = volatilityCol;
     }
   }
+
+  async function refreshPipelineBar() {
+    try {
+      const [port, swarm] = await Promise.all([
+        fetch('/portfolio').then(r => r.json()),
+        fetch('/swarm').then(r => r.json()),
+      ]);
+      const paperEl = document.getElementById('paper-stat');
+      const swarmEl = document.getElementById('swarm-stat');
+      const btn = document.getElementById('swarm-toggle');
+      if (paperEl) {
+        paperEl.textContent = `open=${port.open_count||0} pnl=$${(port.realized_pnl_usd||0).toFixed(2)} cash=$${(port.cash_usd||0).toFixed(0)} kill=${port.kill_switch}`;
+      }
+      if (swarmEl) {
+        swarmEl.textContent = swarm.running ? `running ticks=${swarm.ticks||0}` : 'stopped';
+      }
+      if (btn) btn.textContent = swarm.running ? 'Stop swarm' : 'Start swarm';
+    } catch (e) { /* ignore */ }
+  }
+
+  document.getElementById('swarm-toggle')?.addEventListener('click', async () => {
+    const swarm = await fetch('/swarm').then(r => r.json());
+    const action = swarm.running ? 'stop' : 'start';
+    await fetch('/swarm', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ action, mode: 'full', interval_s: 15 })
+    });
+    refreshPipelineBar();
+  });
 
   fetch('/data?tf=1S').then(res => res.json()).then(data => {
     for (const addr in data) {
@@ -219,6 +423,8 @@
   });
 
   setInterval(refresh, 500);
+  refreshPipelineBar();
+  setInterval(refreshPipelineBar, 5000);
 </script>
 
 

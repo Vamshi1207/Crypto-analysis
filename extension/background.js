@@ -66,6 +66,7 @@ function sendToServer(payload) {
       id: payload.id,
       token: payload.token?.name,
       initial: payload.initial,
+      live: payload.live === true,
       complete: payload.complete === true,
       bytes: message.length
     });
@@ -77,6 +78,7 @@ function sendToServer(payload) {
     id: payload.id,
     token: payload.token?.name,
     initial: payload.initial,
+    live: payload.live === true,
     complete: payload.complete === true,
     bytes: message.length
   });
@@ -153,15 +155,32 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
       const frameId = targetFrame.frameId;
 
-      // Inject injected.js into the exact frame
+      // MAIN world so ChartApiInstance / datafeed are visible to injected.js
       chrome.scripting.executeScript(
-        { target: { tabId, frameIds: [frameId] }, files: ["injected.js"] },
+        {
+          target: { tabId, frameIds: [frameId] },
+          files: ["injected.js"],
+          world: "MAIN"
+        },
         () => {
-          // Send token info after injection
+          if (chrome.runtime.lastError) {
+            console.warn("❌ executeScript injected.js:", chrome.runtime.lastError.message);
+            sendResponse({ status: "error", reason: chrome.runtime.lastError.message });
+            return;
+          }
           chrome.scripting.executeScript({
             target: { tabId, frameIds: [frameId] },
+            world: "MAIN",
             func: (token) => {
-              window.postMessage({ type: "tokenInfo", token }, "*");
+              window.postMessage(
+                {
+                  type: "tokenInfo",
+                  address: token?.address,
+                  name: token?.name,
+                  token
+                },
+                "*"
+              );
             },
             args: [token]
           }, () => sendResponse({ status: "ok" }));
@@ -180,6 +199,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       id: msg.id,
       token: msg.token?.name,
       initial: msg.initial,
+      live: msg.live === true,
       complete: msg.complete === true
     });
     const payload = {
@@ -187,6 +207,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       candles: msg.payload,
       token: msg.token,
       initial: msg.initial,
+      live: Boolean(msg.live),
       complete: Boolean(msg.complete)
     };
 

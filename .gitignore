@@ -9,3 +9,13 @@ extension/.ipynb_checkpoints/
 python_server/.DS_Store
 python_server/.Trash-0/
 .continue/
+
+# Secrets and credentials
+.env
+.env.*
+!.env.example
+.gemini/
+
+# Decision engine runtime data
+python_server/data/
+python_server/store/

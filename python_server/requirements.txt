@@ -4,7 +4,16 @@ numpy
 pandas
 openpyxl
 tqdm
-scikit-learn
-xgboost
 talipp
-jupyter
+
+# Decision engine
+httpx
+pydantic>=2
+cachetools
+
+# Tests
+pytest
+
+# Phase 2 core (no torch). Heavy zero-shot models are optional — see
+# requirements-forecast.txt and FORECAST_DISABLE_* env vars.
+scikit-learn
