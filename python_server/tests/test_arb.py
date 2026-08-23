@@ -60,6 +60,20 @@ def test_find_opportunities_when_spread_clears_stress(monkeypatch):
     assert opps[0].stress_pnl_usd == 0.8
 
 
+def test_insane_spread_skipped(monkeypatch):
+    _patch_basic(monkeypatch, cost=3.0)
+    monkeypatch.setattr(arb, "MAX_GROSS_PCT", 50.0)
+    monkeypatch.setattr(
+        arb,
+        "fetch_dexscreener_pairs",
+        lambda mint: [
+            _pair(POOL_CHEAP, 0.0001, 50_000, "meteora"),
+            _pair(POOL_RICH, 0.17, 40_000, "pumpswap"),  # +169999% gross
+        ],
+    )
+    assert arb.find_opportunities(MEME) == []
+
+
 def test_stress_skips_when_half_gap_inside_costs(monkeypatch):
     _patch_basic(monkeypatch, cost=3.0)
     # +6% gross → net 3% clears, stress 0% does not clear 0.5%

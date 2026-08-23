@@ -57,6 +57,8 @@ MAX_FILLS_PER_MINT_DAY = _env_int("ARB_MAX_FILLS_PER_MINT_DAY", 0)
 REQUIRE_CROSS_DEX = os.getenv("ARB_REQUIRE_CROSS_DEX", "1").strip() == "1"
 # Only book if (gross * stress_frac - costs) still clears MIN_EDGE.
 STRESS_GAP_FRAC = _env_float("ARB_STRESS_GAP_FRAC", 0.5)
+# Reject DexScreener mid prices implying impossible cross-pool gaps (bad/stale pool data).
+MAX_GROSS_PCT = _env_float("ARB_MAX_GROSS_PCT", 50.0)
 # Arb legs are two swaps; reuse the shared cost model (fees + slip + tip).
 ARB_SLIP_PCT = _env_float("ARB_SLIP_PCT", 0.0)  # 0 = use costs.DEFAULT_ENTRY_SLIP_PCT
 REQUIRE_JUPITER = os.getenv("ARB_REQUIRE_JUPITER", "1").strip() == "1"
@@ -170,6 +172,7 @@ def status() -> dict[str, Any]:
                 "max_fills_per_mint_day": MAX_FILLS_PER_MINT_DAY,
                 "require_cross_dex": REQUIRE_CROSS_DEX,
                 "stress_gap_frac": STRESS_GAP_FRAC,
+                "max_gross_pct": MAX_GROSS_PCT,
                 "require_jupiter": REQUIRE_JUPITER,
                 "max_jupiter_impact_pct": MAX_JUPITER_IMPACT_PCT,
                 "jupiter_impact_legs": JUPITER_IMPACT_LEGS,
@@ -324,6 +327,21 @@ def find_opportunities(mint: str, *, symbol: str = "") -> list[ArbOpportunity]:
         return []
 
     gross = (sell.price_usd / buy.price_usd - 1.0) * 100.0
+    if gross > MAX_GROSS_PCT:
+        pipeline_log.emit(
+            "arb",
+            "insane_spread_skip",
+            level="warning",
+            mint=mint,
+            symbol=symbol or buy.symbol,
+            gross_pct=round(gross, 4),
+            max_gross_pct=MAX_GROSS_PCT,
+            buy_dex=buy.dex,
+            sell_dex=sell.dex,
+            buy_price=buy.price_usd,
+            sell_price=sell.price_usd,
+        )
+        return []
     cost = _arb_cost_pct()
     net = gross - cost
     stress_net = gross * STRESS_GAP_FRAC - cost
