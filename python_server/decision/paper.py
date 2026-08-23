@@ -89,6 +89,9 @@ class PaperPosition:
 class PortfolioState:
     cash_usd: float = 1_000.0
     realized_pnl_usd: float = 0.0
+    arb_fills: int = 0
+    arb_realized_pnl_usd: float = 0.0
+    arb_notional_usd: float = 0.0
     open: list[PaperPosition] = field(default_factory=list)
     closed: list[PaperPosition] = field(default_factory=list)
     kill_switch: bool = False
@@ -101,9 +104,14 @@ _state = PortfolioState(kill_switch=KILL_SWITCH, live_trading_blocked=not LIVE_T
 
 def snapshot() -> dict[str, Any]:
     with _lock:
+        scalp_realized = _state.realized_pnl_usd - _state.arb_realized_pnl_usd
         return {
             "cash_usd": _state.cash_usd,
             "realized_pnl_usd": _state.realized_pnl_usd,
+            "arb_fills": _state.arb_fills,
+            "arb_realized_pnl_usd": round(_state.arb_realized_pnl_usd, 4),
+            "arb_notional_usd": round(_state.arb_notional_usd, 4),
+            "scalp_realized_pnl_usd": round(scalp_realized, 4),
             "open_count": len(_state.open),
             "closed_count": len(_state.closed),
             "kill_switch": _state.kill_switch or KILL_SWITCH,
@@ -141,6 +149,9 @@ def reset(*, starting_cash_usd: float = 1_000.0) -> dict[str, Any]:
     with _lock:
         _state.cash_usd = float(starting_cash_usd)
         _state.realized_pnl_usd = 0.0
+        _state.arb_fills = 0
+        _state.arb_realized_pnl_usd = 0.0
+        _state.arb_notional_usd = 0.0
         _state.open = []
         _state.closed = []
         # Keep kill switch as configured; do not force it on.
@@ -151,6 +162,64 @@ def reset(*, starting_cash_usd: float = 1_000.0) -> dict[str, Any]:
         cash_usd=starting_cash_usd,
     )
     return snapshot()
+
+
+def execute_arb_fill(
+    *,
+    size_usd: float,
+    pnl_usd: float,
+    mint: str,
+    symbol: str,
+    record: dict[str, Any],
+) -> dict[str, Any]:
+    """Book an atomic Jupiter round-trip against the shared paper bankroll."""
+    if LIVE_TRADING:
+        return {"status": "refused", "reason": "LIVE_TRADING=1 is blocked in this build"}
+    if _state.kill_switch or KILL_SWITCH:
+        return {"status": "refused", "reason": "kill switch on"}
+    size = float(size_usd)
+    pnl = float(pnl_usd)
+    if size <= 0:
+        return {"status": "refused", "reason": "arb size must be positive"}
+
+    with _lock:
+        if _state.cash_usd < size:
+            return {
+                "status": "refused",
+                "reason": f"insufficient paper cash (${_state.cash_usd:.2f} < ${size:.2f})",
+            }
+        # Atomic round-trip: deploy notional, return principal + Jupiter PnL.
+        _state.cash_usd -= size
+        _state.cash_usd += size + pnl
+        _state.realized_pnl_usd += pnl
+        _state.arb_realized_pnl_usd += pnl
+        _state.arb_notional_usd += size
+        _state.arb_fills += 1
+        cash_after = round(_state.cash_usd, 4)
+        arb_fills = _state.arb_fills
+
+    log_record = dict(record)
+    log_record["portfolio_cash_usd"] = cash_after
+    try:
+        decision_store.append("paper", log_record)
+    except OSError:
+        pass
+    pipeline_log.emit(
+        "paper",
+        "arb_fill",
+        mint=mint,
+        symbol=symbol,
+        size_usd=size,
+        realized_pnl_usd=round(pnl, 4),
+        cash_usd=cash_after,
+        arb_fills=arb_fills,
+    )
+    return {
+        "status": "filled",
+        "cash_usd": cash_after,
+        "realized_pnl_usd": round(pnl, 4),
+        "arb_fills": arb_fills,
+    }
 
 
 def execute_decision(

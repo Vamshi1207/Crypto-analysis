@@ -552,10 +552,10 @@
       <div class="metric">
         <div class="label">Sitting cash <span class="hint" title="Fake dollars not currently tied up in a trade. Available to open a new practice buy.">?</span></div>
         <div class="val" id="m-cash">—</div>
-        <div class="sublabel">not in a trade</div>
+        <div class="sublabel" id="m-cash-sub">not in a trade</div>
       </div>
       <div class="metric">
-        <div class="label">Profit locked in <span class="hint" title="Money won or lost on trades that already finished (sold). Includes fees. This number only moves when a trade closes.">?</span></div>
+        <div class="label">Profit locked in <span class="hint" title="Money won or lost on finished trades (scalps + price-gap round-trips). Updates as trades close or arb fills book.">?</span></div>
         <div class="val" id="m-realized">—</div>
         <div class="sublabel" id="m-realized-sub">finished trades</div>
       </div>
@@ -937,18 +937,26 @@
       document.getElementById("m-equity-sub").textContent =
         `${fmtMoney(eqPnl)} vs $1000 start`;
       setMetric("m-cash", fmtMoneyAbs(port.cash_usd));
+      const arbFills = port.arb_fills || 0;
+      const arbNotional = port.arb_notional_usd || 0;
+      document.getElementById("m-cash-sub").textContent =
+        arbFills
+          ? `${arbFills} price-gap fills · ${fmtMoneyAbs(arbNotional)} deployed`
+          : "not in a trade";
       setMetric("m-realized", fmtMoney(port.realized_pnl_usd), pnlClass(port.realized_pnl_usd));
       document.getElementById("m-realized-sub").textContent =
-        `${port.closed_count || 0} finished · emergency stop ${port.kill_switch ? "ON" : "off"}`;
+        `${port.closed_count || 0} scalp closes · ${arbFills} price-gap fills · emergency stop ${port.kill_switch ? "ON" : "off"}`;
       setMetric("m-unrealized", fmtMoney(port.unrealized_pnl_usd), pnlClass(port.unrealized_pnl_usd));
       document.getElementById("m-unrealized-sub").textContent =
         `${port.open_count || 0} open · ${fmtMoneyAbs(port.open_notional_usd)} in trades`;
-      setMetric("m-scalp", fmtMoney(t.scalp_pnl_sum), pnlClass(t.scalp_pnl_sum));
+      setMetric("m-scalp", fmtMoney(port.scalp_realized_pnl_usd), pnlClass(port.scalp_realized_pnl_usd));
       document.getElementById("m-scalp-sub").textContent =
-        `${t.scalp_closes || 0} closes · avg ${fmtMoney(t.scalp_ev, 3)}`;
-      setMetric("m-arb", fmtMoney(t.arb_pnl_sum), pnlClass(t.arb_pnl_sum));
+        `${port.closed_count || 0} closes · avg ${fmtMoney(t.scalp_ev, 3)}`;
+      const arbPnl = port.arb_realized_pnl_usd != null ? port.arb_realized_pnl_usd : t.arb_pnl_sum;
+      const arbEv = arbFills ? (arbPnl / arbFills) : t.arb_ev;
+      setMetric("m-arb", fmtMoney(arbPnl), pnlClass(arbPnl));
       document.getElementById("m-arb-sub").textContent =
-        `${t.arb_fills || 0} fills · avg ${fmtMoney(t.arb_ev, 3)}`;
+        `${arbFills || t.arb_fills || 0} fills · avg ${fmtMoney(arbEv, 3)} · ${fmtMoneyAbs(arbNotional)} deployed`;
 
       renderOpenPositions(port);
       renderClosed(port);

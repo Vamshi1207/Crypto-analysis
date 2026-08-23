@@ -9,8 +9,8 @@ Honesty upgrades (paper still optimistic vs live MEV/latency, but less naive):
 - Per-mint cooldown + daily fill cap (no double-counting every tick).
 - Cross-DEX only (same-venue gaps are often noise).
 - Half-gap stress gate: if the spread halves, edge must still clear the hurdle.
-- Jupiter sell-route check; impact haircut applied twice (buy+sell legs).
-- Booked PnL uses the **conservative** (stressed) net, not the raw Dex gap.
+- Jupiter round-trip quote (SOL→mint→SOL); booked PnL matches that path.
+- Booked PnL debits/credits the **shared** paper cash ledger with scalps.
 
 It does **not** do mempool racing or Jito bundles yet. True millisecond racing
 needs paid Geyser/gRPC or Jito; this channel asks whether gaps survive *our*
@@ -28,6 +28,7 @@ from datetime import date, datetime, timezone
 from typing import Any, Callable, Optional
 
 from decision import costs
+from decision import paper
 from decision import pipeline_log
 from decision import store as decision_store
 from decision.config import WRAPPED_SOL_MINT, _env_float, _env_int
@@ -37,7 +38,6 @@ from decision.sources import (
     fetch_dexscreener_pairs,
     fetch_jupiter_quote,
     fetch_mint_account,
-    fetch_sell_quote,
 )
 
 ARB_ENABLED = os.getenv("ARB_ENABLED", "0").strip() == "1"
@@ -509,7 +509,7 @@ def _scan_and_maybe_fill() -> dict[str, Any]:
         ok, jup = _jupiter_verify(opp)
         if not ok:
             reason = str(jup.get("reason") or "jupiter_reject")
-            if "stress" in reason or "impact-adjusted" in reason:
+            if "round_trip" in reason or "stress" in reason or "impact-adjusted" in reason:
                 skipped_stress_n += 1
             else:
                 skipped_jupiter_n += 1
@@ -535,6 +535,17 @@ def _scan_and_maybe_fill() -> dict[str, Any]:
             continue
 
         fill = _paper_fill(opp, jupiter=jup)
+        if fill is None:
+            skipped_jupiter_n += 1
+            skipped.append(
+                {
+                    "mint": opp.mint,
+                    "symbol": opp.symbol,
+                    "net_pct": opp.net_pct,
+                    "reason": "paper_cash_refused",
+                }
+            )
+            continue
         _record_fill_limits(opp.mint)
         fills.append(fill)
         pnl_total += float(fill.get("realized_pnl_usd") or 0.0)
@@ -584,57 +595,75 @@ def _estimate_sol_usd() -> float:
 
 
 def _jupiter_verify(opp: ArbOpportunity) -> tuple[bool, dict[str, Any]]:
-    """Confirm Jupiter can route our sized notional before booking paper PnL."""
+    """Quote SOL→mint→SOL and book only when round-trip edge clears."""
     if not REQUIRE_JUPITER:
         booked = min(opp.net_pct, opp.stress_net_pct)
+        pnl = round(opp.size_usd * booked / 100.0, 4)
         return True, {
             "verified": False,
             "reason": "jupiter_not_required",
+            "round_trip_pnl_usd": pnl,
+            "round_trip_net_pct": round(booked, 4),
             "booked_net_pct": round(booked, 4),
+            "dex_gross_pct": opp.gross_pct,
+            "dex_net_pct": opp.net_pct,
+            "dex_stress_net_pct": opp.stress_net_pct,
+            "size_usd": opp.size_usd,
         }
 
-    price = float(opp.buy.price_usd or 0.0)
-    if price <= 0:
-        return False, {"verified": False, "reason": "bad_buy_price"}
+    sol_usd = _estimate_sol_usd()
+    sol_in = int((opp.size_usd / sol_usd) * (10**9))
+    if sol_in <= 0:
+        return False, {"verified": False, "reason": "buy_size_rounds_to_zero"}
 
-    try:
-        mint_info = fetch_mint_account(opp.mint)
-        decimals = int(mint_info.get("decimals"))
-    except (SourceError, TypeError, ValueError) as exc:
-        return False, {"verified": False, "reason": f"mint_meta: {exc}"}
-
-    amount_raw = int((opp.size_usd / price) * (10**decimals))
-    if amount_raw <= 0:
-        return False, {"verified": False, "reason": "size_rounds_to_zero"}
-
+    buy_q: Optional[dict[str, Any]] = None
     buy_impact = None
+    mint_out = 0
+
     if REQUIRE_BUY_ROUTE:
-        sol_usd = _estimate_sol_usd()
-        lamports = int((opp.size_usd / sol_usd) * (10**9))
-        if lamports <= 0:
-            return False, {"verified": False, "reason": "buy_size_rounds_to_zero"}
         try:
-            buy_q = fetch_jupiter_quote(WRAPPED_SOL_MINT, opp.mint, lamports)
+            buy_q = fetch_jupiter_quote(WRAPPED_SOL_MINT, opp.mint, sol_in)
         except NoRouteError as exc:
             return False, {"verified": False, "reason": f"no_buy_route: {exc}"}
         except SourceError as exc:
             return False, {"verified": False, "reason": f"jupiter_buy_unavailable: {exc}"}
         buy_impact = _impact_pct(buy_q)
+        try:
+            mint_out = int(buy_q.get("outAmount") or 0)
+        except (TypeError, ValueError):
+            mint_out = 0
+        if mint_out <= 0:
+            return False, {"verified": False, "reason": "buy_quote_empty"}
+    else:
+        price = float(opp.buy.price_usd or 0.0)
+        if price <= 0:
+            return False, {"verified": False, "reason": "bad_buy_price"}
+        try:
+            mint_info = fetch_mint_account(opp.mint)
+            decimals = int(mint_info.get("decimals"))
+        except (SourceError, TypeError, ValueError) as exc:
+            return False, {"verified": False, "reason": f"mint_meta: {exc}"}
+        mint_out = int((opp.size_usd / price) * (10**decimals))
+        if mint_out <= 0:
+            return False, {"verified": False, "reason": "size_rounds_to_zero"}
 
     try:
-        sell_q = fetch_sell_quote(opp.mint, amount_raw)
+        sell_q = fetch_jupiter_quote(opp.mint, WRAPPED_SOL_MINT, mint_out)
     except NoRouteError as exc:
         return False, {"verified": False, "reason": f"no_route: {exc}"}
     except SourceError as exc:
         return False, {"verified": False, "reason": f"jupiter_unavailable: {exc}"}
 
+    try:
+        sol_out = int(sell_q.get("outAmount") or 0)
+    except (TypeError, ValueError):
+        sol_out = 0
+    if sol_out <= 0:
+        return False, {"verified": False, "reason": "sell_quote_empty"}
+
     sell_impact = _impact_pct(sell_q)
     impacts = [x for x in (buy_impact, sell_impact) if x is not None]
-    if not impacts and sell_impact is None:
-        impact_pct = None
-        impact_rt = None
-    elif impacts:
-        # Prefer measured sum of legs; else 2× sell as proxy.
+    if impacts:
         if buy_impact is not None and sell_impact is not None:
             impact_rt = buy_impact + sell_impact
             impact_pct = sell_impact
@@ -653,21 +682,18 @@ def _jupiter_verify(opp: ArbOpportunity) -> tuple[bool, dict[str, Any]]:
             "impact_rt_pct": None if impact_rt is None else round(impact_rt, 4),
         }
 
-    # Conservative book: stress gap, then subtract round-trip Jupiter impact.
-    booked = opp.stress_net_pct
-    if impact_rt is not None:
-        booked = opp.stress_net_pct - impact_rt
-    if booked < MIN_EDGE_PCT:
+    pnl_usd = round((sol_out - sol_in) / (10**9) * sol_usd, 4)
+    net_pct = round((pnl_usd / opp.size_usd) * 100.0, 4) if opp.size_usd else 0.0
+    if net_pct < MIN_EDGE_PCT:
         return False, {
             "verified": False,
-            "reason": (
-                f"stress/impact net {booked:.2f}% < {MIN_EDGE_PCT}"
-            ),
+            "reason": f"round_trip net {net_pct:.2f}% < {MIN_EDGE_PCT}",
             "impact_pct": None if impact_pct is None else round(impact_pct, 4),
             "impact_rt_pct": None if impact_rt is None else round(impact_rt, 4),
-            "booked_net_pct": round(booked, 4),
-            "optimistic_net_pct": opp.net_pct,
-            "stress_net_pct": opp.stress_net_pct,
+            "round_trip_pnl_usd": pnl_usd,
+            "round_trip_net_pct": net_pct,
+            "dex_gross_pct": opp.gross_pct,
+            "dex_stress_net_pct": opp.stress_net_pct,
         }
 
     return True, {
@@ -676,11 +702,18 @@ def _jupiter_verify(opp: ArbOpportunity) -> tuple[bool, dict[str, Any]]:
         "impact_rt_pct": None if impact_rt is None else round(impact_rt, 4),
         "buy_impact_pct": None if buy_impact is None else round(buy_impact, 4),
         "sell_impact_pct": None if sell_impact is None else round(sell_impact, 4),
-        "booked_net_pct": round(booked, 4),
-        "optimistic_net_pct": opp.net_pct,
-        "stress_net_pct": opp.stress_net_pct,
+        "round_trip_pnl_usd": pnl_usd,
+        "round_trip_net_pct": net_pct,
+        "booked_net_pct": net_pct,
+        "dex_gross_pct": opp.gross_pct,
+        "dex_net_pct": opp.net_pct,
+        "dex_stress_net_pct": opp.stress_net_pct,
+        "sol_in_lamports": sol_in,
+        "sol_out_lamports": sol_out,
+        "mint_out_raw": mint_out,
+        "sol_usd": round(sol_usd, 4),
         "out_amount": sell_q.get("outAmount"),
-        "amount_raw": amount_raw,
+        "amount_raw": mint_out,
         "size_usd": opp.size_usd,
     }
 
@@ -695,16 +728,12 @@ def _impact_pct(quote: dict[str, Any]) -> Optional[float]:
         return None
 
 
-def _paper_fill(opp: ArbOpportunity, *, jupiter: Optional[dict[str, Any]] = None) -> dict[str, Any]:
-    """Simulate an atomic buy@cheap / sell@rich fill. Books conservative net."""
-    booked = opp.stress_net_pct
-    if jupiter and jupiter.get("booked_net_pct") is not None:
-        try:
-            booked = float(jupiter["booked_net_pct"])
-        except (TypeError, ValueError):
-            booked = opp.stress_net_pct
-    pnl = round(opp.size_usd * booked / 100.0, 4)
-    optimistic_pnl = round(opp.size_usd * opp.net_pct / 100.0, 4)
+def _paper_fill(opp: ArbOpportunity, *, jupiter: Optional[dict[str, Any]] = None) -> Optional[dict[str, Any]]:
+    """Simulate atomic round-trip; book Jupiter PnL into shared paper cash."""
+    jup = jupiter or {}
+    pnl = float(jup.get("round_trip_pnl_usd") or 0.0)
+    net_pct = float(jup.get("round_trip_net_pct") or jup.get("booked_net_pct") or 0.0)
+    dex_pnl = round(opp.size_usd * opp.stress_net_pct / 100.0, 4)
     record = {
         "event": "paper_arb",
         "id": str(uuid.uuid4())[:8],
@@ -718,17 +747,35 @@ def _paper_fill(opp: ArbOpportunity, *, jupiter: Optional[dict[str, Any]] = None
         "cost_pct": opp.cost_pct,
         "net_pct": opp.net_pct,
         "stress_net_pct": opp.stress_net_pct,
-        "adj_net_pct": booked,
-        "booked_net_pct": booked,
-        "optimistic_pnl_usd": optimistic_pnl,
+        "dex_stress_pnl_usd": dex_pnl,
+        "booked_net_pct": net_pct,
+        "optimistic_pnl_usd": round(opp.size_usd * opp.net_pct / 100.0, 4),
         "size_usd": opp.size_usd,
         "realized_pnl_usd": pnl,
         "filled_at": datetime.now(timezone.utc).isoformat(),
-        "mode": "paper_atomic_sim_conservative",
-        "jupiter": jupiter or {},
+        "mode": "paper_jupiter_round_trip",
+        "jupiter": jup,
     }
+    ledger = paper.execute_arb_fill(
+        size_usd=opp.size_usd,
+        pnl_usd=pnl,
+        mint=opp.mint,
+        symbol=opp.symbol,
+        record=record,
+    )
+    if ledger.get("status") != "filled":
+        pipeline_log.emit(
+            "arb",
+            "cash_refused",
+            level="warning",
+            mint=opp.mint,
+            symbol=opp.symbol,
+            reason=ledger.get("reason"),
+            size_usd=opp.size_usd,
+        )
+        return None
+
     try:
-        decision_store.append("paper", record)
         decision_store.append(
             "outcomes",
             {
@@ -737,11 +784,11 @@ def _paper_fill(opp: ArbOpportunity, *, jupiter: Optional[dict[str, Any]] = None
                 "timeframe": "arb",
                 "horizon_bars": 0,
                 "action": "paper_arb",
-                "predicted_p50": booked,
-                "predicted_p10": booked,
+                "predicted_p50": net_pct,
+                "predicted_p10": net_pct,
                 "predicted_p90": opp.net_pct,
-                "realized_pct": booked,
-                "error_pct": round(opp.net_pct - booked, 4),
+                "realized_pct": net_pct,
+                "error_pct": round(opp.net_pct - net_pct, 4),
                 "covered_80": True,
                 "entry_price": opp.buy.price_usd,
                 "exit_price": opp.sell.price_usd,
@@ -757,14 +804,16 @@ def _paper_fill(opp: ArbOpportunity, *, jupiter: Optional[dict[str, Any]] = None
         symbol=opp.symbol,
         net_pct=opp.net_pct,
         stress_net_pct=opp.stress_net_pct,
-        booked_net_pct=booked,
+        booked_net_pct=net_pct,
         realized_pnl_usd=pnl,
-        optimistic_pnl_usd=optimistic_pnl,
+        dex_stress_pnl_usd=dex_pnl,
         size_usd=opp.size_usd,
         buy_dex=opp.buy.dex,
         sell_dex=opp.sell.dex,
-        jupiter_verified=bool((jupiter or {}).get("verified")),
+        jupiter_verified=bool(jup.get("verified")),
+        cash_usd=ledger.get("cash_usd"),
     )
+    record["portfolio_cash_usd"] = ledger.get("cash_usd")
     return record
 
 

@@ -118,6 +118,7 @@ def test_size_capped_by_thin_pool(monkeypatch):
 
 
 def test_scan_books_conservative_pnl(monkeypatch, tmp_path):
+    from decision import paper
     from decision import store as decision_store
 
     monkeypatch.setattr(decision_store, "STORE_DIR", tmp_path / "store")
@@ -127,14 +128,17 @@ def test_scan_books_conservative_pnl(monkeypatch, tmp_path):
     monkeypatch.setattr(arb, "MINT_COOLDOWN_SEC", 0.0)
     monkeypatch.setattr(arb, "MAX_FILLS_PER_MINT_DAY", 5)
     arb.reset_counters()
+    paper.reset(starting_cash_usd=1000.0)
 
     def fake_jup(opp):
-        booked = opp.stress_net_pct - 0.2
+        pnl = 1.92
+        net = round(pnl / opp.size_usd * 100.0, 4)
         return True, {
             "verified": True,
             "impact_pct": 0.1,
-            "booked_net_pct": booked,
-            "optimistic_net_pct": opp.net_pct,
+            "round_trip_pnl_usd": pnl,
+            "round_trip_net_pct": net,
+            "booked_net_pct": net,
         }
 
     monkeypatch.setattr(arb, "_jupiter_verify", fake_jup)
@@ -156,13 +160,46 @@ def test_scan_books_conservative_pnl(monkeypatch, tmp_path):
     assert result["fills_n"] == 1
     papers = list(decision_store.read("paper"))
     fill = next(r for r in papers if r.get("event") == "paper_arb")
-    # Booked = stress 5% - 0.2 = 4.8% of $40 = 1.92
     assert fill["realized_pnl_usd"] == 1.92
-    assert fill["optimistic_pnl_usd"] > fill["realized_pnl_usd"]
-    assert fill["mode"] == "paper_atomic_sim_conservative"
+    assert fill["mode"] == "paper_jupiter_round_trip"
+    assert paper.snapshot()["cash_usd"] == 1001.92
+    assert paper.snapshot()["arb_fills"] == 1
+
+
+def test_jupiter_round_trip_pnl_from_quotes(monkeypatch):
+    _patch_basic(monkeypatch, cost=1.0)
+    monkeypatch.setattr(arb, "REQUIRE_JUPITER", True)
+    monkeypatch.setattr(arb, "MIN_EDGE_PCT", 0.5)
+    monkeypatch.setattr(arb, "_estimate_sol_usd", lambda: 100.0)
+
+    opp = arb.ArbOpportunity(
+        mint=MEME,
+        symbol="MEME",
+        buy=arb.PoolQuote("cheap", "raydium", 1.0, 50_000, "MEME"),
+        sell=arb.PoolQuote("rich", "orca", 1.12, 50_000, "MEME"),
+        gross_pct=12.0,
+        cost_pct=1.0,
+        net_pct=11.0,
+        stress_net_pct=5.0,
+        size_usd=40.0,
+        expected_pnl_usd=4.4,
+        stress_pnl_usd=2.0,
+    )
+
+    def fake_quote(input_mint, output_mint, amount_raw, **kwargs):
+        if input_mint == WRAPPED_SOL_MINT:
+            return {"outAmount": "1000000", "priceImpactPct": "0.001"}
+        return {"outAmount": str(int(0.41 * 10**9)), "priceImpactPct": "0.001"}
+
+    monkeypatch.setattr(arb, "fetch_jupiter_quote", fake_quote)
+    ok, jup = arb._jupiter_verify(opp)
+    assert ok is True
+    assert jup["round_trip_pnl_usd"] == 1.0
+    assert jup["round_trip_net_pct"] == 2.5
 
 
 def test_cooldown_optional_when_enabled_blocks_second_fill(monkeypatch, tmp_path):
+    from decision import paper
     from decision import store as decision_store
 
     monkeypatch.setattr(decision_store, "STORE_DIR", tmp_path / "store")
@@ -171,10 +208,19 @@ def test_cooldown_optional_when_enabled_blocks_second_fill(monkeypatch, tmp_path
     monkeypatch.setattr(arb, "MINT_COOLDOWN_SEC", 600.0)
     monkeypatch.setattr(arb, "MAX_FILLS_PER_MINT_DAY", 5)
     arb.reset_counters()
+    paper.reset()
     monkeypatch.setattr(
         arb,
         "_jupiter_verify",
-        lambda opp: (True, {"verified": True, "booked_net_pct": opp.stress_net_pct}),
+        lambda opp: (
+            True,
+            {
+                "verified": True,
+                "round_trip_pnl_usd": 1.0,
+                "round_trip_net_pct": 2.5,
+                "booked_net_pct": 2.5,
+            },
+        ),
     )
     buf = {"addr1": {"mint": MEME, "name": "MEME"}}
     arb.configure(get_tokens=lambda: buf)
@@ -194,6 +240,7 @@ def test_cooldown_optional_when_enabled_blocks_second_fill(monkeypatch, tmp_path
 
 
 def test_default_no_cooldown_allows_refill_when_analysis_clears(monkeypatch, tmp_path):
+    from decision import paper
     from decision import store as decision_store
 
     monkeypatch.setattr(decision_store, "STORE_DIR", tmp_path / "store")
@@ -202,10 +249,19 @@ def test_default_no_cooldown_allows_refill_when_analysis_clears(monkeypatch, tmp
     monkeypatch.setattr(arb, "MINT_COOLDOWN_SEC", 0.0)
     monkeypatch.setattr(arb, "MAX_FILLS_PER_MINT_DAY", 0)
     arb.reset_counters()
+    paper.reset()
     monkeypatch.setattr(
         arb,
         "_jupiter_verify",
-        lambda opp: (True, {"verified": True, "booked_net_pct": opp.stress_net_pct}),
+        lambda opp: (
+            True,
+            {
+                "verified": True,
+                "round_trip_pnl_usd": 1.0,
+                "round_trip_net_pct": 2.5,
+                "booked_net_pct": 2.5,
+            },
+        ),
     )
     buf = {"addr1": {"mint": MEME, "name": "MEME"}}
     arb.configure(get_tokens=lambda: buf)

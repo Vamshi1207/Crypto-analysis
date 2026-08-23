@@ -100,6 +100,12 @@ def evaluate(*, day=None) -> dict[str, Any]:
     arb_sum = sum(arb_pnls) if arb_pnls else 0.0
 
     port = paper.snapshot()
+    port_arb_fills = int(port.get("arb_fills") or 0)
+    if port_arb_fills > 0:
+        arb_n = port_arb_fills
+        arb_sum = float(port.get("arb_realized_pnl_usd") or 0.0)
+        arb_ev = (arb_sum / arb_n) if arb_n else None
+
     live_trading = os.getenv("LIVE_TRADING", "0").strip() == "1"
 
     checks = [
@@ -213,6 +219,9 @@ def evaluate(*, day=None) -> dict[str, Any]:
         "pipeline_events": len(pipeline),
         "paper_open": port.get("open_count"),
         "paper_realized": port.get("realized_pnl_usd"),
+        "paper_arb_fills": port.get("arb_fills"),
+        "paper_arb_realized": port.get("arb_realized_pnl_usd"),
+        "paper_arb_notional": port.get("arb_notional_usd"),
     }
 
     return {
