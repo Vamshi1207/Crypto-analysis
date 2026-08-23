@@ -33,13 +33,26 @@ def isolated_store(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def fresh_monitoring_session():
+    """Each test gets an isolated monitoring session window."""
+    from datetime import datetime, timezone
+
+    from decision import session as decision_session
+
+    decision_session.begin_session(datetime.now(timezone.utc).isoformat())
+
+
+@pytest.fixture(autouse=True)
 def paper_concentration_headroom(monkeypatch):
     """Paper portfolio is process-global; give tests headroom unless they tighten caps."""
     from decision import paper
 
+    paper.reset(starting_cash_usd=1000.0)
+    paper.set_kill_switch(False)
     monkeypatch.setattr(paper, "MAX_TRADES_PER_MINT_DAY", 50)
     monkeypatch.setattr(paper, "MAX_NOTIONAL_PER_MINT_DAY", 10_000.0)
     monkeypatch.setattr(paper, "MAX_DAILY_LOSS_PER_MINT", 10_000.0)
+    monkeypatch.setattr(paper, "BLOCK_REPEAT_MINT_AFTER_STOP", False)
 
 
 @pytest.fixture(scope="session")

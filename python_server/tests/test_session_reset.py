@@ -21,6 +21,10 @@ def test_archive_today_moves_jsonl(isolated_store):
 
 
 def test_reset_board_clears_paper_and_cooloffs(isolated_store, monkeypatch):
+    discover._cool_until.clear()
+    discover._no_edge_streak.clear()
+    discover._safety_ok.clear()
+    discover._cool_meta.clear()
     # Seed paper + cool-off state without hitting network on scan.
     paper.reset(starting_cash_usd=500.0)
     snap = paper.snapshot()

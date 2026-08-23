@@ -63,6 +63,10 @@ def record_outcome(
 
 def summarize(day=None) -> dict[str, Any]:
     rows = list(decision_store.read("outcomes", day))
+    return summarize_rows(rows)
+
+
+def summarize_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
     if not rows:
         return {"n": 0, "coverage": None, "mae": None, "mean_error": None, "rows": []}
     n = len(rows)

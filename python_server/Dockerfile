@@ -3,10 +3,12 @@ FROM python:3.11-slim
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     # Official installer drops the binary in ~/.local/bin
-    PATH="/root/.local/bin:${PATH}"
+    PATH="/root/.local/bin:${PATH}" \
+    HOST=0.0.0.0 \
+    PORT=8000
 
 # Antigravity CLI (agy) replaced the deprecated Gemini CLI.
-# Native binary install — no Node required. Docs:
+# Native binary install — no Node required.
 # https://antigravity.google/docs/cli/install/
 RUN apt-get update \
     && apt-get install -y --no-install-recommends curl ca-certificates \
@@ -23,7 +25,9 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
+RUN chmod +x /app/dev-server.sh
 
 EXPOSE 8000
 
-CMD ["sleep", "infinity"]
+# Default: run the paper desk. Compose overrides with the same command.
+CMD ["./dev-server.sh"]

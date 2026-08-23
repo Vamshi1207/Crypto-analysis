@@ -27,8 +27,8 @@ def test_emit_writes_jsonl(tmp_path, monkeypatch):
 
     rows = list(decision_store.read("pipeline"))
     assert len(rows) >= 2
-    assert rows[0]["run_id"] == run_id
-    assert rows[0]["stage"] == "discover"
+    assert any(r.get("run_id") == run_id for r in rows)
+    assert any(r["stage"] == "discover" and r["event"] == "scan_start" for r in rows)
     assert any(r["event"] == "fail" and r["stage"] == "gate2" for r in rows)
 
 

@@ -17,5 +17,7 @@ python_server/.Trash-0/
 .gemini/
 
 # Decision engine runtime data
-python_server/data/
-python_server/store/
+python_server/data/**
+!python_server/data/.gitkeep
+python_server/store/**
+!python_server/store/.gitkeep

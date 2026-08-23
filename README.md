@@ -46,29 +46,53 @@ Goal of the practice loop: prove the pipeline can clear ~$1 **net** after realis
 
 ---
 
-## Quick start
+## Quick start (laptop or overnight server)
+
+One command after `.env` exists — Flask **auto-starts** (no manual `./dev-server.sh`).
 
 ```bash
-# From repo root — copy env, fill keys you have (Helius optional for paper)
+# From repo root
 cp .env.example .env
+# Edit .env: keep LIVE_TRADING=0; set HELIUS_API_KEY if you have one (optional for paper)
 
-docker compose up -d --build python_server
-docker compose exec -d python_server ./dev-server.sh
+docker compose up -d --build
 
 # Dashboard + APIs (host 8080 → container 8000)
-open http://127.0.0.1:8080/
+# open http://127.0.0.1:8080/   # or http://YOUR_SERVER_IP:8080/
 curl -s http://127.0.0.1:8080/health | python3 -m json.tool
 curl -s http://127.0.0.1:8080/readiness | python3 -m json.tool
 ```
 
-Useful knobs live in `.env` / `.env.example`: `DISCOVER_*`, `SWARM_*`, `ARB_*`, `PAPER_*`, `READY_*`, `INDICATOR_*`. After changing `.env`, recreate the container so env is picked up:
+### Overnight server deploy
 
 ```bash
-docker compose up -d --force-recreate python_server
-docker compose exec -d python_server ./dev-server.sh
+git clone <your-repo-url> crypto_platform && cd crypto_platform
+git checkout codex   # or your deploy branch
+cp .env.example .env && nano .env   # paste secrets; LIVE_TRADING=0
+
+docker compose up -d --build
+docker compose ps    # python_server should be healthy / up
+# Leave it running. Logs:
+docker compose logs -f python_server
 ```
 
-Flask does **not** auto-reload HTML with debug off — restart `./dev-server.sh` after template edits, then **Cmd+Shift+R** in the browser.
+Workers (discover / swarm / arb) start from `.env` flags inside the process — no extra setup.
+Paper JSONL lives under `python_server/store/` (bind-mounted, survives recreate).
+
+After changing `.env`:
+
+```bash
+docker compose up -d --force-recreate
+```
+
+After code pull on the server:
+
+```bash
+git pull
+docker compose up -d --build
+```
+
+Flask does **not** auto-reload HTML with debug off — recreate/restart after template edits, then hard-refresh the browser.
 
 ### Chrome extension (optional)
 

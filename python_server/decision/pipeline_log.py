@@ -156,8 +156,10 @@ def emit_decide_card(card: Any, *, run_id: Optional[str] = None) -> None:
 
 
 def recent(limit: int = 100, *, stage: Optional[str] = None) -> list[dict[str, Any]]:
-    """Latest pipeline events for today (newest last)."""
-    rows = list(decision_store.read(PIPELINE_KIND))
+    """Latest pipeline events this session (newest last)."""
+    from decision import session as session_scope
+
+    rows = session_scope.read_since(PIPELINE_KIND)
     if stage:
         rows = [r for r in rows if r.get("stage") == stage]
     if limit > 0:
@@ -166,7 +168,14 @@ def recent(limit: int = 100, *, stage: Optional[str] = None) -> list[dict[str, A
 
 
 def count_today() -> int:
-    return decision_store.count(PIPELINE_KIND)
+    """Session-scoped pipeline event count (name kept for callers)."""
+    return count_session()
+
+
+def count_session() -> int:
+    from decision import session as session_scope
+
+    return session_scope.count_since(PIPELINE_KIND)
 
 
 def timed_ms(started: float) -> float:

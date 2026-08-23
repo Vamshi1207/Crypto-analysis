@@ -11,7 +11,7 @@ import os
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from decision import paper, scoreboard
+from decision import paper, scoreboard, session
 from decision import store as decision_store
 from decision.config import _env_float, _env_int
 
@@ -27,13 +27,14 @@ MAX_MAE = _env_float("READY_MAX_MAE", 8.0)
 
 
 def evaluate(*, day=None) -> dict[str, Any]:
-    """Compute readiness checklist + overall go/no-go."""
-    day = day or datetime.now(timezone.utc).date()
+    """Compute readiness checklist + overall go/no-go (current session window)."""
+    _ = day  # legacy arg; metrics are session-scoped
+    session_started = session.started_at_iso()
 
-    decisions = list(decision_store.read("decisions", day))
-    paper_rows = list(decision_store.read("paper", day))
-    outcomes = list(decision_store.read("outcomes", day))
-    pipeline = list(decision_store.read("pipeline", day))
+    decisions = session.read_since("decisions")
+    paper_rows = session.read_since("paper")
+    outcomes = session.read_since("outcomes")
+    pipeline = session.read_since("pipeline")
 
     scalp_closes = [
         r
@@ -77,7 +78,7 @@ def evaluate(*, day=None) -> dict[str, Any]:
     n_dec = len(decisions)
     buy_rate = (buys / n_dec) if n_dec else 0.0
 
-    sb = scoreboard.summarize(day)
+    sb = scoreboard.summarize_rows(outcomes)
     # Prefer directional (non-arb) outcomes for coverage math when possible.
     dir_outcomes = [o for o in outcomes if o.get("action") != "paper_arb"]
     if dir_outcomes:
@@ -137,7 +138,7 @@ def evaluate(*, day=None) -> dict[str, Any]:
         _check(
             "decisions_volume",
             n_dec >= MIN_DECISIONS,
-            f"{n_dec}/{MIN_DECISIONS} decisions today",
+            f"{n_dec}/{MIN_DECISIONS} bot opinions this session",
             weight=1,
         ),
         _check(
@@ -196,6 +197,24 @@ def evaluate(*, day=None) -> dict[str, Any]:
     critical_ok = all(c["pass"] for c in checks if c["id"] in critical)
     ready = critical_ok and score >= 75.0 and (scalp_ev or 0) >= MIN_SCALP_EV_USD
 
+    session_stats = {
+        "decisions": n_dec,
+        "actions": actions,
+        "buy_rate": round(buy_rate, 4),
+        "scalp_closes": scalp_n,
+        "scalp_pnl_sum": round(scalp_sum, 4),
+        "scalp_ev": None if scalp_ev is None else round(scalp_ev, 4),
+        "arb_fills": arb_n,
+        "arb_pnl_sum": round(arb_sum, 4),
+        "arb_ev": None if arb_ev is None else round(arb_ev, 4),
+        "scoreboard_n": sb_n,
+        "coverage": None if cov is None else round(float(cov), 3),
+        "mae": None if mae is None else round(float(mae), 4),
+        "pipeline_events": len(pipeline),
+        "paper_open": port.get("open_count"),
+        "paper_realized": port.get("realized_pnl_usd"),
+    }
+
     return {
         "ready_for_live": ready,
         "score": score,
@@ -203,6 +222,7 @@ def evaluate(*, day=None) -> dict[str, Any]:
         "total_checks": len(checks),
         "checks": checks,
         "insights": insights,
+        "session_started_at": session_started,
         "thresholds": {
             "min_scalp_closes": MIN_SCALP_CLOSES,
             "min_arb_fills": MIN_ARB_FILLS,
@@ -214,23 +234,8 @@ def evaluate(*, day=None) -> dict[str, Any]:
             "max_mae": MAX_MAE,
             "min_score_pct": 75.0,
         },
-        "today": {
-            "decisions": n_dec,
-            "actions": actions,
-            "buy_rate": round(buy_rate, 4),
-            "scalp_closes": scalp_n,
-            "scalp_pnl_sum": round(scalp_sum, 4),
-            "scalp_ev": None if scalp_ev is None else round(scalp_ev, 4),
-            "arb_fills": arb_n,
-            "arb_pnl_sum": round(arb_sum, 4),
-            "arb_ev": None if arb_ev is None else round(arb_ev, 4),
-            "scoreboard_n": sb_n,
-            "coverage": None if cov is None else round(float(cov), 3),
-            "mae": None if mae is None else round(float(mae), 4),
-            "pipeline_events": len(pipeline),
-            "paper_open": port.get("open_count"),
-            "paper_realized": port.get("realized_pnl_usd"),
-        },
+        "session": session_stats,
+        "today": session_stats,
         "recommendation": (
             "Looks ready for a tiny real-money trial — but only after you personally review the paper results. Keep sizes tiny."
             if ready

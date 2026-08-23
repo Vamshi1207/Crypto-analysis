@@ -887,6 +887,7 @@ def health():
     from decision import forecast as forecast_mod
     from decision import calibrate as calibrate_mod
     from decision import arb, discover, paper, pipeline_log, readiness, swarm
+    from decision import session as decision_session
 
     residuals = calibrate_mod.load_residuals()
     port = paper.snapshot()
@@ -949,10 +950,15 @@ def health():
             "recommendation": ready.get("recommendation"),
             "passed": ready.get("passed"),
             "total_checks": ready.get("total_checks"),
+            "session_started_at": ready.get("session_started_at"),
         },
-        "pipeline_events_today": pipeline_log.count_today(),
-        "safety_checks_logged_today": decision_store.count("safety"),
-        "decisions_logged_today": decision_store.count("decisions"),
+        "session_started_at": ready.get("session_started_at"),
+        "pipeline_events_session": pipeline_log.count_session(),
+        "safety_checks_logged_session": decision_session.count_since("safety"),
+        "decisions_logged_session": decision_session.count_since("decisions"),
+        "pipeline_events_today": pipeline_log.count_session(),
+        "safety_checks_logged_today": decision_session.count_since("safety"),
+        "decisions_logged_today": decision_session.count_since("decisions"),
     })
 
 
@@ -1004,6 +1010,10 @@ def _configure_background_channels() -> None:
 
 
 _configure_background_channels()
+
+from decision import session as decision_session
+
+decision_session.bootstrap(reason="server_boot")
 
 if __name__ == '__main__':
     host = os.getenv('HOST', '0.0.0.0')

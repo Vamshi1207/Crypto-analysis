@@ -16,6 +16,7 @@ from typing import Any, Optional
 
 from decision import costs
 from decision import pipeline_log
+from decision import session as session_scope
 from decision import store as decision_store
 from decision.config import _env_float, _env_int
 from decision.packet import SCALP_SIZE_USD, TARGET_PROFIT_USD
@@ -43,6 +44,9 @@ MAX_DAILY_LOSS_PER_MINT = _env_float("PAPER_MAX_DAILY_LOSS_PER_MINT", 5.0)
 # If decide still clears edge while a lot is open, open another lot (pyramid).
 # Each lot keeps its own take-profit / stop. Still bound by cash + max open/notional.
 ALLOW_ADD_ON = os.getenv("PAPER_ALLOW_ADD_ON", "1").strip() == "1"
+MAX_OPEN_LOTS_PER_ADDRESS = _env_int("PAPER_MAX_OPEN_LOTS_PER_ADDRESS", 2)
+BLOCK_ADD_ON_IF_OPEN_LOSING = os.getenv("PAPER_BLOCK_ADD_ON_IF_OPEN_LOSING", "1").strip() == "1"
+BLOCK_REPEAT_MINT_AFTER_STOP = os.getenv("PAPER_BLOCK_REPEAT_MINT_AFTER_STOP", "1").strip() == "1"
 
 
 @dataclass
@@ -119,6 +123,9 @@ def snapshot() -> dict[str, Any]:
                 "max_notional_per_mint_day": MAX_NOTIONAL_PER_MINT_DAY,
                 "max_daily_loss_per_mint": MAX_DAILY_LOSS_PER_MINT,
                 "allow_add_on": ALLOW_ADD_ON,
+                "max_open_lots_per_address": MAX_OPEN_LOTS_PER_ADDRESS,
+                "block_add_on_if_open_losing": BLOCK_ADD_ON_IF_OPEN_LOSING,
+                "block_repeat_mint_after_stop": BLOCK_REPEAT_MINT_AFTER_STOP,
             },
         }
 
@@ -296,6 +303,15 @@ def _execute_decision_inner(
         ]
         if already and not ALLOW_ADD_ON:
             return {"status": "skipped", "reason": "already open for address"}
+        entry_block = _entry_block_reason(
+            address=address,
+            mint=mint,
+            mark_price=price,
+            open_lots=already,
+            add_on=len(already) > 0,
+        )
+        if entry_block:
+            return {"status": "skipped", "reason": entry_block}
         cooling = _cooldown_remaining(address)
         if cooling > 0:
             return {
@@ -534,23 +550,22 @@ def _utc_day(iso_ts: Optional[str] = None) -> str:
 
 
 def _concentration_block(*, mint: Optional[str], address: str, size: float) -> Optional[str]:
-    """Refuse when this mint has already eaten its daily budget. Holds _lock."""
+    """Refuse when this mint has already eaten its session budget. Holds _lock."""
     key = _mint_key(mint, address)
-    today = _utc_day()
     trades = 0
     notional = 0.0
     realized = 0.0
     for pos in _state.open:
         if _mint_key(pos.mint, pos.address) != key:
             continue
-        if _utc_day(pos.opened_at) != today:
+        if not session_scope.is_since(pos.opened_at):
             continue
         trades += 1
         notional += pos.size_usd
     for pos in _state.closed:
         if _mint_key(pos.mint, pos.address) != key:
             continue
-        if _utc_day(pos.opened_at) != today:
+        if not session_scope.is_since(pos.opened_at):
             continue
         trades += 1
         notional += pos.size_usd
@@ -565,6 +580,37 @@ def _concentration_block(*, mint: Optional[str], address: str, size: float) -> O
         )
     if MAX_DAILY_LOSS_PER_MINT > 0 and realized <= -MAX_DAILY_LOSS_PER_MINT:
         return f"mint daily loss ${realized:.2f} hit -${MAX_DAILY_LOSS_PER_MINT:.2f} cap"
+    return None
+
+
+def _entry_block_reason(
+    *,
+    address: str,
+    mint: Optional[str],
+    mark_price: float,
+    open_lots: list[PaperPosition],
+    add_on: bool,
+) -> Optional[str]:
+    """Analysis-based entry blocks (not timer cool-downs). Caller holds _lock."""
+    if len(open_lots) >= MAX_OPEN_LOTS_PER_ADDRESS:
+        return f"max {MAX_OPEN_LOTS_PER_ADDRESS} open lots on this coin"
+
+    if add_on and BLOCK_ADD_ON_IF_OPEN_LOSING and mark_price > 0:
+        for pos in open_lots:
+            if mark_price < pos.entry_price:
+                return "add-on blocked: existing lot is losing at mark"
+
+    if BLOCK_REPEAT_MINT_AFTER_STOP:
+        key = _mint_key(mint, address)
+        for pos in reversed(_state.closed):
+            if _mint_key(pos.mint, pos.address) != key:
+                continue
+            if not session_scope.is_since(pos.closed_at):
+                continue
+            reason = str(pos.close_reason or "")
+            if "stop_loss" in reason:
+                return "won't re-scalp this coin this session after a stop loss"
+            break
     return None
 
 

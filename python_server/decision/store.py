@@ -70,6 +70,37 @@ def count(kind: str, day: Optional[date] = None) -> int:
     return sum(1 for _ in read(kind, day))
 
 
+def record_ts(record: dict[str, Any]) -> Optional[datetime]:
+    """Best-effort timestamp for filtering a store row."""
+    for key in ("logged_at", "scored_at", "filled_at", "started_at"):
+        raw = record.get(key)
+        if not raw:
+            continue
+        try:
+            return datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        except ValueError:
+            continue
+    return None
+
+
+def read_since(kind: str, since: datetime) -> Iterator[dict[str, Any]]:
+    """Yield records at or after ``since``, spanning daily JSONL files."""
+    if since.tzinfo is None:
+        since = since.replace(tzinfo=timezone.utc)
+    day = since.date()
+    end = datetime.now(timezone.utc).date()
+    while day <= end:
+        for rec in read(kind, day):
+            ts = record_ts(rec)
+            if ts is None or ts >= since:
+                yield rec
+        day = day.fromordinal(day.toordinal() + 1)
+
+
+def count_since(kind: str, since: datetime) -> int:
+    return sum(1 for _ in read_since(kind, since))
+
+
 def archive_today(kinds: list[str] | tuple[str, ...]) -> list[dict[str, str]]:
     """Rename today's JSONL files aside so a new monitoring window starts empty.
 

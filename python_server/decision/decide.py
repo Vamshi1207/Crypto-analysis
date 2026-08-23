@@ -8,6 +8,7 @@ Paper execute / swarm loop live outside this function (Phase 4–5).
 
 from __future__ import annotations
 
+import os
 import time
 from typing import Any, Optional
 
@@ -25,6 +26,7 @@ from decision.packet import (
     horizon_for_tf,
     min_edge_pct_for_target,
     pick_decision_timeframe,
+    gate2_thresholds,
 )
 from decision.safety import check_token
 from decision.schema import (
@@ -427,19 +429,18 @@ def _decide_body(
     cost = market_packet.est_round_trip_cost_pct or 2.0
     edge = band.p50 - cost
     profit_usd = expected_profit_usd(edge, size_usd=SCALP_SIZE_USD)
-    need_edge = min_edge_pct_for_target(
-        size_usd=SCALP_SIZE_USD, target_usd=TARGET_PROFIT_USD
-    )
+    live = os.getenv("LIVE_TRADING", "0").strip() == "1"
+    need_edge, profit_target_usd = gate2_thresholds(live_trading=live)
 
     # --- Gate 2 ---
-    # Buy-fast / sell-fast: require cost-adjusted edge that clears ~$1 on scalp size.
+    # Buy-fast / sell-fast: require cost-adjusted edge that clears profit target.
     direction = _direction(band)
-    edge_ok = edge >= need_edge and profit_usd >= TARGET_PROFIT_USD
+    edge_ok = edge >= need_edge and profit_usd >= profit_target_usd
     if not edge_ok or direction is Direction.SIDEWAYS:
         gates_failed.append("gate2")
         reason = (
             f"edge {edge:+.2f}% (${profit_usd:+.2f} on ${SCALP_SIZE_USD:.0f}) "
-            f"below target ${TARGET_PROFIT_USD:.2f} "
+            f"below target ${profit_target_usd:.2f} "
             f"(need ≥{need_edge:.2f}%, cost≈{cost:.2f}%)"
             if not edge_ok
             else "forecast is sideways"

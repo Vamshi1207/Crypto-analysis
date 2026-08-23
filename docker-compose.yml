@@ -4,30 +4,29 @@ services:
       context: ./python_server
     container_name: crypto-analysis-python-server
     ports:
-      - "${HOST_PORT:-5050}:${CONTAINER_PORT:-5000}"
+      # Dashboard + APIs. Defaults match .env.example (8080 → 8000).
+      - "${HOST_PORT:-8080}:${CONTAINER_PORT:-8000}"
       - "${DATASET_PREP_DASHBOARD_HOST_PORT:-8765}:${DATASET_PREP_DASHBOARD_CONTAINER_PORT:-8765}"
-    # Pass the whole file so DECIDE_/PAPER_/VIBE_/EXEC_ tuning knobs actually
-    # reach the process. Listing vars one by one silently dropped every knob
-    # that was not enumerated below. `environment:` still wins on conflicts.
+    # Whole file so DISCOVER_/SWARM_/ARB_/PAPER_/READY_ knobs reach the process.
+    # Listing vars one-by-one silently dropped every knob not enumerated.
+    # `environment:` still wins on conflicts.
     env_file:
       - .env
     environment:
       HOST: 0.0.0.0
-      PORT: ${CONTAINER_PORT:-5000}
+      PORT: ${CONTAINER_PORT:-8000}
       DATA_DIR: /app/data
+      CANDLE_DATA_DIR: /app/data
+      DECISION_STORE_DIR: /app/store
 
-      # --- Antigravity CLI (agy) — replaces deprecated Gemini CLI ---
-      # Force the remote/SSH OAuth flow so login prints a URL instead of
-      # trying to open a browser that does not exist in the container.
-      # https://antigravity.google/docs/cli/install/
+      # --- Antigravity CLI (agy) — optional LLM deep-review ---
+      # Force remote/SSH OAuth so login prints a URL (no browser in container).
       SSH_CONNECTION: "172.17.0.1 22 172.17.0.2 22"
       SSH_CLIENT: "172.17.0.1 22 22"
       AGY_MODEL: ${AGY_MODEL:-}
-      # Optional: API-key auth instead of Google Sign-In (headless/CI).
-      # Requires ~/.gemini/antigravity-cli/settings.json modelProvider=gemini
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
 
-      # --- LLM providers ---
+      # --- LLM providers (optional for paper loop) ---
       NVIDIA_KEY: ${NVIDIA_KEY:-}
       NVIDIA_BASE_URL: ${NVIDIA_BASE_URL:-https://integrate.api.nvidia.com/v1}
       NEMOTRON_MODEL: ${NEMOTRON_MODEL:-nvidia/nemotron-3-nano-30b-a3b}
@@ -39,21 +38,38 @@ services:
       SOLANA_RPC_URL: ${SOLANA_RPC_URL:-}
       BIRDEYE_API_KEY: ${BIRDEYE_API_KEY:-}
 
-      # --- Safety thresholds ---
+      # --- Safety ---
       SAFETY_MIN_LIQUIDITY_USD: ${SAFETY_MIN_LIQUIDITY_USD:-5000}
       SAFETY_MAX_TOP10_PCT: ${SAFETY_MAX_TOP10_PCT:-55}
       SAFETY_MIN_POOL_AGE_MIN: ${SAFETY_MIN_POOL_AGE_MIN:-5}
 
+      # Never enable on a shared/overnight box unless you mean it.
       LIVE_TRADING: ${LIVE_TRADING:-0}
     volumes:
+      # Live code mount (dev + server). Rebuild image after requirements change.
       - ./python_server:/app
       - ./python_server/data:/app/data
-      # Persists the one-time agy Google Sign-In across restarts/rebuilds
+      # Persist decision/paper/pipeline JSONL across recreates.
+      - ./python_server/store:/app/store
+      # Persists one-time agy Google Sign-In across restarts/rebuilds.
       - ./.gemini:/root/.gemini
     extra_hosts:
       - "host.docker.internal:host-gateway"
     working_dir: /app
-    command: ["sleep", "infinity"]
+    # Auto-start Flask — no manual `./dev-server.sh` after compose up.
+    command: ["./dev-server.sh"]
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import os,urllib.request; p=os.getenv('PORT','8000'); urllib.request.urlopen(f'http://127.0.0.1:{p}/health', timeout=5)",
+        ]
+      interval: 30s
+      timeout: 8s
+      retries: 5
+      start_period: 40s
     stdin_open: true
     tty: true
     restart: unless-stopped
@@ -71,7 +87,19 @@ services:
       - ./python_server:/app
       - ./python_server/data:/app/data
     working_dir: /app
-    command: ["jupyter", "notebook", "--ip=0.0.0.0", "--port=8888", "--no-browser", "--allow-root", "--ServerApp.token=", "--ServerApp.password=", "--NotebookApp.token=", "--NotebookApp.password="]
+    command:
+      [
+        "jupyter",
+        "notebook",
+        "--ip=0.0.0.0",
+        "--port=8888",
+        "--no-browser",
+        "--allow-root",
+        "--ServerApp.token=",
+        "--ServerApp.password=",
+        "--NotebookApp.token=",
+        "--NotebookApp.password=",
+      ]
     stdin_open: true
     tty: true
     restart: unless-stopped

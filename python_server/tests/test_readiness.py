@@ -15,6 +15,8 @@ def test_readiness_no_go_on_empty_day(tmp_path, monkeypatch):
     rec = out["recommendation"].lower()
     assert "practicing" in rec or "getting there" in rec or "looks ready" in rec
     assert "plain_english" in out
+    assert "session" in out
+    assert out["session"] == out["today"]
     ids = {c["id"] for c in out["checks"]}
     assert "scalp_sample" in ids
     assert "live_flag_off" in ids

@@ -565,12 +565,12 @@
         <div class="sublabel" id="m-unrealized-sub">still open</div>
       </div>
       <div class="metric">
-        <div class="label">Quick trades today <span class="hint" title="Scalps = short buy-then-sell bets on one token. This is the total fake profit/loss from those finished trades today. “Avg / trade” is the typical result per close.">?</span></div>
+        <div class="label">Quick trades <span class="hint" title="Scalps = short buy-then-sell bets on one token. Totals since your last Reset board (or server start), not UTC midnight.">?</span></div>
         <div class="val" id="m-scalp">—</div>
         <div class="sublabel" id="m-scalp-sub">closes · avg / trade</div>
       </div>
       <div class="metric">
-        <div class="label">Price-gap trades today <span class="hint" title="Arb = spotting the same token cheaper in one pool than another and booking a paper “buy low / sell high” fill. Separate from quick directional scalps.">?</span></div>
+        <div class="label">Price-gap trades <span class="hint" title="Arb = same token priced differently in two pools. Totals since your last Reset board (or server start).">?</span></div>
         <div class="val" id="m-arb">—</div>
         <div class="sublabel" id="m-arb-sub">fills · avg / fill</div>
       </div>
@@ -644,7 +644,7 @@
         <div><b>Chart agree? (TA)</b> — do RSI/MACD-style signals support the buy, or fight it?</div>
         <div><b>Active hunt / Watch only</b> — hunting tokens can be traded; watch-only are paused or cooling down.</div>
         <div><b>Readiness score</b> — checklist score for “is practice strong enough to consider real money?” Keep live trading off until it says ready.</div>
-        <div><b>Reset board</b> — archive today’s logs and start a clean practice score from $1000 again.</div>
+        <div><b>Reset board</b> — archive logs and start a new session from $1000 (trade totals count from that point, not midnight).</div>
         <div><b>Fees / slip</b> — trading isn’t free: pool fees plus price moving while you buy/sell. The bot subtracts these before calling something a good idea.</div>
         <div><b>Add-on lot</b> — if the bot already holds a coin and analysis still says “buy for profit,” it can open another separate ~$40 lot (each with its own take-profit / stop), as long as cash and book limits allow.</div>
       </div>
@@ -930,7 +930,7 @@
         fetch("/readiness").then(r => r.json()),
         fetch("/arb").then(r => r.json()),
       ]);
-      const t = ready.today || {};
+      const t = ready.session || ready.today || {};
       const eq = port.equity_usd;
       const eqPnl = port.equity_pnl_usd;
       setMetric("m-equity", fmtMoneyAbs(eq), pnlClass(eqPnl));
@@ -957,7 +957,7 @@
         `<span>auto-trader <b>${swarm.running ? "on" : "off"}</b> · ${swarm.ticks || 0} checks</span>` +
         `<span>finder <b>${(health.discover && health.discover.running) ? "on" : "off"}</b> · ${health.tokens_tradeable || 0} hunting / ${health.tokens_observe || 0} watching</span>` +
         `<span>price-gap <b>${arb.running ? "on" : "off"}</b> · ${arb.paper_fills || 0} fills</span>` +
-        `<span>bot opinions today <b>${t.decisions || 0}</b> · buys <b>${(t.actions && t.actions.buy) || 0}</b></span>`;
+        `<span>bot opinions <b>${t.decisions || 0}</b> · buys <b>${(t.actions && t.actions.buy) || 0}</b> this session</span>`;
 
       document.getElementById("swarm-toggle").textContent = swarm.running ? "Pause auto-trader" : "Start auto-trader";
 

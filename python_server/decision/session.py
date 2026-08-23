@@ -7,11 +7,10 @@ clears discover cool-offs, and zeroes arb session counters.
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Optional
 
 from decision import arb, discover, paper, pipeline_log
 from decision import store as decision_store
-
 
 KINDS = (
     "decisions",
@@ -21,10 +20,63 @@ KINDS = (
     "safety",
 )
 
+_started_at: Optional[str] = None
+
+
+def started_at_iso() -> str:
+    """UTC ISO timestamp for the active monitoring session."""
+    if _started_at is None:
+        bootstrap(reason="lazy_init")
+    return _started_at  # type: ignore[return-value]
+
+
+def started_at() -> datetime:
+    return datetime.fromisoformat(started_at_iso().replace("Z", "+00:00"))
+
+
+def bootstrap(*, reason: str = "server_boot") -> str:
+    """Begin a new monitoring session (server boot or first touch)."""
+    global _started_at
+    _started_at = datetime.now(timezone.utc).isoformat()
+    try:
+        decision_store.append(
+            "sessions",
+            {"event": "session_start", "reason": reason, "started_at": _started_at},
+        )
+    except OSError:
+        pass
+    return _started_at
+
+
+def begin_session(iso: str) -> None:
+    """Mark session boundary (reset board)."""
+    global _started_at
+    _started_at = iso
+
+
+def is_since(iso_ts: Optional[str]) -> bool:
+    """True when ``iso_ts`` falls inside the active session window."""
+    if not iso_ts:
+        return False
+    try:
+        ts = datetime.fromisoformat(str(iso_ts).replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    return ts >= started_at()
+
+
+def read_since(kind: str) -> list[dict[str, Any]]:
+    return list(decision_store.read_since(kind, started_at()))
+
+
+def count_since(kind: str) -> int:
+    return decision_store.count_since(kind, started_at())
+
 
 def reset_board(*, reason: str = "manual") -> dict[str, Any]:
     """Archive today + reset in-memory book for a clean performance window."""
     started = datetime.now(timezone.utc).isoformat()
+    begin_session(started)
     archived = decision_store.archive_today(KINDS)
     paper_snap = paper.reset(starting_cash_usd=1000.0)
     discover_cleared = discover.clear_rotation()
@@ -82,7 +134,7 @@ def reset_board(*, reason: str = "manual") -> dict[str, Any]:
             "error": scan.get("error"),
         },
         "note": (
-            "Today's prior JSONL logs were archived; readiness/scoreboard now "
-            "reflect only post-reset activity. Paper bankroll reset to $1000."
+            "Prior JSONL logs were archived; readiness and trade totals now "
+            "count only this session (since reset), not UTC midnight. Paper bankroll reset to $1000."
         ),
     }
