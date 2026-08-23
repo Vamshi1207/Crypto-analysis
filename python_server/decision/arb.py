@@ -57,6 +57,19 @@ MAX_FILLS_PER_MINT_DAY = _env_int("ARB_MAX_FILLS_PER_MINT_DAY", 0)
 REQUIRE_CROSS_DEX = os.getenv("ARB_REQUIRE_CROSS_DEX", "1").strip() == "1"
 # Only book if (gross * stress_frac - costs) still clears MIN_EDGE.
 STRESS_GAP_FRAC = _env_float("ARB_STRESS_GAP_FRAC", 0.5)
+# Which filter decides whether an opportunity is real.
+#
+# ``stress`` requires the halved DexScreener gap to clear the hurdle before we
+# spend a Jupiter quote. That is safe but it rejects almost everything, because
+# two pool mid prices rarely differ by (hurdle + cost) / stress_frac — so the
+# channel goes quiet and we learn nothing.
+#
+# ``jupiter`` treats the Dex gap as what it actually is, a cheap screen, and lets
+# the executable round-trip quote be the gate. Jupiter prices the real route
+# including impact, so it is strictly better evidence than two mids.
+PREFILTER_MODE = os.getenv("ARB_PREFILTER_MODE", "stress").strip().lower()
+# In ``jupiter`` mode, the Dex gap only has to be this wide to earn a quote.
+SCREEN_GROSS_PCT = _env_float("ARB_SCREEN_GROSS_PCT", 0.3)
 # Reject DexScreener mid prices implying impossible cross-pool gaps (bad/stale pool data).
 MAX_GROSS_PCT = _env_float("ARB_MAX_GROSS_PCT", 50.0)
 # Arb legs are two swaps; reuse the shared cost model (fees + slip + tip).
@@ -173,6 +186,8 @@ def status() -> dict[str, Any]:
                 "require_cross_dex": REQUIRE_CROSS_DEX,
                 "stress_gap_frac": STRESS_GAP_FRAC,
                 "max_gross_pct": MAX_GROSS_PCT,
+                "prefilter_mode": PREFILTER_MODE,
+                "screen_gross_pct": SCREEN_GROSS_PCT,
                 "require_jupiter": REQUIRE_JUPITER,
                 "max_jupiter_impact_pct": MAX_JUPITER_IMPACT_PCT,
                 "jupiter_impact_legs": JUPITER_IMPACT_LEGS,
@@ -363,19 +378,23 @@ def find_opportunities(mint: str, *, symbol: str = "") -> list[ArbOpportunity]:
     )
     if size is None:
         return []
-    if net < MIN_EDGE_PCT:
-        return []
-    if stress_net < MIN_EDGE_PCT:
-        pipeline_log.emit(
-            "arb",
-            "stress_skip",
-            level="warning",
-            mint=mint,
-            symbol=symbol or buy.symbol,
-            stress_net_pct=round(stress_net, 4),
-            need=MIN_EDGE_PCT,
-        )
-        return []
+    if PREFILTER_MODE == "jupiter":
+        if gross < SCREEN_GROSS_PCT:
+            return []
+    else:
+        if net < MIN_EDGE_PCT:
+            return []
+        if stress_net < MIN_EDGE_PCT:
+            pipeline_log.emit(
+                "arb",
+                "stress_skip",
+                level="warning",
+                mint=mint,
+                symbol=symbol or buy.symbol,
+                stress_net_pct=round(stress_net, 4),
+                need=MIN_EDGE_PCT,
+            )
+            return []
 
     return [
         ArbOpportunity(

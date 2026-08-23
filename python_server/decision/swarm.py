@@ -7,10 +7,19 @@ import time
 from collections import Counter
 from typing import Any, Callable, Optional
 
+import os
+
 from decision import paper
 from decision import pipeline_log
+from decision.config import paper_risk_on
 from decision.decide import decide
 from decision.schema import DecideMode
+
+# Paper: decide observe tokens once they have real (non-stub) candles.
+DECIDE_OBSERVE = os.getenv("SWARM_DECIDE_OBSERVE", "1").strip() == "1"
+# Discover already ran Gate 0 on the trade roster; re-running it every 12s
+# starves the tick. Paper risk-on skips the repeat unless the row is observe.
+RUN_SAFETY = os.getenv("SWARM_RUN_SAFETY", "0" if paper_risk_on() else "1").strip() == "1"
 
 try:
     from decision import discover as discover_mod
@@ -85,21 +94,24 @@ def _run(get_token_data: Callable[[], dict[str, Any]], interval_s: float, mode: 
                         closed = paper.mark_and_maybe_exit(address=address, mark_price=mark)
                         if closed:
                             paper_status["closed"] += len(closed)
-                    # Observe/cooled tokens stay on the dashboard but do not
-                    # burn decide/Gate-0 budget — only the trade roster decides.
+                    # Stub observe rows stay off the decide path. Pricefeed-
+                    # hydrated observe rows (and any tradeable) get a card so
+                    # the 20–40 name watchlist is not dead weight.
                     if live_token.get("discover") and live_token.get("tradeable") is False:
-                        paper_status["observe_skip"] += 1
-                        continue
-                    # Prefer densest available TF (5S/15S) — memecoins move in
-                    # seconds, not only on 1m Gecko bars.
+                        lite = bool(live_token.get("observe_lite"))
+                        cooled = bool(live_token.get("cooled"))
+                        if cooled or lite or not DECIDE_OBSERVE:
+                            paper_status["observe_skip"] += 1
+                            continue
                     tf = _pick_tf(live_token)
+                    safety = RUN_SAFETY or live_token.get("tradeable") is False
                     try:
                         card = decide(
                             address=address,
                             live_token=live_token,
                             mode=decide_mode,
                             timeframe=tf,
-                            run_safety=True,
+                            run_safety=safety,
                         )
                     except Exception as exc:  # noqa: BLE001
                         with _lock:

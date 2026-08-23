@@ -31,37 +31,66 @@ def test_gate_cost_matches_executor_cost():
 
 def test_gate_cost_includes_both_slippage_legs():
     """The old formula's specific hole: exit slippage was free."""
-    gate = _est_round_trip_cost_pct(slippage_bps=150.0)
-    assert gate > costs.DEFAULT_ENTRY_SLIP_PCT + costs.EXIT_SLIP_PCT
-    assert gate == pytest.approx(3.2, abs=1e-6)
+    entry_slip = 1.5
+    gate = _est_round_trip_cost_pct(slippage_bps=entry_slip * 100.0)
+    fixed = costs.ENTRY_FEE_PCT + costs.EXIT_FEE_PCT + costs.PRIORITY_TIP_PCT
+    assert gate == pytest.approx(entry_slip + costs.EXIT_SLIP_PCT + fixed, abs=1e-6)
+    # Both legs are present, so the total exceeds either slippage leg alone.
+    assert gate > entry_slip + costs.EXIT_SLIP_PCT
 
 
 def test_measured_impact_overrides_the_default():
     cheap = _est_round_trip_cost_pct(slippage_bps=10.0)
     dear = _est_round_trip_cost_pct(slippage_bps=900.0)
     assert cheap < dear
-    assert cheap == pytest.approx(0.1 + 0.3 + 0.3 + 1.0 + 0.1, abs=1e-6)
+    fixed = costs.ENTRY_FEE_PCT + costs.EXIT_FEE_PCT + costs.PRIORITY_TIP_PCT
+    assert cheap == pytest.approx(0.1 + costs.EXIT_SLIP_PCT + fixed, abs=1e-6)
+    # A measured impact is used instead of the pessimistic fallback.
+    assert cheap < _est_round_trip_cost_pct(slippage_bps=None)
 
 
 def test_barrier_moves_account_for_entry_slippage():
-    """A $1 target on $36.12 is a +5.6% move, not a +2.8% one."""
-    moves = costs.barrier_moves(size_usd=36.12, target_usd=1.0, stop_usd=1.5)
-    assert moves["target_from_fill_pct"] == pytest.approx(4.07, abs=0.02)
-    assert moves["target_from_quote_pct"] == pytest.approx(5.63, abs=0.02)
-    # The stop is far closer than the target: 1.4% vs 5.6%.
-    assert moves["stop_from_quote_pct"] == pytest.approx(-1.40, abs=0.02)
+    """The target is measured from the fill, which already sits above the quote."""
+    slip = 1.5
+    moves = costs.barrier_moves(
+        size_usd=36.12, target_usd=1.0, stop_usd=1.5, entry_slip_pct_=slip
+    )
+    exit_frac = costs.exit_cost_pct() / 100.0
+    expected_fill = (exit_frac + 1.0 / 36.12) * 100.0
+    assert moves["target_from_fill_pct"] == pytest.approx(expected_fill, abs=0.02)
+    # Entry slippage makes the move from the quote strictly larger.
+    assert moves["target_from_quote_pct"] > moves["target_from_fill_pct"] + slip - 0.1
+    # The stop is far closer than the target.
     assert abs(moves["stop_from_quote_pct"]) < moves["target_from_quote_pct"]
 
 
 def test_stop_inside_exit_cost_is_degenerate():
-    """$1.50 on a $200 position is less than the 1.3% exit cost."""
-    reason = costs.degenerate_stop_reason(size_usd=200.0, target_usd=1.0, stop_usd=1.5)
+    """A stop smaller than the exit cost on this size sits above the fill."""
+    stop = 1.5
+    # Size chosen so the exit cost alone exceeds the stop, whatever the config.
+    size = stop / (costs.exit_cost_pct() / 100.0) * 1.2
+    reason = costs.degenerate_stop_reason(size_usd=size, target_usd=1.0, stop_usd=stop)
     assert reason is not None
     assert "immediately" in reason
 
 
 def test_sane_barriers_are_not_flagged():
-    assert costs.degenerate_stop_reason(size_usd=36.12, target_usd=1.0, stop_usd=1.5) is None
+    stop = 1.5
+    # Comfortably smaller than the size at which the exit cost swallows the stop.
+    size = stop / (costs.exit_cost_pct() / 100.0) * 0.5
+    assert costs.degenerate_stop_reason(size_usd=size, target_usd=1.0, stop_usd=stop) is None
+
+
+def test_required_move_falls_as_size_rises():
+    """Why sizing decides tradability: the target's share of notional shrinks."""
+    small = costs.required_move_pct(size_usd=40.0, target_usd=1.0)
+    large = costs.required_move_pct(size_usd=200.0, target_usd=1.0)
+    assert small > large
+    cost = costs.round_trip_cost_pct()
+    assert small == pytest.approx(cost + 2.5, abs=1e-6)
+    assert large == pytest.approx(cost + 0.5, abs=1e-6)
+    # Cost is the floor no size can get under.
+    assert large > cost
 
 
 def test_executor_refuses_degenerate_barriers(monkeypatch):
@@ -69,12 +98,15 @@ def test_executor_refuses_degenerate_barriers(monkeypatch):
     from tests.test_risk_guards import _card
 
     monkeypatch.setattr(paper, "STOP_LOSS_USD", 1.5)
+    monkeypatch.setattr(paper, "STOP_LOSS_PCT", 0.0)
     monkeypatch.setattr(paper, "REENTRY_COOLDOWN_SEC", 0.0)
     paper.set_kill_switch(False)
 
+    # Big enough that the exit cost alone exceeds the flat $1.50 stop.
+    size = 1.5 / (costs.exit_cost_pct() / 100.0) * 1.5
     card = _card(address="DegeneratePool111")
-    card.position.max_size_usd = 500.0
-    monkeypatch.setattr("decision.paper.SCALP_SIZE_USD", 500.0)
+    card.position.max_size_usd = size
+    monkeypatch.setattr("decision.paper.SCALP_SIZE_USD", size)
 
     result = paper.execute_decision(card, mark_price=1.0)
     assert result["status"] == "refused"
@@ -113,6 +145,7 @@ def test_executor_skips_when_median_cannot_reach_target(monkeypatch):
 
     monkeypatch.setattr(paper, "REENTRY_COOLDOWN_SEC", 0.0)
     monkeypatch.setattr(paper, "TARGET_PROFIT_USD", 1.0)
+    monkeypatch.setenv("PAPER_RISK_ON", "0")
     paper.set_kill_switch(False)
 
     # +7% median clears the barrier on $36 but not on $15.
@@ -124,4 +157,19 @@ def test_executor_skips_when_median_cannot_reach_target(monkeypatch):
 
     card = _card(address="BigEnoughPool111", band=(-5.0, 7.0, 20.0))
     card.position.max_size_usd = 36.12
+    assert paper.execute_decision(card, mark_price=1.0)["status"] == "opened"
+
+
+def test_paper_risk_on_skips_median_hurdle(monkeypatch):
+    from tests.test_risk_guards import _card
+
+    monkeypatch.setattr(paper, "REENTRY_COOLDOWN_SEC", 0.0)
+    monkeypatch.setattr(paper, "TARGET_PROFIT_USD", 1.0)
+    monkeypatch.setenv("PAPER_RISK_ON", "1")
+    monkeypatch.setenv("LIVE_TRADING", "0")
+    paper.set_kill_switch(False)
+    paper.reset()
+
+    card = _card(address="RiskOnSmall111", band=(-5.0, 7.0, 20.0))
+    card.position.max_size_usd = 15.0
     assert paper.execute_decision(card, mark_price=1.0)["status"] == "opened"

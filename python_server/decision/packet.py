@@ -263,6 +263,11 @@ COVERAGE_TARGET = _env_float("DECIDE_COVERAGE_TARGET", 0.8)
 MIN_HISTORY_BARS = _env_int("DECIDE_MIN_HISTORY_BARS", 16)
 SCALP_SIZE_USD = _env_float("DECIDE_SCALP_SIZE_USD", 40.0)
 TARGET_PROFIT_USD = _env_float("DECIDE_TARGET_PROFIT_USD", 1.0)
+# Floor on the confidence multiplier applied to scalp size. Because the profit
+# target is a fixed dollar amount, shrinking size raises the percent move the
+# trade must catch — so sizing down on low confidence makes the trade harder to
+# win, not safer.
+MIN_SIZE_FRACTION = _env_float("DECIDE_MIN_SIZE_FRACTION", 0.25)
 # Paper-only: Gate 2 uses this fraction of the $1 target (live uses 1.0).
 PAPER_GATE2_EDGE_FRACTION = _env_float("PAPER_GATE2_EDGE_FRACTION", 0.55)
 MAX_SLIPPAGE_BPS = _env_float("DECIDE_MAX_SLIPPAGE_BPS", 1200.0)

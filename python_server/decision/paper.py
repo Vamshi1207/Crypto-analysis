@@ -18,7 +18,7 @@ from decision import costs
 from decision import pipeline_log
 from decision import session as session_scope
 from decision import store as decision_store
-from decision.config import _env_float, _env_int
+from decision.config import _env_float, _env_int, paper_risk_on
 from decision.packet import SCALP_SIZE_USD, TARGET_PROFIT_USD
 from decision.schema import Action, DecisionCard
 
@@ -26,7 +26,28 @@ LIVE_TRADING = os.getenv("LIVE_TRADING", "0") == "1"
 MAX_OPEN_POSITIONS = _env_int("PAPER_MAX_OPEN", 5)
 MAX_NOTIONAL_USD = _env_float("PAPER_MAX_NOTIONAL_USD", 200.0)
 STOP_LOSS_USD = _env_float("PAPER_STOP_LOSS_USD", 1.5)
+# When > 0 the stop scales with position size instead of being a flat dollar
+# amount. A fixed $1.50 stop on a larger clip is inside normal memecoin noise,
+# so every position would stop out before its thesis had room to play out.
+STOP_LOSS_PCT = _env_float("PAPER_STOP_LOSS_PCT", 0.0)
 MAX_HOLD_SEC = _env_float("PAPER_MAX_HOLD_SEC", 600.0)
+# Trailing take-profit. Closing every winner at exactly +$1 caps the runners
+# that pay for the losers, which is the whole edge in momentum scalping.
+TRAIL_ENABLED = os.getenv("PAPER_TRAIL_ENABLED", "0").strip() == "1"
+# Profit that arms the trail (defaults to the normal target).
+TRAIL_ARM_USD = _env_float("PAPER_TRAIL_ARM_USD", 0.0)
+# Percent of size we let a winner give back from its peak before banking.
+TRAIL_GIVEBACK_PCT = _env_float("PAPER_TRAIL_GIVEBACK_PCT", 1.0)
+# Also give back at least this fraction of the peak (0.35 = keep 65% of the run).
+TRAIL_GIVEBACK_OF_PEAK = _env_float("PAPER_TRAIL_GIVEBACK_OF_PEAK", 0.35)
+# Ignore a single mark that jumps more than this % of size vs the last accepted
+# PnL — Dex mids on new memecoins print 50%+ ghosts that used to arm the trail
+# and then "take profit" at a loss when the next tick is real.
+TRAIL_MAX_JUMP_PCT = _env_float("PAPER_TRAIL_MAX_JUMP_PCT", 15.0)
+# First seconds after a fill: a mark that is this far from entry is a different
+# venue, not a dump. Used to be an instant -$1.60 stop on every launch.
+STOP_GRACE_SEC = _env_float("PAPER_STOP_GRACE_SEC", 12.0)
+ENTRY_CONFIRM_PCT = _env_float("PAPER_ENTRY_CONFIRM_PCT", 8.0)
 KILL_SWITCH = os.getenv("PAPER_KILL_SWITCH", "0") == "1"
 # Quiet period after a close before the same token may be re-entered.
 # 0 = off — if Gate 2 still sees edge, paper may re-buy immediately.
@@ -77,6 +98,18 @@ class PaperPosition:
     closed_at: Optional[str] = None
     close_reason: Optional[str] = None
     fills: list[dict[str, Any]] = field(default_factory=list)
+    # Trailing state: best mark PnL seen and whether the trail is live.
+    peak_pnl_usd: float = 0.0
+    trail_armed: bool = False
+    last_mark_pnl_usd: float = 0.0
+    entry_reason: Optional[str] = None
+    max_hold_sec: Optional[float] = None
+    # Sniper: bank the dollar target and leave. Cluster/forecast still trail.
+    bank_at_target: bool = False
+    take_profit_pct: float = 0.0
+    # Situation hold: scratch a dead tape early; only clock-stop if stalled.
+    dead_after_sec: Optional[float] = None
+    abs_hold_sec: Optional[float] = None
     # Forecast snapshot at entry — feeds the live calibration loop.
     predicted_p10: Optional[float] = None
     predicted_p50: Optional[float] = None
@@ -105,6 +138,9 @@ _state = PortfolioState(kill_switch=KILL_SWITCH, live_trading_blocked=not LIVE_T
 def snapshot() -> dict[str, Any]:
     with _lock:
         scalp_realized = _state.realized_pnl_usd - _state.arb_realized_pnl_usd
+        sniper_closed = [p for p in _state.closed if p.entry_reason == "snipe"]
+        sniper_open = [p for p in _state.open if p.entry_reason == "snipe"]
+        sniper_realized = sum(float(p.realized_pnl_usd or 0.0) for p in sniper_closed)
         return {
             "cash_usd": _state.cash_usd,
             "realized_pnl_usd": _state.realized_pnl_usd,
@@ -118,6 +154,12 @@ def snapshot() -> dict[str, Any]:
             "live_trading": LIVE_TRADING,
             "open": [asdict(p) for p in _state.open],
             "closed_recent": [asdict(p) for p in _state.closed[-20:]],
+            "sniper": {
+                "open_count": len(sniper_open),
+                "closed_count": len(sniper_closed),
+                "realized_pnl_usd": round(sniper_realized, 4),
+                "closed_recent": [asdict(p) for p in sniper_closed[-12:]],
+            },
             "limits": {
                 "max_open": MAX_OPEN_POSITIONS,
                 "max_notional_usd": MAX_NOTIONAL_USD,
@@ -134,6 +176,20 @@ def snapshot() -> dict[str, Any]:
                 "max_open_lots_per_address": MAX_OPEN_LOTS_PER_ADDRESS,
                 "block_add_on_if_open_losing": BLOCK_ADD_ON_IF_OPEN_LOSING,
                 "block_repeat_mint_after_stop": BLOCK_REPEAT_MINT_AFTER_STOP,
+                "stop_loss_pct": STOP_LOSS_PCT,
+                "trail_enabled": TRAIL_ENABLED,
+                "trail_arm_usd": TRAIL_ARM_USD or TARGET_PROFIT_USD,
+                "trail_giveback_pct": TRAIL_GIVEBACK_PCT,
+                "trail_giveback_of_peak": TRAIL_GIVEBACK_OF_PEAK,
+                "trail_max_jump_pct": TRAIL_MAX_JUMP_PCT,
+                "stop_grace_sec": STOP_GRACE_SEC,
+                "entry_confirm_pct": ENTRY_CONFIRM_PCT,
+                "required_move_pct": round(
+                    costs.required_move_pct(
+                        size_usd=SCALP_SIZE_USD, target_usd=TARGET_PROFIT_USD
+                    ),
+                    4,
+                ),
             },
         }
 
@@ -162,6 +218,159 @@ def reset(*, starting_cash_usd: float = 1_000.0) -> dict[str, Any]:
         cash_usd=starting_cash_usd,
     )
     return snapshot()
+
+
+def execute_signal(
+    *,
+    address: str,
+    mint: str,
+    name: str,
+    mark_price: float,
+    size_usd: float,
+    strategy: str,
+    max_hold_sec: Optional[float] = None,
+    extra: Optional[dict[str, Any]] = None,
+    target_profit_usd: Optional[float] = None,
+    bank_at_target: bool = False,
+    stop_loss_usd: Optional[float] = None,
+    take_profit_pct: float = 0.0,
+    dead_after_sec: Optional[float] = None,
+    abs_hold_sec: Optional[float] = None,
+) -> dict[str, Any]:
+    """Open a paper lot from a launch/cluster signal (no DecisionCard)."""
+    if LIVE_TRADING:
+        return {"status": "refused", "reason": "LIVE_TRADING=1 is blocked in this build"}
+    if _state.kill_switch or KILL_SWITCH:
+        return {"status": "refused", "reason": "kill switch on"}
+    if mark_price <= 0 or size_usd <= 0:
+        return {"status": "refused", "reason": "bad price or size"}
+
+    slip_pct = costs.entry_slip_pct()
+    stop_usd = float(stop_loss_usd) if stop_loss_usd is not None else stop_loss_for_size(size_usd)
+    target_usd = float(target_profit_usd) if target_profit_usd is not None else TARGET_PROFIT_USD
+    fill_price = mark_price * (1.0 + slip_pct / 100.0)
+    fee_usd = size_usd * costs.ENTRY_FEE_PCT / 100.0
+    notional = size_usd + fee_usd
+    qty = size_usd / fill_price
+
+    with _lock:
+        already = [p for p in _state.open if p.address == address and p.status == "open"]
+        if already and not ALLOW_ADD_ON:
+            return {"status": "skipped", "reason": "already open for address"}
+        if len(already) >= MAX_OPEN_LOTS_PER_ADDRESS:
+            return {"status": "skipped", "reason": f"max {MAX_OPEN_LOTS_PER_ADDRESS} lots"}
+        if len(_state.open) >= MAX_OPEN_POSITIONS:
+            return {"status": "refused", "reason": "max open positions"}
+        open_notional = sum(p.size_usd for p in _state.open)
+        if open_notional + size_usd > MAX_NOTIONAL_USD:
+            return {"status": "refused", "reason": "max notional"}
+        if _state.cash_usd < notional:
+            return {"status": "refused", "reason": "insufficient paper cash"}
+        _state.cash_usd -= notional
+        pos = PaperPosition(
+            id=str(uuid.uuid4())[:8],
+            address=address,
+            mint=mint,
+            name=name,
+            entry_price=fill_price,
+            size_usd=size_usd,
+            qty=qty,
+            opened_at=datetime.now(timezone.utc).isoformat(),
+            target_profit_usd=target_usd,
+            stop_loss_usd=stop_usd,
+            entry_reason=strategy,
+            max_hold_sec=max_hold_sec,
+            bank_at_target=bool(bank_at_target),
+            take_profit_pct=float(take_profit_pct or 0.0),
+            dead_after_sec=float(dead_after_sec) if dead_after_sec else None,
+            abs_hold_sec=float(abs_hold_sec) if abs_hold_sec else None,
+            fills=[
+                asdict(
+                    PaperFill(
+                        side="buy",
+                        price=fill_price,
+                        size_usd=size_usd,
+                        fee_usd=fee_usd,
+                        slippage_pct=slip_pct,
+                        ts=datetime.now(timezone.utc).isoformat(),
+                    )
+                )
+            ],
+            timeframe=strategy,
+            horizon_bars=0,
+        )
+        _state.open.append(pos)
+        record = {
+            "event": "open",
+            "strategy": strategy,
+            "position": asdict(pos),
+            "extra": extra or {},
+        }
+        try:
+            decision_store.append("paper", record)
+        except OSError:
+            pass
+        pipeline_log.emit(
+            "paper",
+            "open",
+            address=address,
+            mint=mint,
+            symbol=name,
+            size_usd=size_usd,
+            strategy=strategy,
+        )
+        return {"status": "opened", "position": asdict(pos), "cash_usd": round(_state.cash_usd, 4)}
+
+
+def close_by_mint(*, mint: str, mark_price: float, reason: str) -> list[dict[str, Any]]:
+    """Force-close every open lot on ``mint`` (cluster-sell / creator dump)."""
+    if mark_price <= 0:
+        return []
+    mint = (mint or "").strip()
+    if not mint:
+        return []
+    closed: list[dict[str, Any]] = []
+    now = time.time()
+    with _lock:
+        still: list[PaperPosition] = []
+        for pos in _state.open:
+            if (pos.mint or "") != mint or pos.status != "open":
+                still.append(pos)
+                continue
+            exit_fee_frac = costs.EXIT_FEE_PCT / 100.0
+            exit_slip_frac = costs.EXIT_SLIP_PCT / 100.0
+            pnl = pos.qty * mark_price - pos.size_usd - pos.size_usd * (
+                exit_fee_frac + exit_slip_frac
+            )
+            proceeds = pos.qty * mark_price - pos.size_usd * (exit_fee_frac + exit_slip_frac)
+            opened = _parse_ts(pos.opened_at)
+            held = now - opened if opened else 0.0
+            _state.cash_usd += proceeds
+            _state.realized_pnl_usd += pnl
+            pos.status = "closed"
+            pos.exit_price = mark_price
+            pos.realized_pnl_usd = round(pnl, 4)
+            pos.closed_at = datetime.now(timezone.utc).isoformat()
+            pos.close_reason = reason
+            _state.closed.append(pos)
+            try:
+                decision_store.append("paper", {"event": "close", "position": asdict(pos)})
+            except OSError:
+                pass
+            pipeline_log.emit(
+                "paper",
+                "close",
+                address=pos.address,
+                mint=pos.mint,
+                symbol=pos.name,
+                position_id=pos.id,
+                realized_pnl_usd=pos.realized_pnl_usd,
+                reason=reason,
+                held_sec=round(held, 1),
+            )
+            closed.append(asdict(pos))
+        _state.open = still
+    return closed
 
 
 def execute_arb_fill(
@@ -330,12 +539,14 @@ def _execute_decision_inner(
         impact = sell.get("price_impact_pct")
     slip_pct = costs.entry_slip_pct(price_impact_pct=impact)
 
+    stop_usd = stop_loss_for_size(size)
+
     # Barriers that cannot be reached in the intended direction are a config
     # error, not a trade: refuse rather than open a guaranteed loss.
     degenerate = costs.degenerate_stop_reason(
         size_usd=size,
         target_usd=TARGET_PROFIT_USD,
-        stop_usd=STOP_LOSS_USD,
+        stop_usd=stop_usd,
         entry_slip_pct_=slip_pct,
     )
     if degenerate:
@@ -347,12 +558,23 @@ def _execute_decision_inner(
     moves = costs.barrier_moves(
         size_usd=size,
         target_usd=TARGET_PROFIT_USD,
-        stop_usd=STOP_LOSS_USD,
+        stop_usd=stop_usd,
         entry_slip_pct_=slip_pct,
     )
     needed = moves["target_from_quote_pct"]
     median = card.expected_return_pct.p50 if card.expected_return_pct else None
-    if median is not None and median < needed:
+    notes = getattr(card, "notes", None) or {}
+    momentum_entry = bool(notes.get("momentum_entry"))
+    # A momentum entry is taken on tape, not on the forecast median, so the
+    # median-vs-target check would veto exactly the setups it exists to catch.
+    # Paper risk-on: Gate 2 already cleared; don't re-veto on a second hurdle
+    # that exists to keep live size honest.
+    if (
+        median is not None
+        and median < needed
+        and not momentum_entry
+        and not paper_risk_on()
+    ):
         return {
             "status": "skipped",
             "reason": (
@@ -410,7 +632,8 @@ def _execute_decision_inner(
             qty=qty,
             opened_at=datetime.now(timezone.utc).isoformat(),
             target_profit_usd=TARGET_PROFIT_USD,
-            stop_loss_usd=STOP_LOSS_USD,
+            stop_loss_usd=stop_usd,
+            entry_reason="momentum" if momentum_entry else "forecast",
             fills=[
                 asdict(
                     PaperFill(
@@ -491,17 +714,110 @@ def mark_and_maybe_exit(
             exit_price = mark_price
             pnl = mark_pnl
 
-            if mark_pnl >= pos.target_profit_usd:
-                # Bank at least the target; if mark overshoots, keep the overshoot.
-                reason = f"target_profit ${mark_pnl:.2f}"
+            # Grace is only for launch/cluster Gecko→Dex venue gaps. A sniper
+            # marks the same Pump curve it bought — a 50% print is a dump.
+            suppress_stop = (
+                pos.entry_reason in ("launch", "cluster")
+                and _venue_gap(pos.entry_price, mark_price)
+                and held < STOP_GRACE_SEC
+            )
+
+            max_jump = pos.size_usd * TRAIL_MAX_JUMP_PCT / 100.0
+            last_accepted = pos.last_mark_pnl_usd
+            # Climb toward a huge up-print in steps so a real runner can arm
+            # the trail. A single +$80 ghost still cannot become the peak in
+            # one tick. Never skip the rest of the tick — that froze
+            # gamerfaroe through a 300k→15k rug past its 300s max-hold.
+            if mark_pnl - last_accepted > max_jump:
+                decision_pnl = last_accepted + max_jump
+            else:
+                decision_pnl = mark_pnl
+            pos.last_mark_pnl_usd = decision_pnl
+            if decision_pnl > pos.peak_pnl_usd:
+                pos.peak_pnl_usd = decision_pnl
+
+            hold_limit = pos.max_hold_sec if pos.max_hold_sec else MAX_HOLD_SEC
+            abs_limit = pos.abs_hold_sec if pos.abs_hold_sec else None
+            situational = pos.dead_after_sec is not None
+            stalled = pos.peak_pnl_usd <= 0 or decision_pnl <= 0
+
+            # Stop first on the real mark. Dumps are down-jumps and always apply.
+            # A first-tick venue gap only suppresses the stop — a sniper can
+            # still bank the dollar if the print ran.
+            if mark_pnl <= -pos.stop_loss_usd and not suppress_stop:
+                exit_price, pnl, reason = _resolve_stop_exit(
+                    pos, mark_price, mark_pnl, exit_cost_frac
+                )
+            elif pos.bank_at_target and (
+                (
+                    (pos.take_profit_pct or 0.0) > 0
+                    and mark_pnl >= pos.size_usd * pos.take_profit_pct / 100.0
+                )
+                or decision_pnl >= pos.target_profit_usd
+            ):
+                rip = pos.size_usd * (pos.take_profit_pct or 0.0) / 100.0
+                if rip > 0 and mark_pnl >= rip:
+                    pnl = rip
+                    reason = f"snipe_rip ${pnl:.2f}"
+                else:
+                    pnl = pos.target_profit_usd
+                    reason = f"snipe_target ${pnl:.2f}"
+                exit_price = _implied_exit_price(pos, pnl, exit_cost_frac)
+            elif (
+                situational
+                and pos.dead_after_sec
+                and pos.peak_pnl_usd <= 0
+                and held >= pos.dead_after_sec
+            ):
+                if mark_pnl <= -pos.stop_loss_usd:
+                    exit_price, pnl, reason = _resolve_stop_exit(
+                        pos, mark_price, mark_pnl, exit_cost_frac
+                    )
+                    reason = f"dead_tape {held:.0f}s {reason}"
+                elif _venue_gap(pos.entry_price, mark_price):
+                    pnl = last_accepted
+                    exit_price = _implied_exit_price(pos, pnl, exit_cost_frac)
+                    reason = (
+                        f"dead_tape {held:.0f}s pnl=${pnl:.2f} "
+                        f"(unconfirmed mark ${mark_pnl:.2f})"
+                    )
+                else:
+                    reason = f"dead_tape {held:.0f}s pnl=${mark_pnl:.2f}"
+                    exit_price = mark_price
+                    pnl = mark_pnl
+            elif abs_limit and held >= abs_limit:
+                reason = f"abs_hold {held:.0f}s pnl=${mark_pnl:.2f}"
                 exit_price = mark_price
                 pnl = mark_pnl
-            elif mark_pnl <= -pos.stop_loss_usd:
-                exit_price, pnl, reason = _resolve_stop_exit(pos, mark_price, mark_pnl, exit_cost_frac)
-            elif held >= MAX_HOLD_SEC:
-                reason = f"max_hold {held:.0f}s pnl=${mark_pnl:.2f}"
-                exit_price = mark_price
-                pnl = mark_pnl
+            elif held >= hold_limit and (not situational or stalled):
+                if mark_pnl - last_accepted > max_jump:
+                    pnl = last_accepted
+                    exit_price = _implied_exit_price(pos, pnl, exit_cost_frac)
+                    reason = (
+                        f"max_hold {held:.0f}s pnl=${pnl:.2f} "
+                        f"(unconfirmed mark ${mark_pnl:.2f})"
+                    )
+                else:
+                    reason = f"max_hold {held:.0f}s pnl=${mark_pnl:.2f}"
+                    exit_price = mark_price
+                    pnl = mark_pnl
+            elif pos.bank_at_target:
+                trailed = _trail_exit(pos, decision_pnl) if TRAIL_ENABLED else None
+                if trailed is not None:
+                    pnl, reason = trailed
+                    exit_price = _implied_exit_price(pos, pnl, exit_cost_frac)
+            else:
+                trailed = _trail_exit(pos, decision_pnl) if TRAIL_ENABLED else None
+                if trailed is not None:
+                    pnl, reason = trailed
+                    exit_price = _implied_exit_price(pos, pnl, exit_cost_frac)
+                elif TRAIL_ENABLED and pos.trail_armed:
+                    still_open.append(pos)
+                    continue
+                elif mark_pnl >= pos.target_profit_usd and not TRAIL_ENABLED:
+                    reason = f"target_profit ${mark_pnl:.2f}"
+                    exit_price = mark_price
+                    pnl = mark_pnl
 
             if reason is None:
                 still_open.append(pos)
@@ -602,6 +918,73 @@ def _resolve_stop_exit(
         barrier,
         -stop,
         f"stop_loss $-{stop:.2f} (barrier; mark would be ${mark_pnl:.2f})",
+    )
+
+
+def _implied_exit_price(pos: PaperPosition, pnl: float, exit_cost_frac: float) -> float:
+    """Mark that realizes ``pnl`` after exit costs. Used when we refuse a ghost mid."""
+    if pos.qty <= 0:
+        return pos.entry_price
+    return (pnl + pos.size_usd * (1.0 + exit_cost_frac)) / pos.qty
+
+
+def _venue_gap(entry_price: float, mark_price: float) -> bool:
+    """True when the mark is a different print than the fill, not a small move."""
+    if entry_price <= 0 or mark_price <= 0:
+        return False
+    return abs(mark_price / entry_price - 1.0) * 100.0 > ENTRY_CONFIRM_PCT
+
+
+def stop_loss_for_size(size_usd: float) -> float:
+    """Dollar stop for a position of ``size_usd``.
+
+    Percent mode keeps the stop outside exit costs as size changes; the flat
+    dollar stop is kept as the default so existing behaviour is unchanged.
+    """
+    if STOP_LOSS_PCT > 0:
+        return round(max(size_usd * STOP_LOSS_PCT / 100.0, 0.01), 4)
+    return STOP_LOSS_USD
+
+
+def _trail_exit(pos: PaperPosition, mark_pnl: float) -> Optional[tuple[float, str]]:
+    """Decide whether a trailing winner should bank now.
+
+    Returns ``(pnl, reason)`` when the trail has been hit, else None. Arming is
+    sticky: once a position has paid the arm amount we stop taking the fixed
+    target and manage it on giveback from the peak instead.
+
+    A single Dex print that jumps more than ``TRAIL_MAX_JUMP_PCT`` of size is
+    treated as stale and ignored. A trail never books a close below the arm —
+    that is the stop's job, not a take-profit.
+    """
+    arm = TRAIL_ARM_USD if TRAIL_ARM_USD > 0 else pos.target_profit_usd
+    max_jump = pos.size_usd * TRAIL_MAX_JUMP_PCT / 100.0
+    prev = pos.last_mark_pnl_usd
+    if mark_pnl - prev > max_jump:
+        # Ghost mid. Keep the last accepted peak; do not arm on a spike.
+        return None
+
+    pos.last_mark_pnl_usd = mark_pnl
+    if not pos.trail_armed and mark_pnl < arm:
+        return None
+
+    pos.trail_armed = True
+    pos.peak_pnl_usd = max(pos.peak_pnl_usd, mark_pnl)
+    size_giveback = pos.size_usd * TRAIL_GIVEBACK_PCT / 100.0
+    peak_giveback = pos.peak_pnl_usd * TRAIL_GIVEBACK_OF_PEAK
+    giveback = max(size_giveback, peak_giveback)
+    floor = max(arm, pos.peak_pnl_usd - giveback)
+    if mark_pnl > floor:
+        return None
+    if mark_pnl < arm:
+        # Peak was a ghost or the tape dumped through the trail. Disarm and
+        # let the stop / max-hold handle the loser — do not label it a TP.
+        pos.trail_armed = False
+        pos.peak_pnl_usd = max(0.0, mark_pnl)
+        return None
+    return mark_pnl, (
+        f"trail_take_profit ${mark_pnl:.2f} (peak ${pos.peak_pnl_usd:.2f}, "
+        f"gave back ${pos.peak_pnl_usd - mark_pnl:.2f})"
     )
 
 

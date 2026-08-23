@@ -270,6 +270,12 @@ def _risk_committee(
     review = DeskReview()
     buy_w = sum(o.weight for o in opinions if o.vote == "buy")
     avoid_w = sum(o.weight for o in opinions if o.vote == "avoid")
+    # A momentum entry is taken *because* the forecast has nothing to say, so
+    # vetoing it for weak forecast edge or low ensemble agreement would cancel
+    # the path entirely — those two checks describe the forecast, not the risk.
+    # Everything about actual risk (safety, exit route, specialist consensus,
+    # implausible bands) still applies, plus a blowoff check below.
+    momentum_entry = bool((card.notes or {}).get("momentum_entry"))
 
     if packet.safety and packet.safety.blocking:
         review.risk_pass = False
@@ -280,15 +286,23 @@ def _risk_committee(
     if avoid_w >= buy_w + 1.5 and card.action is Action.BUY:
         review.risk_pass = False
         review.veto_reasons.append(f"specialist avoid weight {avoid_w:.1f} > buy {buy_w:.1f}")
-    if card.cost_adjusted_edge_pct < 0 and card.action is Action.BUY:
+    if card.cost_adjusted_edge_pct < 0 and card.action is Action.BUY and not momentum_entry:
         review.risk_pass = False
         review.veto_reasons.append("negative cost-adjusted edge")
     agree = card.forecast.agreement if card.forecast else 1.0
-    if card.action is Action.BUY and agree < MIN_AGREEMENT_TO_BUY:
+    if card.action is Action.BUY and agree < MIN_AGREEMENT_TO_BUY and not momentum_entry:
         review.risk_pass = False
         review.veto_reasons.append(
             f"ensemble agreement {agree:.2f} < {MIN_AGREEMENT_TO_BUY:.2f} — no directional signal"
         )
+    if momentum_entry and card.action is Action.BUY:
+        blowoff = _blowoff_return_pct(card, packet)
+        if blowoff is not None and blowoff > BLOWOFF_RETURN_PCT:
+            review.risk_pass = False
+            review.veto_reasons.append(
+                f"momentum entry into a blowoff: window return {blowoff:+.1f}% "
+                f"> {BLOWOFF_RETURN_PCT:.0f}%"
+            )
     # A band that cannot lose is a calibration failure, not an opportunity.
     band = card.expected_return_pct
     if card.action is Action.BUY and band and band.p10 > 0:
@@ -303,6 +317,15 @@ def _risk_committee(
         review.action_override = Action.HOLD
         review.warnings.append("weak specialist buy consensus → hold")
     return review
+
+
+def _blowoff_return_pct(card: DecisionCard, packet: MarketPacket) -> Optional[float]:
+    """Trailing return over the decision window, or None without enough closes."""
+    tf = packet.timeframes.get(card.timeframe)
+    closes = [r.get("close") for r in (tf.ohlcv_tail if tf else []) if r.get("close") is not None]
+    if len(closes) < 8 or not closes[0]:
+        return None
+    return (closes[-1] / closes[0] - 1.0) * 100.0
 
 
 def _deep_agy_review(card: DecisionCard, packet: MarketPacket) -> Optional[dict[str, Any]]:

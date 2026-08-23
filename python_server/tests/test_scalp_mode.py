@@ -41,4 +41,11 @@ def test_dollar_edge_for_one_dollar_target():
     need = min_edge_pct_for_target(size_usd=40.0, target_usd=1.0)
     assert need == 2.5
     assert expected_profit_usd(2.5, size_usd=40.0) == 1.0
-    assert expected_profit_usd(1.0, size_usd=SCALP_SIZE_USD) < TARGET_PROFIT_USD
+    # A bigger clip needs a smaller edge for the same dollar target.
+    assert min_edge_pct_for_target(size_usd=200.0, target_usd=1.0) < need
+    # The configured size must be able to reach the configured target at the
+    # edge the gate asks for.
+    configured = min_edge_pct_for_target(
+        size_usd=SCALP_SIZE_USD, target_usd=TARGET_PROFIT_USD
+    )
+    assert expected_profit_usd(configured, size_usd=SCALP_SIZE_USD) >= TARGET_PROFIT_USD

@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 from decision import arb, discover, paper, pipeline_log
+from decision import trenches
 from decision import store as decision_store
 
 KINDS = (
@@ -81,6 +82,7 @@ def reset_board(*, reason: str = "manual") -> dict[str, Any]:
     paper_snap = paper.reset(starting_cash_usd=1000.0)
     discover_cleared = discover.clear_rotation()
     arb_snap = arb.reset_counters()
+    trench_snap = trenches.reset_counters()
 
     marker = {
         "event": "session_reset",
@@ -96,6 +98,11 @@ def reset_board(*, reason: str = "manual") -> dict[str, Any]:
         "arb": {
             "paper_fills": arb_snap.get("paper_fills"),
             "realized_pnl_usd": arb_snap.get("realized_pnl_usd"),
+        },
+        "trenches": {
+            "launch_opens": trench_snap.get("launch_opens"),
+            "cluster_opens": trench_snap.get("cluster_opens"),
+            "sniper_opens": trench_snap.get("sniper_opens"),
         },
     }
     try:
@@ -126,6 +133,7 @@ def reset_board(*, reason: str = "manual") -> dict[str, Any]:
         "paper": paper_snap,
         "discover_cleared": discover_cleared,
         "arb": arb_snap,
+        "trenches": trench_snap,
         "discover_scan": {
             "status": scan.get("status"),
             "trade_n": scan.get("trade_n"),

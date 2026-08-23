@@ -717,6 +717,10 @@ def portfolio_endpoint():
     snap["total_pnl_usd"] = round(realized + unrealized, 4)
     snap["equity_pnl_usd"] = round(equity - starting, 4)
     snap["starting_cash_usd"] = starting
+    sniper = dict(snap.get("sniper") or {})
+    sniper["open"] = [r for r in open_enriched if r.get("entry_reason") == "snipe"]
+    sniper["open_count"] = len(sniper["open"])
+    snap["sniper"] = sniper
     return jsonify(snap)
 
 
@@ -792,6 +796,75 @@ def pipeline_endpoint():
             "events": rows,
         }
     )
+
+
+@app.route('/funnel', methods=["GET", "OPTIONS"])
+def funnel_endpoint():
+    """Session drop-off from discovery to fill, plus the roster it ran on."""
+    if request.method == "OPTIONS":
+        return _build_cors_preflight_response()
+    from decision import paper, pipeline_log, pricefeed
+
+    roster = {"trade": [], "observe": []}
+    for address, token in token_data.items():
+        if not isinstance(token, dict):
+            continue
+        bucket = "observe" if token.get("tradeable") is False else "trade"
+        bars = max(
+            (len(rows) for rows in (token.get("timeframes") or {}).values() if rows),
+            default=0,
+        )
+        roster[bucket].append(
+            {
+                "address": address,
+                "symbol": token.get("name"),
+                "mint": token.get("mint"),
+                "bars": bars,
+                "candle_source": token.get("candle_source"),
+                "liquidity_usd": token.get("liquidity_usd"),
+                "cooled": bool(token.get("cooled")),
+            }
+        )
+
+    port = paper.snapshot()
+    return jsonify(
+        {
+            **pipeline_log.funnel(),
+            "roster": {
+                "trade_n": len(roster["trade"]),
+                "observe_n": len(roster["observe"]),
+                "trade": sorted(roster["trade"], key=lambda r: -(r["bars"] or 0))[:40],
+                "observe": sorted(roster["observe"], key=lambda r: -(r["bars"] or 0))[:40],
+            },
+            "pricefeed": pricefeed.status(),
+            "paper": {
+                "cash_usd": port.get("cash_usd"),
+                "open_count": port.get("open_count"),
+                "realized_pnl_usd": port.get("realized_pnl_usd"),
+                "limits": port.get("limits"),
+            },
+        }
+    )
+
+
+@app.route('/trenches', methods=["GET", "POST", "OPTIONS"])
+def trenches_endpoint():
+    """Paper launch + smart-money cluster channel."""
+    if request.method == "OPTIONS":
+        return _build_cors_preflight_response()
+    from decision import trenches
+
+    if request.method == "GET":
+        return jsonify(trenches.status())
+    body = request.get_json(silent=True) or {}
+    action = (body.get("action") or "status").lower()
+    if action == "start":
+        return jsonify(trenches.start())
+    if action == "stop":
+        return jsonify(trenches.stop())
+    if action == "scan":
+        return jsonify(trenches.scan_once())
+    return jsonify(trenches.status())
 
 
 @app.route('/arb', methods=["GET", "POST", "OPTIONS"])
@@ -886,13 +959,15 @@ def health():
     agy_status = agy_cli.preflight()
     from decision import forecast as forecast_mod
     from decision import calibrate as calibrate_mod
-    from decision import arb, discover, paper, pipeline_log, readiness, swarm
+    from decision import arb, discover, paper, pipeline_log, pricefeed, readiness, swarm
+    from decision import trenches
     from decision import session as decision_session
 
     residuals = calibrate_mod.load_residuals()
     port = paper.snapshot()
     disc = discover.status()
     arb_st = arb.status()
+    feed = pricefeed.status()
     ready = readiness.evaluate()
     trade_n = sum(
         1
@@ -944,6 +1019,14 @@ def health():
             "realized_pnl_usd": arb_st.get("realized_pnl_usd"),
             "last_error": arb_st.get("last_error"),
         },
+        "pricefeed": {
+            "running": feed.get("running"),
+            "ticks": feed.get("ticks"),
+            "tracked_n": feed.get("tracked_n"),
+            "samples": feed.get("samples"),
+            "last_error": feed.get("last_error"),
+        },
+        "trenches": trenches.status(),
         "readiness": {
             "ready_for_live": ready.get("ready_for_live"),
             "score": ready.get("score"),
@@ -990,23 +1073,34 @@ def _build_cors_preflight_response():
 
 def _configure_background_channels() -> None:
     """Bind discover + paper-arb to the shared live buffer; optionally auto-start."""
-    from decision import arb, discover, swarm
+    from decision import arb, discover, pricefeed, swarm, trenches
 
     def _set_token(address: str, token: dict) -> None:
         token_data[address] = token
 
     discover.configure(set_token=_set_token, get_tokens=lambda: token_data)
     arb.configure(get_tokens=lambda: token_data)
+    trenches.configure(set_token=_set_token)
+    if pricefeed.ENABLED:
+        pricefeed.start()
+        print("pricefeed: auto-started sampled candle feed", flush=True)
     if discover.DISCOVER_ENABLED:
         discover.start()
         print("discover: auto-started (DISCOVER_ENABLED=1)", flush=True)
     if arb.ARB_ENABLED:
         arb.start()
         print("arb: auto-started paper channel (ARB_ENABLED=1)", flush=True)
+    if trenches.LAUNCH_ENABLED or trenches.CLUSTER_ENABLED or trenches.SNIPER_ENABLED:
+        trenches.start()
+        print("trenches: auto-started launch/cluster/sniper paper channel", flush=True)
     if os.getenv("SWARM_ENABLED", "0").strip() == "1":
         interval = float(os.getenv("SWARM_INTERVAL_SEC", "12") or 12)
-        swarm.start(lambda: token_data, interval_s=interval, mode="full")
-        print(f"swarm: auto-started (SWARM_ENABLED=1, interval={interval}s)", flush=True)
+        swarm_mode = (os.getenv("SWARM_MODE") or "fast").strip() or "fast"
+        swarm.start(lambda: token_data, interval_s=interval, mode=swarm_mode)
+        print(
+            f"swarm: auto-started (SWARM_ENABLED=1, interval={interval}s, mode={swarm_mode})",
+            flush=True,
+        )
 
 
 _configure_background_channels()

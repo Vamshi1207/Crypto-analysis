@@ -94,15 +94,25 @@ def build_live_token(
     candles: list[dict[str, Any]],
     source: str = "geckoterminal",
     extra: Optional[dict[str, Any]] = None,
+    extra_timeframes: Optional[dict[str, list[dict[str, Any]]]] = None,
 ) -> dict[str, Any]:
-    """Shape matching extension ingest so swarm/decide need no special case."""
+    """Shape matching extension ingest so swarm/decide need no special case.
+
+    ``extra_timeframes`` carries the sampled price-feed series (5S/15S/30S/1),
+    which lets decide work on seconds-scale bars for tokens Gecko never served.
+    """
+    timeframes: dict[str, list[dict[str, Any]]] = {"1": list(candles)}
+    if extra_timeframes:
+        for tf, rows in extra_timeframes.items():
+            if rows:
+                timeframes[tf] = list(rows)
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     token: dict[str, Any] = {
         "payload_id": f"discover:{pool_address[:12]}",
         "name": name or "Unknown",
         "mint": mint,
         "pool": pool_address,
-        "timeframes": {"1": list(candles)},
+        "timeframes": timeframes,
         "stats": [],
         "updated": now,
         "live": True,

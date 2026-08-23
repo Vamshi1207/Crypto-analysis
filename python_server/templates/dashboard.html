@@ -309,6 +309,43 @@
       color: var(--muted);
       font-size: 0.85rem;
     }
+    .lane {
+      display: inline-block;
+      font-family: var(--mono);
+      font-size: 0.62rem;
+      font-weight: 650;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      padding: 0.12rem 0.4rem;
+      border-radius: 999px;
+      border: 1px solid var(--line-strong);
+      color: var(--muted);
+    }
+    .lane-snipe { color: #1a1408; background: var(--accent); border-color: transparent; }
+    .lane-cluster { color: #062033; background: var(--hold); border-color: transparent; }
+    .lane-launch { color: #3a2a00; background: var(--warn); border-color: transparent; }
+    .snipe-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 0;
+    }
+    @media (max-width: 720px) {
+      .snipe-grid { grid-template-columns: 1fr; }
+    }
+    .snipe-col + .snipe-col { border-left: 1px solid var(--line); }
+    @media (max-width: 720px) {
+      .snipe-col + .snipe-col { border-left: 0; border-top: 1px solid var(--line); }
+    }
+    .snipe-col h3 {
+      margin: 0;
+      padding: 0.55rem 1rem 0.2rem;
+      font-size: 0.68rem;
+      font-weight: 650;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+      color: var(--muted);
+    }
+    .panel-snipe { border-color: rgba(255, 180, 84, 0.35); }
 
     /* Filters */
     .bar {
@@ -586,6 +623,7 @@
           <a href="/health" target="_blank" rel="noopener">health</a>
           <a href="/discover" target="_blank" rel="noopener">discover</a>
           <a href="/arb" target="_blank" rel="noopener">arb</a>
+          <a href="/trenches" target="_blank" rel="noopener">trenches</a>
         </div>
       </div>
       <div class="strip-actions">
@@ -593,6 +631,23 @@
         <button type="button" class="btn ghost" id="swarm-toggle">Start auto-trader</button>
       </div>
     </div>
+
+    <section class="panel panel-snipe" aria-label="Sniper trades">
+      <div class="panel-h">
+        <h2>Sniper — create-event scalps</h2>
+        <span id="snipe-count">—</span>
+      </div>
+      <div class="snipe-grid">
+        <div class="snipe-col">
+          <h3>Open now</h3>
+          <div id="snipe-open-body"><div class="empty-row">No sniper lots open.</div></div>
+        </div>
+        <div class="snipe-col">
+          <h3>Recently finished</h3>
+          <div id="snipe-closed-body"><div class="empty-row">No finished snipes yet.</div></div>
+        </div>
+      </div>
+    </section>
 
     <section class="panel" aria-label="Trades still open">
       <div class="panel-h">
@@ -757,6 +812,67 @@
     return votes.reduce((a, b) => a + b, 0) / votes.length;
   }
 
+  function laneOf(p) {
+    return String(p.entry_reason || p.timeframe || "—").toLowerCase();
+  }
+  function laneBadge(lane) {
+    const cls = lane === "snipe" ? "lane-snipe" : lane === "cluster" ? "lane-cluster" : lane === "launch" ? "lane-launch" : "";
+    return `<span class="lane ${cls}">${esc(lane)}</span>`;
+  }
+
+  function renderSniper(port) {
+    const s = port.sniper || {};
+    const open = (s.open && s.open.length)
+      ? s.open
+      : (port.open || []).filter(p => laneOf(p) === "snipe");
+    const closedSrc = (s.closed_recent && s.closed_recent.length)
+      ? s.closed_recent
+      : (port.closed_recent || []).filter(p => laneOf(p) === "snipe");
+    const closed = closedSrc.slice().reverse();
+    const realized = s.realized_pnl_usd != null
+      ? s.realized_pnl_usd
+      : closedSrc.reduce((a, p) => a + (Number(p.realized_pnl_usd) || 0), 0);
+    document.getElementById("snipe-count").textContent =
+      `${open.length} open · ${s.closed_count || 0} finished · ${fmtMoney(realized)}`;
+
+    if (!open.length) {
+      document.getElementById("snipe-open-body").innerHTML = `<div class="empty-row">No sniper lots open.</div>`;
+    } else {
+      const body = open.map(p => {
+        const u = p.unrealized_pnl_usd;
+        return `<tr>
+          <td><b>${esc(p.name || "—")}</b></td>
+          <td>${fmtMoneyAbs(p.size_usd)}</td>
+          <td class="pnl ${pnlClass(u)}">${fmtMoney(u)}</td>
+        </tr>`;
+      }).join("");
+      document.getElementById("snipe-open-body").innerHTML = `
+        <table class="pos-table">
+          <thead><tr><th>Coin</th><th>Size</th><th>Open P/L</th></tr></thead>
+          <tbody>${body}</tbody>
+        </table>`;
+    }
+
+    if (!closed.length) {
+      document.getElementById("snipe-closed-body").innerHTML = `<div class="empty-row">No finished snipes yet.</div>`;
+    } else {
+      const body = closed.slice(0, 8).map(p => {
+        const pnl = p.realized_pnl_usd;
+        const why = (p.close_reason || "—").split(" (")[0];
+        return `<tr>
+          <td><b>${esc(p.name || "—")}</b></td>
+          <td class="pnl ${pnlClass(pnl)}">${fmtMoney(pnl)}</td>
+          <td class="muted-cell">${esc(why)}</td>
+        </tr>`;
+      }).join("");
+      document.getElementById("snipe-closed-body").innerHTML = `
+        <table class="close-table">
+          <thead><tr><th>Coin</th><th>Final P/L</th><th>Why</th></tr></thead>
+          <tbody>${body}</tbody>
+        </table>`;
+    }
+  }
+
   function renderOpenPositions(port) {
     const rows = port.open || [];
     document.getElementById("open-count").textContent = `${rows.length} open · ${fmtMoneyAbs(port.open_notional_usd)} in trades`;
@@ -767,7 +883,7 @@
     const body = rows.map(p => {
       const u = p.unrealized_pnl_usd;
       return `<tr>
-        <td><b>${esc(p.name || "—")}</b><div class="muted-cell">${esc((p.id || "").slice(0, 8))}</div></td>
+        <td><b>${esc(p.name || "—")}</b><div class="muted-cell">${laneBadge(laneOf(p))} ${esc((p.id || "").slice(0, 8))}</div></td>
         <td>${fmtMoneyAbs(p.size_usd)}<div class="muted-cell">qty ${fmtNum(p.qty, 2)}</div></td>
         <td>${fmtPrice(p.entry_price)}</td>
         <td>${fmtPrice(p.mark_price)}</td>
@@ -799,7 +915,7 @@
     const body = rows.map(p => {
       const pnl = p.realized_pnl_usd;
       return `<tr>
-        <td><b>${esc(p.name || "—")}</b></td>
+        <td><b>${esc(p.name || "—")}</b> ${laneBadge(laneOf(p))}</td>
         <td class="pnl ${pnlClass(pnl)}">${fmtMoney(pnl)}</td>
         <td class="muted-cell">${esc(p.close_reason || "—")}</td>
         <td class="muted-cell">${esc((p.closed_at || "").replace("T", " ").slice(0, 19))}Z</td>
@@ -958,6 +1074,7 @@
       document.getElementById("m-arb-sub").textContent =
         `${arbFills || t.arb_fills || 0} fills · avg ${fmtMoney(arbEv, 3)} · ${fmtMoneyAbs(arbNotional)} deployed`;
 
+      renderSniper(port);
       renderOpenPositions(port);
       renderClosed(port);
 
@@ -965,6 +1082,8 @@
         `<span>auto-trader <b>${swarm.running ? "on" : "off"}</b> · ${swarm.ticks || 0} checks</span>` +
         `<span>finder <b>${(health.discover && health.discover.running) ? "on" : "off"}</b> · ${health.tokens_tradeable || 0} hunting / ${health.tokens_observe || 0} watching</span>` +
         `<span>price-gap <b>${arb.running ? "on" : "off"}</b> · ${arb.paper_fills || 0} fills</span>` +
+        `<span>launch/cluster <b>${(health.trenches && health.trenches.running) ? "on" : "off"}</b> · ${((health.trenches && health.trenches.launch_opens) || 0)} launches / ${((health.trenches && health.trenches.cluster_opens) || 0)} clusters / ${((health.trenches && health.trenches.sniper_opens) || 0)} snipes</span>` +
+        `<span>pump-create <b>${((health.trenches && health.trenches.snipe_feed && health.trenches.snipe_feed.connected) ? "live" : "off")}</b> · ${((health.trenches && health.trenches.snipe_feed && health.trenches.snipe_feed.creates) || 0)} creates · ${((health.trenches && health.trenches.snipe_feed && health.trenches.snipe_feed.trades) || 0)} trades · ${((health.trenches && health.trenches.sniper_watching) || 0)} watching</span>` +
         `<span>bot opinions <b>${t.decisions || 0}</b> · buys <b>${(t.actions && t.actions.buy) || 0}</b> this session</span>`;
 
       document.getElementById("swarm-toggle").textContent = swarm.running ? "Pause auto-trader" : "Start auto-trader";

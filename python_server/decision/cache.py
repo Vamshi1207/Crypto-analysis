@@ -25,10 +25,14 @@ _DEFAULT_TTLS = {
     # Discovery feeds — longer TTLs to stay inside free-tier rpm.
     "dexscreener_boosts": 60.0,
     "gecko_trending": 60.0,
+    "gecko_pool_list": 60.0,
+    # Sniper needs this fresh — 60s made every "new" pool a minute old.
+    "gecko_new_pools": 3.0,
     "gecko_ohlcv": 30.0,
     # Pool→mint mapping is effectively permanent for a given pool address.
     "resolve_mint": 3600.0,
     "jupiter_quote": 20.0,
+    "helius_txs": 8.0,
 }
 
 _MAX_ENTRIES = 512

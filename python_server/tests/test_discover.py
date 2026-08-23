@@ -165,6 +165,21 @@ def test_scan_candidates_merges_boost_and_gecko(monkeypatch):
         "fetch_dexscreener_pairs",
         lambda mint: [pair] if mint == MEME_MINT else [],
     )
+    # Scans resolve mints through the batch endpoint; the per-mint call above is
+    # only the fallback for when a batch request fails outright.
+    monkeypatch.setattr(
+        discover,
+        "fetch_dexscreener_tokens_batch",
+        lambda mints: {m: ([pair] if m == MEME_MINT else []) for m in mints},
+    )
+    # Keep the extra Gecko listings out of this test so it stays offline and
+    # asserts only on the boost + trending merge.
+    monkeypatch.setattr(discover, "GECKO_POOL_FEEDS", ())
+    monkeypatch.setattr(
+        discover,
+        "fetch_gecko_pool_list",
+        lambda kind="new_pools", page=1: [],
+    )
     monkeypatch.setattr(
         discover,
         "fetch_gecko_trending_pools",
@@ -482,3 +497,35 @@ def test_scan_skips_cooled_mints_for_next_names(monkeypatch):
     assert buf["CoolPool"].get("tradeable") is False
     assert result.get("trade_n") == 1
     assert result.get("observe_n") >= 1
+
+
+def test_graduate_board_observe_promotes_when_bars_ready(monkeypatch):
+    buf: dict = {}
+    discover.configure(set_token=lambda a, t: buf.__setitem__(a, t), get_tokens=lambda: buf)
+    monkeypatch.setattr(discover, "PRICEFEED_MIN_BARS", 4)
+    monkeypatch.setattr(
+        discover,
+        "check_token",
+        lambda mint: SafetyReport(mint=mint, verdict=SafetyVerdict.SAFE, risk_score=5),
+    )
+    mint = "GradMint111111111111111111111111111111"
+    pool = "GradPool"
+    bars = [
+        {"timestamp": 1.0 + i, "open": 1, "high": 1, "low": 1, "close": 1.0, "volume": 1}
+        for i in range(6)
+    ]
+    buf[pool] = {
+        "mint": mint,
+        "name": "GRAD",
+        "discover": True,
+        "role": "observe",
+        "tradeable": False,
+        "observe_lite": False,
+        "cooled": False,
+        "timeframes": {"1": bars[:2]},
+    }
+    monkeypatch.setattr(discover.pricefeed, "timeframes", lambda m: {"1": bars} if m == mint else {})
+    n = discover._graduate_board_observe()
+    assert n == 1
+    assert buf[pool]["role"] == "trade"
+    assert buf[pool]["tradeable"] is True

@@ -35,6 +35,9 @@ def _patch_basic(monkeypatch, *, cost: float = 3.0):
     monkeypatch.setattr(arb, "MAX_POOL_FRAC", 0.01)
     monkeypatch.setattr(arb, "STRESS_GAP_FRAC", 0.5)
     monkeypatch.setattr(arb, "REQUIRE_CROSS_DEX", True)
+    # These cases assert the Dex stress prefilter, so pin the mode regardless of
+    # what the deployed .env selects.
+    monkeypatch.setattr(arb, "PREFILTER_MODE", "stress")
     monkeypatch.setattr(arb, "_arb_cost_pct", lambda: cost)
 
 

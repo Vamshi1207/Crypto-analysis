@@ -265,6 +265,9 @@ class DecisionCard(BaseModel):
     gates_failed: list[str] = Field(default_factory=list)
     mode: DecideMode = DecideMode.FAST
     degraded: bool = False
+    # Free-form context downstream stages need but the schema should not hard-code
+    # (e.g. which entry path produced a buy).
+    notes: dict[str, Any] = Field(default_factory=dict)
     latency_ms: Optional[int] = None
     decided_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     langfuse_trace_id: Optional[str] = None

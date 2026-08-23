@@ -21,17 +21,18 @@ def _paper_defaults(monkeypatch):
 
 
 def test_stop_fills_at_barrier_not_gapped_mark():
-    """EVE-style -25% gap must book -$1.50, not -$9."""
+    """A -25% gap must book the stop, not the full gapped mark loss."""
     card = _card(address="GapBarrierPool", band=(-5.0, 8.0, 20.0), agreement=0.8)
     opened = paper.execute_decision(card, mark_price=100.0)
     assert opened["status"] == "opened", opened
     entry = opened["position"]["entry_price"]
 
-    # Mark crashes ~25% — well past the $1.50 stop.
+    # Mark crashes ~25% — well past the stop.
     closed = paper.mark_and_maybe_exit(address="GapBarrierPool", mark_price=entry * 0.75)
     assert closed
     pos = closed[0]
-    assert pos["realized_pnl_usd"] == pytest.approx(-paper.STOP_LOSS_USD, abs=0.01)
+    expected_stop = paper.stop_loss_for_size(pos["size_usd"])
+    assert pos["realized_pnl_usd"] == pytest.approx(-expected_stop, abs=0.01)
     assert "barrier" in (pos.get("close_reason") or "")
     assert "mark would be" in (pos.get("close_reason") or "")
 
@@ -94,6 +95,9 @@ def test_mint_daily_trade_cap_blocks_reentry(monkeypatch):
 
 
 def test_mint_daily_loss_cap_blocks_after_bleed(monkeypatch):
+    # Flat stop keeps the single loss this asserts on independent of size config.
+    monkeypatch.setattr(paper, "STOP_LOSS_PCT", 0.0)
+    monkeypatch.setattr(paper, "STOP_LOSS_USD", 1.5)
     monkeypatch.setattr(paper, "MAX_DAILY_LOSS_PER_MINT", 1.5)
     monkeypatch.setattr(paper, "STOP_FILL_MODE", "barrier")
     mint = "MintLossBBB2222222222222222222222222222222"

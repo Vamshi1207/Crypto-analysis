@@ -24,6 +24,17 @@ def _env_int(name: str, default: int) -> int:
     return int(_env_float(name, default))
 
 
+def paper_risk_on() -> bool:
+    """Paper-only: take more trades so we learn the real drawdown.
+
+    Never applies when ``LIVE_TRADING=1``. Default on for paper so a fresh
+    session actually fills instead of sitting on a two-token roster.
+    """
+    if os.getenv("LIVE_TRADING", "0").strip() == "1":
+        return False
+    return os.getenv("PAPER_RISK_ON", "0").strip() == "1"
+
+
 @dataclass(frozen=True)
 class SafetyThresholds:
     """Tunable limits for Gate 0. Deliberately conservative for memecoins."""

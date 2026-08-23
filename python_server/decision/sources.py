@@ -337,6 +337,63 @@ def fetch_gecko_trending_pools(*, page: int = 1) -> list[dict[str, Any]]:
     return cache.get_or_set("gecko_trending", f"p{page}", produce)
 
 
+# GeckoTerminal pool listings other than trending. ``new_pools`` surfaces fresh
+# launches (where most memecoin movement lives) and ``pools`` ranks by volume.
+GECKO_POOL_KINDS = ("new_pools", "pools", "trending_pools")
+
+
+def fetch_gecko_pool_list(*, kind: str = "new_pools", page: int = 1) -> list[dict[str, Any]]:
+    """Solana pool listing by ``kind`` (``new_pools`` / ``pools`` / ``trending_pools``)."""
+    if kind not in GECKO_POOL_KINDS:
+        raise SourceError(f"unsupported gecko pool kind {kind!r}")
+
+    def produce() -> list[dict[str, Any]]:
+        url = f"{GECKO_BASE_URL}/networks/solana/{kind}"
+        try:
+            response = _http().get(url, params={"page": page})
+            response.raise_for_status()
+            body = response.json()
+        except (httpx.HTTPError, ValueError) as exc:
+            raise SourceError(f"gecko {kind}: {exc}") from exc
+        rows = body.get("data") or []
+        return [row for row in rows if isinstance(row, dict)]
+
+    ns = "gecko_new_pools" if kind == "new_pools" else "gecko_pool_list"
+    return cache.get_or_set(ns, f"{kind}:p{page}", produce)
+
+
+# DexScreener accepts up to 30 comma-separated mints per token lookup, which is
+# what makes a self-built candle feed affordable: ~2 calls covers 60 tokens.
+DEXSCREENER_BATCH_MAX = 30
+
+
+def fetch_dexscreener_tokens_batch(mints: list[str]) -> dict[str, list[dict[str, Any]]]:
+    """Solana pairs for up to 30 mints in one call, keyed by mint.
+
+    Uncached on purpose: callers use this to sample a live price series, so a
+    cache hit would silently flatten the candles they are trying to build.
+    """
+    wanted = [m.strip() for m in mints if m and m.strip()][:DEXSCREENER_BATCH_MAX]
+    if not wanted:
+        return {}
+    try:
+        response = _http().get(f"{DEXSCREENER_TOKENS_URL}/{','.join(wanted)}")
+        response.raise_for_status()
+        body = response.json()
+    except (httpx.HTTPError, ValueError) as exc:
+        raise SourceError(f"dexscreener batch: {exc}") from exc
+
+    out: dict[str, list[dict[str, Any]]] = {m: [] for m in wanted}
+    for pair in body.get("pairs") or []:
+        if not isinstance(pair, dict) or pair.get("chainId") != "solana":
+            continue
+        for side in ("baseToken", "quoteToken"):
+            addr = ((pair.get(side) or {}).get("address") or "").strip()
+            if addr in out:
+                out[addr].append(pair)
+    return out
+
+
 def fetch_gecko_ohlcv(
     pool_address: str,
     *,
@@ -463,6 +520,33 @@ def _safe_error_text(response: httpx.Response) -> str:
     if isinstance(body, dict):
         return str(body.get("error") or body.get("message") or body)[:200]
     return str(body)[:200]
+
+
+def fetch_helius_transactions(address: str, *, limit: int = 20) -> list[dict[str, Any]]:
+    """Parsed recent txs for an address via Helius enhanced API.
+
+    Used by the paper cluster/launch channel. Requires ``HELIUS_API_KEY``.
+    """
+    key = SETTINGS.helius_api_key
+    if not key:
+        raise SourceError("HELIUS_API_KEY unset")
+    addr = (address or "").strip()
+    if not addr:
+        raise SourceError("empty address")
+
+    def produce() -> list[dict[str, Any]]:
+        url = f"https://api.helius.xyz/v0/addresses/{addr}/transactions"
+        try:
+            response = _http().get(url, params={"api-key": key, "limit": str(limit)})
+            response.raise_for_status()
+            body = response.json()
+        except (httpx.HTTPError, ValueError) as exc:
+            raise SourceError(f"helius txs: {exc}") from exc
+        if not isinstance(body, list):
+            raise SourceError("helius txs: unexpected body")
+        return [row for row in body if isinstance(row, dict)]
+
+    return cache.get_or_set("helius_txs", f"{addr}:{limit}", produce)
 
 
 def close() -> None:

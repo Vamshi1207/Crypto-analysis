@@ -14,6 +14,7 @@ from typing import Any, Optional
 
 from decision import calibrate, dataset, forecast, packet as packet_mod
 from decision import indicators_signal
+from decision import momentum as momentum_signal
 from decision import pipeline_log
 from decision import store as decision_store
 from decision.packet import (
@@ -44,6 +45,7 @@ from decision.schema import (
     SafetyReport,
     SafetyVerdict,
 )
+from decision.config import paper_risk_on
 from decision.sources import SourceError, resolve_to_mint
 from decision.tradability import check_tradability
 from decision import vibe as vibe_mod
@@ -436,6 +438,32 @@ def _decide_body(
     # Buy-fast / sell-fast: require cost-adjusted edge that clears profit target.
     direction = _direction(band)
     edge_ok = edge >= need_edge and profit_usd >= profit_target_usd
+
+    # Momentum override: a breakout on expanding volume is evidence the forecast
+    # median cannot contain, so it gets its own path through Gate 2 rather than
+    # being averaged away by a quiet trailing distribution.
+    momentum: dict[str, Any] = {}
+    if momentum_signal.ENABLED and not edge_ok:
+        momentum = momentum_signal.evaluate(
+            tf.ohlcv_tail,
+            orderflow=market_packet.orderflow,
+        )
+        pipeline_log.emit(
+            "momentum",
+            "pass" if momentum.get("enter") else "skip",
+            address=market_packet.address,
+            mint=market_packet.mint,
+            symbol=market_packet.name,
+            score=momentum.get("score"),
+            thrust_pct=momentum.get("thrust_pct"),
+            breakout_pct=momentum.get("breakout_pct"),
+            volume_ratio=momentum.get("volume_ratio"),
+            reason=momentum.get("reason"),
+        )
+        if momentum.get("enter"):
+            edge_ok = True
+            direction = Direction.UP
+
     if not edge_ok or direction is Direction.SIDEWAYS:
         gates_failed.append("gate2")
         reason = (
@@ -474,6 +502,7 @@ def _decide_body(
         return _finalize(card, market_packet, mode=mode, started=started)
 
     gates_passed.append("gate2")
+    momentum_entry = bool(momentum.get("enter"))
     pipeline_log.emit(
         "gate2",
         "pass",
@@ -485,6 +514,7 @@ def _decide_body(
         need_edge=need_edge,
         direction=direction.value,
         profit_usd=round(profit_usd, 4),
+        via="momentum" if momentum_entry else "forecast",
     )
 
     # --- Indicator alignment (after edge clears; does not replace Gate 2) ---
@@ -500,7 +530,11 @@ def _decide_body(
         reason=ind_sig.reason,
         votes=ind_sig.votes,
     )
-    if ind_sig.available and (ind_sig.hard_block or not ind_sig.soft_ok):
+    if (
+        ind_sig.available
+        and (ind_sig.hard_block or not ind_sig.soft_ok)
+        and not (paper_risk_on() and momentum_entry)
+    ):
         gates_failed.append("indicators")
         pipeline_log.emit(
             "indicators",
@@ -563,14 +597,19 @@ def _decide_body(
         ),
         warnings=warnings
         + [
-            f"scalp edge {edge:+.2f}% → ${profit_usd:+.2f} on ${SCALP_SIZE_USD:.0f} "
-            f"(target ${TARGET_PROFIT_USD:.2f})"
+            f"momentum entry: {momentum.get('reason')}"
+            if momentum_entry
+            else (
+                f"scalp edge {edge:+.2f}% → ${profit_usd:+.2f} on ${SCALP_SIZE_USD:.0f} "
+                f"(target ${TARGET_PROFIT_USD:.2f})"
+            )
         ],
         gates_passed=gates_passed,
         gates_failed=gates_failed,
         started=started,
         safety=safety,
         indicator_signal=ind_sig,
+        notes={"momentum_entry": True, "momentum": momentum} if momentum_entry else None,
     )
     return _finalize(card, market_packet, mode=mode, started=started)
 
@@ -617,11 +656,16 @@ def _price_targets(packet: MarketPacket, band: ReturnBand) -> PriceTargets:
 
 
 def _position(packet: MarketPacket, safety: Optional[SafetyReport], confidence: float) -> PositionPlan:
-    from decision.packet import SCALP_SIZE_USD
+    from decision.packet import MIN_SIZE_FRACTION, SCALP_SIZE_USD
 
     liq = packet.market.liquidity_usd_total or packet.market.liquidity_usd or 0.0
     # Cap at 1% of exit depth and scalp size; confidence scales down.
-    raw = min(SCALP_SIZE_USD, liq * 0.01) * max(0.25, confidence)
+    #
+    # The confidence floor matters more than it looks: a fixed dollar target
+    # needs a larger percent move as size shrinks, so scaling a $150 plan down
+    # to $49 on typical confidence quietly triples the move the trade has to
+    # catch. The floor keeps sizing inside the range the target is reachable in.
+    raw = min(SCALP_SIZE_USD, liq * 0.01) * max(MIN_SIZE_FRACTION, confidence)
     if safety and safety.verdict is SafetyVerdict.CAUTION:
         raw *= 0.5
     return PositionPlan(
@@ -670,6 +714,7 @@ def _card_from_forecast(
     started: float,
     safety: Optional[SafetyReport],
     indicator_signal: Optional[indicators_signal.IndicatorSignal] = None,
+    notes: Optional[dict[str, Any]] = None,
 ) -> DecisionCard:
     band = ens.calibrated
     drivers = [
@@ -725,6 +770,7 @@ def _card_from_forecast(
         gates_failed=gates_failed,
         mode=mode,
         degraded=bool(safety.degraded) if safety else packet.source == "corpus",
+        notes=dict(notes or {}),
         latency_ms=int((time.perf_counter() - started) * 1000),
     )
 

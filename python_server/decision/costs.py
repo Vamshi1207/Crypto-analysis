@@ -91,6 +91,25 @@ def barrier_moves(
     }
 
 
+def required_move_pct(
+    *,
+    size_usd: float,
+    target_usd: float,
+    price_impact_pct: Optional[float] = None,
+) -> float:
+    """Percent move needed to bank ``target_usd`` on ``size_usd``, all-in.
+
+    This is the number that decides whether a strategy is possible at all:
+    ``target/size`` plus round-trip cost. A $1 target on $40 at 3.2% cost needs
+    5.7%, which almost nothing delivers in minutes; the same $1 on $200 at 1.7%
+    needs 2.2%, which memecoins print constantly. Sizing is not a detail here.
+    """
+    if size_usd <= 0:
+        raise ValueError("size_usd must be positive")
+    cost = round_trip_cost_pct(price_impact_pct=price_impact_pct)
+    return round(cost + (target_usd / size_usd) * 100.0, 4)
+
+
 def degenerate_stop_reason(
     *,
     size_usd: float,

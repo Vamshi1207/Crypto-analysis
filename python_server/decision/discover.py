@@ -1,7 +1,12 @@
 """Headless Solana token discovery → hydrate live buffer for paper swarm.
 
-Universe v1: DexScreener Solana boosts + GeckoTerminal trending pools.
+Universe: DexScreener Solana boosts + GeckoTerminal trending/new/top pools.
 Hard prefilters run before Gate 0; only a shortlist gets safety + OHLCV spend.
+
+Candles come from Gecko when its keyless quota allows and from our own sampled
+price feed otherwise. That fallback is the difference between a trade roster of
+two names and a full one: a single Gecko 429 used to end hydration for the whole
+scan, so everything after it stayed observe-only and never reached a decision.
 """
 
 from __future__ import annotations
@@ -15,13 +20,17 @@ from typing import Any, Callable, Optional
 
 from decision import ohlcv_remote
 from decision import pipeline_log
+from decision import pricefeed
 from decision.config import WRAPPED_SOL_MINT, _env_float, _env_int
 from decision.safety import check_token
 from decision.schema import SafetyVerdict
 from decision.sources import (
+    DEXSCREENER_BATCH_MAX,
     SourceError,
     fetch_dexscreener_boosts,
     fetch_dexscreener_pairs,
+    fetch_dexscreener_tokens_batch,
+    fetch_gecko_pool_list,
     fetch_gecko_trending_pools,
 )
 
@@ -49,6 +58,15 @@ NO_EDGE_STREAK = _env_int("DISCOVER_NO_EDGE_STREAK", 3)
 NO_EDGE_COOLDOWN_SEC = _env_float("DISCOVER_NO_EDGE_COOLDOWN_SEC", 0.0)
 # Walk this many filtered names trying to fill the watchlist (past cool-downs).
 EXPLORE_MULTIPLIER = _env_int("DISCOVER_EXPLORE_MULTIPLIER", 5)
+# Extra GeckoTerminal pool listings to widen the universe beyond trending.
+# ``new_pools`` is where most memecoin movement starts.
+GECKO_POOL_FEEDS = tuple(
+    kind.strip()
+    for kind in os.getenv("DISCOVER_GECKO_FEEDS", "new_pools,pools").split(",")
+    if kind.strip()
+)
+# Minimum sampled bars before the price feed may hydrate a trade-roster token.
+PRICEFEED_MIN_BARS = _env_int("DISCOVER_PRICEFEED_MIN_BARS", 18)
 
 
 @dataclass
@@ -427,10 +445,35 @@ def _run(interval_s: float) -> None:
 # --- scan / filter / hydrate -------------------------------------------------
 
 
+def _prefetch_pairs(mints: list[str]) -> dict[str, list[dict[str, Any]]]:
+    """Batch DexScreener lookups for a whole scan's worth of mints.
+
+    One request per mint was the scan's dominant cost: with several feeds the
+    universe runs to ~100 names, which alone exhausts the rate limit and starves
+    the sampled price feed sharing the same budget. Thirty per call fixes that.
+    """
+    unique = list(dict.fromkeys(m for m in mints if m))
+    out: dict[str, list[dict[str, Any]]] = {}
+    for start in range(0, len(unique), DEXSCREENER_BATCH_MAX):
+        chunk = unique[start : start + DEXSCREENER_BATCH_MAX]
+        try:
+            out.update(fetch_dexscreener_tokens_batch(chunk))
+        except SourceError as exc:
+            pipeline_log.emit(
+                "discover",
+                "batch_pairs_error",
+                level="warning",
+                reason=str(exc),
+                n=len(chunk),
+            )
+    return out
+
+
 def scan_candidates() -> list[Candidate]:
     """Merge boost + trending feeds into enriched Candidate rows (pre-filter)."""
     by_pool: dict[str, Candidate] = {}
 
+    boost_rows: list[tuple[str, str, float]] = []  # (mint, source, boost_amount)
     for which in ("latest", "top"):
         try:
             boosts = fetch_dexscreener_boosts(which=which)
@@ -441,36 +484,57 @@ def scan_candidates() -> list[Candidate]:
             if not mint:
                 continue
             boost_amt = float(row.get("totalAmount") or row.get("amount") or 0.0)
-            cand = _candidate_from_mint(
-                mint,
-                source=f"dex_boost_{which}",
-                boost_amount=boost_amt,
-            )
-            if cand is None:
-                continue
-            prev = by_pool.get(cand.pool)
-            if prev is None or cand.boost_amount > prev.boost_amount:
-                by_pool[cand.pool] = cand
+            boost_rows.append((mint, f"dex_boost_{which}", boost_amt))
 
+    feeds: list[tuple[str, list[dict[str, Any]]]] = []
     try:
-        pools = fetch_gecko_trending_pools(page=1)
+        feeds.append(("gecko_trending", fetch_gecko_trending_pools(page=1)))
     except SourceError:
-        pools = []
-    for row in pools:
-        cand = _candidate_from_gecko(row)
+        pass
+    for kind in GECKO_POOL_FEEDS:
+        try:
+            feeds.append((f"gecko_{kind}", fetch_gecko_pool_list(kind=kind, page=1)))
+        except SourceError:
+            continue
+
+    # Resolve every mint the feeds mentioned in a handful of batched requests.
+    gecko_mints = [
+        m
+        for _, pools in feeds
+        for m in (_gecko_mint(row) for row in pools)
+        if m
+    ]
+    pairs_by_mint = _prefetch_pairs([m for m, _, _ in boost_rows] + gecko_mints)
+
+    for mint, source, boost_amt in boost_rows:
+        cand = _candidate_from_mint(
+            mint,
+            source=source,
+            boost_amount=boost_amt,
+            pairs_by_mint=pairs_by_mint,
+        )
         if cand is None:
             continue
         prev = by_pool.get(cand.pool)
-        if prev is None:
+        if prev is None or cand.boost_amount > prev.boost_amount:
             by_pool[cand.pool] = cand
-        else:
+
+    for label, pools in feeds:
+        for row in pools:
+            cand = _candidate_from_gecko(row, source=label, pairs_by_mint=pairs_by_mint)
+            if cand is None:
+                continue
+            prev = by_pool.get(cand.pool)
+            if prev is None:
+                by_pool[cand.pool] = cand
+                continue
             # Keep boost amount; refresh liquidity/volume from gecko if stronger.
             if cand.volume_24h_usd > prev.volume_24h_usd:
                 prev.volume_24h_usd = cand.volume_24h_usd
                 prev.liquidity_usd = max(prev.liquidity_usd, cand.liquidity_usd)
                 prev.tx_h1 = max(prev.tx_h1, cand.tx_h1)
-            if "gecko" not in prev.source:
-                prev.source = f"{prev.source}+gecko_trending"
+            if label not in prev.source:
+                prev.source = f"{prev.source}+{label}"
 
     return list(by_pool.values())
 
@@ -576,6 +640,8 @@ def _scan_and_hydrate() -> dict[str, Any]:
         role: str,
         candles: list[dict[str, Any]],
         lite: bool = False,
+        candle_source: str = "geckoterminal",
+        extra_timeframes: Optional[dict[str, list[dict[str, Any]]]] = None,
     ) -> None:
         tradeable = role == "trade" and not _is_cooling(c.mint)
         token = ohlcv_remote.build_live_token(
@@ -583,7 +649,9 @@ def _scan_and_hydrate() -> dict[str, Any]:
             mint=c.mint,
             pool_address=c.pool,
             candles=candles,
+            extra_timeframes=extra_timeframes,
             extra={
+                "candle_source": candle_source,
                 "discover_score": c.score,
                 "discover_source": c.source,
                 "liquidity_usd": c.liquidity_usd,
@@ -611,6 +679,7 @@ def _scan_and_hydrate() -> dict[str, Any]:
                 "role": role,
                 "tradeable": tradeable,
                 "observe_lite": lite,
+                "candle_source": candle_source,
             }
         )
         pipeline_log.emit(
@@ -625,9 +694,26 @@ def _scan_and_hydrate() -> dict[str, Any]:
             role=role,
             tradeable=tradeable,
             lite=lite,
+            candle_source=candle_source,
             liquidity_usd=c.liquidity_usd,
             volume_24h_usd=c.volume_24h_usd,
         )
+
+    def _pricefeed_trade(c: Candidate) -> bool:
+        """Hydrate from our own sampled series when Gecko cannot serve candles."""
+        tfs = pricefeed.timeframes(c.mint)
+        best = max(tfs.items(), key=lambda kv: len(kv[1]), default=None)
+        if best is None or len(best[1]) < PRICEFEED_MIN_BARS:
+            return False
+        _push_token(
+            c,
+            role="trade",
+            candles=best[1],
+            lite=False,
+            candle_source="pricefeed",
+            extra_timeframes=tfs,
+        )
+        return True
 
     def _hydrate_trade(c: Candidate) -> bool:
         nonlocal ohlcv_budget_hit
@@ -653,20 +739,15 @@ def _scan_and_hydrate() -> dict[str, Any]:
                 reason=reason,
             )
             return False
+        # Gate 0 passed — start sampling so the price feed can serve this mint
+        # even if Gecko never answers for it.
+        pricefeed.track(mint=c.mint, pool=c.pool, symbol=c.symbol or c.name)
         if ohlcv_budget_hit:
-            return False
+            return _pricefeed_trade(c)
         try:
             candles = ohlcv_remote.fetch_pool_ohlcv(c.pool, aggregate=1, limit=300)
         except SourceError as exc:
             msg = str(exc)
-            safety_rejected.append(
-                {
-                    "mint": c.mint,
-                    "pool": c.pool,
-                    "symbol": c.symbol,
-                    "reason": f"ohlcv: {exc}",
-                }
-            )
             pipeline_log.emit(
                 "ohlcv",
                 "fail",
@@ -682,10 +763,48 @@ def _scan_and_hydrate() -> dict[str, Any]:
                     "ohlcv",
                     "rate_limit",
                     level="warning",
-                    reason="stopping further gecko ohlcv this scan",
+                    reason="gecko exhausted; using sampled price feed for candles",
                 )
+            if _pricefeed_trade(c):
+                return True
+            safety_rejected.append(
+                {
+                    "mint": c.mint,
+                    "pool": c.pool,
+                    "symbol": c.symbol,
+                    "reason": f"ohlcv: {exc}",
+                }
+            )
             return False
         _push_token(c, role="trade", candles=candles, lite=False)
+        return True
+
+    def _try_graduate_candidate(
+        c: Candidate,
+        tfs: dict[str, list[dict[str, Any]]],
+        candles: list[dict[str, Any]],
+    ) -> bool:
+        """Promote an observe name to the trade roster once sampled bars exist."""
+        if _is_cooling(c.mint):
+            return False
+        gate = _gate0_ok(c.mint)
+        if gate is not True:
+            return False
+        _push_token(
+            c,
+            role="trade",
+            candles=candles,
+            lite=False,
+            candle_source="pricefeed",
+            extra_timeframes=tfs,
+        )
+        pipeline_log.emit(
+            "discover",
+            "graduate",
+            mint=c.mint,
+            symbol=c.symbol,
+            bars=len(candles),
+        )
         return True
 
     def _hydrate_observe_lite(c: Candidate) -> bool:
@@ -707,11 +826,31 @@ def _scan_and_hydrate() -> dict[str, Any]:
                 price = None
         if price is None or price <= 0:
             return False
+        # Sample observe names too, so they can graduate to the trade roster on a
+        # later scan once they have enough real bars.
+        pricefeed.track(mint=c.mint, pool=c.pool, symbol=c.symbol or c.name)
+        tfs = pricefeed.timeframes(c.mint)
+        best = max(tfs.items(), key=lambda kv: len(kv[1]), default=None)
+        if best is not None and len(best[1]) >= PRICEFEED_MIN_BARS:
+            if _try_graduate_candidate(c, tfs, best[1]):
+                return True
+        if best is not None and len(best[1]) >= 2:
+            _push_token(
+                c,
+                role="observe",
+                candles=best[1],
+                lite=False,
+                candle_source="pricefeed",
+                extra_timeframes=tfs,
+            )
+            return True
         candles = ohlcv_remote.stub_candles_from_price(price, bars=32, step_sec=60)
         _push_token(c, role="observe", candles=candles, lite=True)
         return True
 
     # Walk eligible until trade roster is full (Gate 0 + OHLCV may knock some out).
+    # A Gecko 429 no longer ends the walk: hydration falls through to the sampled
+    # price feed, so the roster keeps filling instead of freezing at one or two.
     cursor = 0
     while sum(1 for h in hydrated if h.get("role") == "trade") < MAX_CANDIDATES and cursor < len(
         eligible
@@ -719,9 +858,6 @@ def _scan_and_hydrate() -> dict[str, Any]:
         c = eligible[cursor]
         cursor += 1
         _hydrate_trade(c)
-        if ohlcv_budget_hit and sum(1 for h in hydrated if h.get("role") == "trade") > 0:
-            # Keep what we have; fill observe with lite stubs instead of more 429s.
-            break
 
     # Observe = cooled + remaining eligible (lite stubs — no Gecko OHLCV).
     observe_targets: list[Candidate] = list(cooled_observe)
@@ -746,6 +882,7 @@ def _scan_and_hydrate() -> dict[str, Any]:
             continue
         _hydrate_observe_lite(c)
 
+    graduated = _graduate_board_observe()
     _prune_stale_discover(watchlist)
 
     return {
@@ -756,10 +893,52 @@ def _scan_and_hydrate() -> dict[str, Any]:
         "candidates": hydrated,
         "trade_n": sum(1 for h in hydrated if h.get("role") == "trade"),
         "observe_n": sum(1 for h in hydrated if h.get("role") == "observe"),
+        "graduated_n": graduated,
         "ohlcv_rate_limited": ohlcv_budget_hit,
         "rejected": rejected[:30] + safety_rejected,
         "cooled_skipped": cooled_skip,
     }
+
+
+def _graduate_board_observe() -> int:
+    """Promote already-watched observe tokens that now have enough sampled bars."""
+    if _token_source is None or _token_sink is None:
+        return 0
+    n = 0
+    for addr, tok in list((_token_source() or {}).items()):
+        if not isinstance(tok, dict):
+            continue
+        if tok.get("role") != "observe" or tok.get("cooled"):
+            continue
+        mint = str(tok.get("mint") or "").strip()
+        if not mint or _is_cooling(mint):
+            continue
+        tfs = pricefeed.timeframes(mint)
+        best = max(tfs.items(), key=lambda kv: len(kv[1]), default=None)
+        if best is None or len(best[1]) < PRICEFEED_MIN_BARS:
+            continue
+        gate = _gate0_ok(mint)
+        if gate is not True:
+            continue
+        patched = dict(tok)
+        patched["role"] = "trade"
+        patched["tradeable"] = True
+        patched["observe_lite"] = False
+        patched["candle_source"] = "pricefeed"
+        merged = dict(patched.get("timeframes") or {})
+        merged.update(tfs)
+        patched["timeframes"] = merged
+        _token_sink(addr, patched)
+        n += 1
+        pipeline_log.emit(
+            "discover",
+            "graduate",
+            mint=mint,
+            address=addr,
+            symbol=tok.get("name"),
+            bars=len(best[1]),
+        )
+    return n
 
 
 def _gate0_ok(mint: str) -> bool | str:
@@ -815,18 +994,38 @@ def _candidate_from_mint(
     *,
     source: str,
     boost_amount: float = 0.0,
+    pairs_by_mint: Optional[dict[str, list[dict[str, Any]]]] = None,
 ) -> Optional[Candidate]:
-    try:
-        pairs = fetch_dexscreener_pairs(mint)
-    except SourceError:
-        return None
+    pairs = (pairs_by_mint or {}).get(mint)
+    if pairs is None:
+        try:
+            pairs = fetch_dexscreener_pairs(mint)
+        except SourceError:
+            return None
     pair = _best_pair(pairs, preferred_mint=mint)
     if not pair:
         return None
     return _candidate_from_dex_pair(pair, source=source, boost_amount=boost_amount)
 
 
-def _candidate_from_gecko(row: dict[str, Any]) -> Optional[Candidate]:
+def _gecko_mint(row: dict[str, Any]) -> Optional[str]:
+    """Base mint a Gecko pool row refers to, preferring the non-quote side."""
+    rel = row.get("relationships") or {}
+    base_id = ((rel.get("base_token") or {}).get("data") or {}).get("id") or ""
+    quote_id = ((rel.get("quote_token") or {}).get("data") or {}).get("id") or ""
+    mint = base_id.split("_", 1)[-1] if base_id else ""
+    quote = quote_id.split("_", 1)[-1] if quote_id else ""
+    if mint in QUOTE_MINTS and quote and quote not in QUOTE_MINTS:
+        return quote
+    return mint or None
+
+
+def _candidate_from_gecko(
+    row: dict[str, Any],
+    *,
+    source: str = "gecko_trending",
+    pairs_by_mint: Optional[dict[str, list[dict[str, Any]]]] = None,
+) -> Optional[Candidate]:
     attrs = row.get("attributes") or {}
     pool = (attrs.get("address") or "").strip()
     if not pool:
@@ -872,9 +1071,13 @@ def _candidate_from_gecko(row: dict[str, Any]) -> Optional[Candidate]:
         gecko_price = None
 
     # Prefer DexScreener enrichment when available (consistent liquidity/age).
-    enriched = _candidate_from_mint(mint, source="gecko_trending") if mint else None
+    enriched = (
+        _candidate_from_mint(mint, source=source, pairs_by_mint=pairs_by_mint)
+        if mint
+        else None
+    )
     if enriched is not None:
-        enriched.source = "gecko_trending"
+        enriched.source = source
         enriched.tx_h1 = max(enriched.tx_h1, tx_h1)
         if enriched.liquidity_usd <= 0:
             enriched.liquidity_usd = liq
@@ -895,7 +1098,7 @@ def _candidate_from_gecko(row: dict[str, Any]) -> Optional[Candidate]:
         volume_24h_usd=vol24,
         pair_created_at_ms=created_ms,
         tx_h1=tx_h1,
-        source="gecko_trending",
+        source=source,
         price_usd=gecko_price,
     )
 

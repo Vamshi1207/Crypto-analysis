@@ -167,6 +167,53 @@ def recent(limit: int = 100, *, stage: Optional[str] = None) -> list[dict[str, A
     return rows
 
 
+def funnel() -> dict[str, Any]:
+    """Where candidates die between discovery and a fill, this session.
+
+    Answers the question a quiet dashboard cannot: is the roster starved, are
+    forecasts short of the hurdle, or is the paper book refusing fills? Each
+    stage is a count of session pipeline events, so the drop between two rows is
+    the number of names that stage removed.
+    """
+    from decision import session as session_scope
+
+    rows = session_scope.read_since(PIPELINE_KIND)
+    counts: dict[str, int] = {}
+    for row in rows:
+        key = f"{row.get('stage')}.{row.get('event')}"
+        counts[key] = counts.get(key, 0) + 1
+
+    def n(*keys: str) -> int:
+        return sum(counts.get(k, 0) for k in keys)
+
+    stages = [
+        {"stage": "discover_scans", "n": n("discover.scan_done")},
+        {"stage": "gate0_rejects", "n": n("discover.gate0_reject")},
+        {"stage": "hydrated", "n": n("ohlcv.hydrate")},
+        {"stage": "ohlcv_rate_limited", "n": n("ohlcv.rate_limit")},
+        {"stage": "decisions", "n": n("decide.card")},
+        {"stage": "gate1_fail", "n": n("gate1.fail", "forecast.fail")},
+        {"stage": "gate2_fail", "n": n("gate2.fail")},
+        {"stage": "gate2_pass", "n": n("gate2.pass")},
+        {"stage": "momentum_entries", "n": n("momentum.pass")},
+        {"stage": "indicator_blocks", "n": n("indicators.fail")},
+        {"stage": "gate3_risk_veto", "n": n("gate3.fail")},
+        {"stage": "gate4_portfolio_block", "n": n("gate4.fail")},
+        # Most "skipped" rows are simply hold/avoid cards reaching the executor,
+        # which is not a blocked buy — only refusals are.
+        {"stage": "paper_refused", "n": n("paper.refused")},
+        {"stage": "paper_skipped", "n": n("paper.skipped")},
+        {"stage": "paper_opens", "n": n("paper.open", "paper.add_on")},
+        {"stage": "paper_closes", "n": n("paper.close")},
+        {"stage": "arb_fills", "n": n("paper.arb_fill")},
+    ]
+    return {
+        "stages": stages,
+        "events": counts,
+        "total_events": len(rows),
+    }
+
+
 def count_today() -> int:
     """Session-scoped pipeline event count (name kept for callers)."""
     return count_session()
