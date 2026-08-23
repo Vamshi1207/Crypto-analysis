@@ -27,6 +27,7 @@ from decision import snipe_feed
 from decision.config import SETTINGS, WRAPPED_SOL_MINT, _env_float, _env_int
 from decision.pumpfun import (
     CreatorBook,
+    curve_gave_back,
     initial_price_usd,
     snipe_entry,
     snipe_lift_pct,
@@ -79,6 +80,7 @@ SNIPER_DEAD_SEC = _env_float("SNIPER_DEAD_SEC", 6.0)
 SNIPER_ABS_HOLD_SEC = _env_float("SNIPER_ABS_HOLD_SEC", 90.0)
 SNIPER_TARGET_PCT = _env_float("SNIPER_TARGET_PCT", 40.0)
 SNIPER_MAX_PER_TICK = _env_int("SNIPER_MAX_PER_TICK", 1)
+SNIPER_CURVE_DROP_PCT = _env_float("SNIPER_CURVE_DROP_PCT", 50.0)
 SNIPER_LISTEN = os.getenv("SNIPER_LISTEN", "1").strip() == "1"
 _SNIPE_DEATH_EXTS = frozenset(
     {"nonTransferable", "permanentDelegate", "transferHook", "pausableConfig"}
@@ -201,6 +203,7 @@ def status() -> dict[str, Any]:
                 "sniper_abs_hold_sec": SNIPER_ABS_HOLD_SEC,
                 "sniper_target_pct": SNIPER_TARGET_PCT,
                 "sniper_max_per_tick": SNIPER_MAX_PER_TICK,
+                "sniper_curve_drop_pct": SNIPER_CURVE_DROP_PCT,
             },
             "launch_enabled": LAUNCH_ENABLED,
             "cluster_enabled": CLUSTER_ENABLED,
@@ -474,6 +477,7 @@ def _scan_sniper() -> tuple[int, int, int, int, list[dict[str, Any]]]:
         buys = int(tape.get("buys") or 0)
         sells = int(tape.get("sells") or 0)
         real_sol = float(tape.get("real_sol") or 0.0)
+        peak_real = float(tape.get("peak_real_sol") or 0.0)
         age = now - float(watch.get("seen_at") or now)
         ok, why = snipe_entry(
             create_px=create_px,
@@ -488,8 +492,11 @@ def _scan_sniper() -> tuple[int, int, int, int, list[dict[str, Any]]]:
             min_lift_pct=SNIPER_MIN_LIFT_PCT,
             fast_lift_pct=SNIPER_FAST_LIFT_PCT,
             min_real_sol=SNIPER_MIN_REAL_SOL,
+            dev_sold=bool(tape.get("dev_sold")),
+            peak_real_sol=peak_real,
+            curve_drop_pct=SNIPER_CURVE_DROP_PCT,
         )
-        if why in {"watch_expired", "net_selling"}:
+        if why in {"watch_expired", "net_selling", "dev_sold", "curve_dump"}:
             _seen_mints.add(mint)
             _watches.pop(mint, None)
             expired += 1
@@ -820,7 +827,20 @@ def _open(
     return result
 
 
+def _tape_force_reason(tape: dict[str, Any]) -> Optional[str]:
+    if tape.get("dev_sold"):
+        return "dev_sell"
+    if curve_gave_back(
+        float(tape.get("peak_real_sol") or 0.0),
+        float(tape.get("real_sol") or 0.0),
+        drop_pct=SNIPER_CURVE_DROP_PCT,
+    ):
+        return "curve_dump"
+    return None
+
+
 def _mark_open_lots() -> None:
+    tape_map = snipe_feed.tapes(sol_usd=_sol_usd())
     snap = paper.snapshot()
     for pos in snap.get("open") or []:
         if not isinstance(pos, dict):
@@ -833,15 +853,23 @@ def _mark_open_lots() -> None:
         reason = pos.get("entry_reason")
         if reason != "snipe" and _just_opened(opened):
             continue
+        tape = tape_map.get(str(mint or "")) or {}
         mark = None
         if reason == "snipe" and mint:
             mark = _snipe_marks.get(str(mint))
+            if mark is None:
+                mark = float(tape.get("last_px") or 0.0) or None
         if mark is None:
             mark = dex_price_usd(str(mint or ""), pool=str(addr))
         if mark is None and mint:
             mark = _snipe_marks.get(str(mint))
         if mark:
-            paper.mark_and_maybe_exit(address=str(addr), mark_price=mark)
+            force = _tape_force_reason(tape) if reason == "snipe" else None
+            paper.mark_and_maybe_exit(
+                address=str(addr),
+                mark_price=mark,
+                force_reason=force,
+            )
 
 
 def _just_opened(opened_at: Any) -> bool:

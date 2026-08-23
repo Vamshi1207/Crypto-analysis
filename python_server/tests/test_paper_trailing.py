@@ -259,6 +259,58 @@ def test_snipe_dump_hits_stop_not_a_twenty_dollar_scratch(trailing, monkeypatch)
     paper.reset()
 
 
+def test_snipe_situational_still_banks_the_dollar(trailing):
+    paper.reset()
+    opened = paper.execute_signal(
+        address="PoolTrail",
+        mint="MintTrail",
+        name="RUNNER",
+        mark_price=1.0,
+        size_usd=40.0,
+        strategy="snipe",
+        max_hold_sec=45.0,
+        bank_at_target=True,
+        target_profit_usd=1.0,
+        take_profit_pct=40.0,
+        dead_after_sec=6.0,
+        abs_hold_sec=90.0,
+    )
+    assert opened["status"] == "opened"
+    closed = paper.mark_and_maybe_exit(address="PoolTrail", mark_price=1.07)
+    assert closed
+    assert "snipe_target" in (closed[0].get("close_reason") or "")
+    assert closed[0]["realized_pnl_usd"] == pytest.approx(1.0, abs=0.02)
+    paper.reset()
+
+
+def test_snipe_force_reason_flattens_without_a_twenty_dollar_gap(trailing, monkeypatch):
+    monkeypatch.setattr(paper, "STOP_FILL_MODE", "barrier")
+    monkeypatch.setattr(paper, "ENTRY_CONFIRM_PCT", 8.0)
+    paper.reset()
+    opened = paper.execute_signal(
+        address="PoolDev",
+        mint="MintDev",
+        name="DEV",
+        mark_price=1.0,
+        size_usd=40.0,
+        strategy="snipe",
+        max_hold_sec=45.0,
+        bank_at_target=True,
+        target_profit_usd=1.0,
+        stop_loss_usd=0.80,
+        dead_after_sec=6.0,
+        abs_hold_sec=90.0,
+    )
+    assert opened["status"] == "opened"
+    closed = paper.mark_and_maybe_exit(
+        address="PoolDev", mark_price=0.48, force_reason="dev_sell"
+    )
+    assert closed
+    assert "dev_sell" in (closed[0].get("close_reason") or "")
+    assert closed[0]["realized_pnl_usd"] == pytest.approx(-0.80, abs=0.02)
+    paper.reset()
+
+
 def test_snipe_green_tape_skips_the_clock(trailing):
     paper.reset()
     opened = paper.execute_signal(

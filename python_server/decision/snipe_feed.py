@@ -25,6 +25,7 @@ from decision.pumpfun import (
     VIRTUAL_SOL_LAMPORTS,
     VIRTUAL_TOKEN_RAW,
     curve_price_usd,
+    is_dev_sell,
     parse_create_logs,
     parse_trade_logs,
 )
@@ -83,6 +84,8 @@ def tapes(*, sol_usd: float) -> dict[str, dict[str, Any]]:
                 "virt_sol": virt_sol,
                 "virt_token": virt_token,
                 "real_sol": float(row.get("real_sol") or 0.0),
+                "peak_real_sol": float(row.get("peak_real_sol") or 0.0),
+                "dev_sold": bool(row.get("dev_sold")),
                 "buys": int(row.get("buys") or 0),
                 "sells": int(row.get("sells") or 0),
                 "unique_buyers": len(buyers),
@@ -301,6 +304,8 @@ def _note_create(parsed: dict[str, Any]) -> None:
                 "virt_sol": int(row.get("virt_sol") or VIRTUAL_SOL_LAMPORTS),
                 "virt_token": int(row.get("virt_token") or VIRTUAL_TOKEN_RAW),
                 "real_sol": float(row.get("real_sol") or 0.0),
+                "peak_real_sol": float(row.get("peak_real_sol") or 0.0),
+                "dev_sold": bool(row.get("dev_sold")),
                 "buys": int(row.get("buys") or 0),
                 "sells": int(row.get("sells") or 0),
                 "buyers": row.get("buyers") if isinstance(row.get("buyers"), set) else set(),
@@ -321,6 +326,8 @@ def _note_trade(trade: dict[str, Any]) -> None:
             "virt_sol": VIRTUAL_SOL_LAMPORTS,
             "virt_token": VIRTUAL_TOKEN_RAW,
             "real_sol": 0.0,
+            "peak_real_sol": 0.0,
+            "dev_sold": False,
             "buys": 0,
             "sells": 0,
             "buyers": set(),
@@ -331,14 +338,22 @@ def _note_trade(trade: dict[str, Any]) -> None:
             buyers = set()
         row["virt_sol"] = int(trade.get("virt_sol") or row.get("virt_sol") or 0)
         row["virt_token"] = int(trade.get("virt_token") or row.get("virt_token") or 0)
-        row["real_sol"] = float(trade.get("real_sol_ui") or row.get("real_sol") or 0.0)
+        real_sol = float(trade.get("real_sol_ui") or row.get("real_sol") or 0.0)
+        row["real_sol"] = real_sol
+        row["peak_real_sol"] = max(float(row.get("peak_real_sol") or 0.0), real_sol)
+        user = trade.get("user") or ""
         if trade.get("is_buy"):
             row["buys"] = int(row.get("buys") or 0) + 1
-            user = trade.get("user") or ""
             if user:
                 buyers.add(user)
         else:
             row["sells"] = int(row.get("sells") or 0) + 1
+            if is_dev_sell(
+                creator=str(row.get("creator") or ""),
+                user=user,
+                is_buy=False,
+            ):
+                row["dev_sold"] = True
         row["buyers"] = buyers
         row["updated_at"] = now
         _tapes[mint] = row

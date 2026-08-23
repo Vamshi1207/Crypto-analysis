@@ -173,12 +173,19 @@ def snipe_entry(
     min_lift_pct: float = 5.0,
     fast_lift_pct: float = 12.0,
     min_real_sol: float = 2.5,
+    dev_sold: bool = False,
+    peak_real_sol: float = 0.0,
+    curve_drop_pct: float = 50.0,
 ) -> tuple[bool, str]:
     """Buy only when the curve shows demand — never on a bare create."""
     if create_px <= 0:
         return False, "no_create_px"
     if age_sec > watch_sec:
         return False, "watch_expired"
+    if dev_sold:
+        return False, "dev_sold"
+    if curve_gave_back(peak_real_sol, real_sol, drop_pct=curve_drop_pct):
+        return False, "curve_dump"
     if sells > buys:
         return False, "net_selling"
     lift = ((last_px / create_px) - 1.0) * 100.0 if last_px > 0 else 0.0
@@ -210,6 +217,26 @@ def snipe_lift_pct(create_px: float, last_px: float) -> float:
     if create_px <= 0 or last_px <= 0:
         return 0.0
     return ((last_px / create_px) - 1.0) * 100.0
+
+
+def is_dev_sell(*, creator: str, user: str, is_buy: bool) -> bool:
+    """True when the create wallet sells on the same mint's curve."""
+    if is_buy or not creator or not user:
+        return False
+    return creator == user
+
+
+def curve_gave_back(
+    peak_real_sol: float,
+    real_sol: float,
+    *,
+    drop_pct: float = 50.0,
+    min_peak_sol: float = 2.0,
+) -> bool:
+    """True when curve SOL has dumped this far from its high-water mark."""
+    if peak_real_sol < min_peak_sol or drop_pct <= 0:
+        return False
+    return real_sol <= peak_real_sol * (1.0 - drop_pct / 100.0)
 
 
 def _borsh_string(buf: bytes, offset: int) -> tuple[str, int]:

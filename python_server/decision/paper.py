@@ -104,7 +104,7 @@ class PaperPosition:
     last_mark_pnl_usd: float = 0.0
     entry_reason: Optional[str] = None
     max_hold_sec: Optional[float] = None
-    # Sniper: bank the dollar target and leave. Cluster/forecast still trail.
+    # Sniper: $1 arms the trail on a live tape. Instant clip only if not situational.
     bank_at_target: bool = False
     take_profit_pct: float = 0.0
     # Situation hold: scratch a dead tape early; only clock-stop if stalled.
@@ -684,8 +684,9 @@ def mark_and_maybe_exit(
     *,
     address: str,
     mark_price: float,
+    force_reason: Optional[str] = None,
 ) -> list[dict[str, Any]]:
-    """Update open positions for address; close on +$1, stop, or max hold.
+    """Update open positions for address; close on stop, trail, or a tape force.
 
     Stop fills honour ``PAPER_STOP_FILL_MODE``. Default ``barrier`` exits at the
     price that realizes exactly ``-stop_loss_usd``, so a gap through the level
@@ -748,6 +749,8 @@ def mark_and_maybe_exit(
                 exit_price, pnl, reason = _resolve_stop_exit(
                     pos, mark_price, mark_pnl, exit_cost_frac
                 )
+                if force_reason:
+                    reason = f"{force_reason} {reason}"
             elif pos.bank_at_target and (
                 (
                     (pos.take_profit_pct or 0.0) > 0
@@ -755,6 +758,8 @@ def mark_and_maybe_exit(
                 )
                 or decision_pnl >= pos.target_profit_usd
             ):
+                # Bank the dollar (or the rip) before a later tape force can
+                # flatten a winner that already paid. This was the edge.
                 rip = pos.size_usd * (pos.take_profit_pct or 0.0) / 100.0
                 if rip > 0 and mark_pnl >= rip:
                     pnl = rip
@@ -763,6 +768,18 @@ def mark_and_maybe_exit(
                     pnl = pos.target_profit_usd
                     reason = f"snipe_target ${pnl:.2f}"
                 exit_price = _implied_exit_price(pos, pnl, exit_cost_frac)
+            elif force_reason:
+                if _venue_gap(pos.entry_price, mark_price):
+                    pnl = last_accepted
+                    exit_price = _implied_exit_price(pos, pnl, exit_cost_frac)
+                    reason = (
+                        f"{force_reason} pnl=${pnl:.2f} "
+                        f"(unconfirmed mark ${mark_pnl:.2f})"
+                    )
+                else:
+                    reason = f"{force_reason} pnl=${mark_pnl:.2f}"
+                    exit_price = mark_price
+                    pnl = mark_pnl
             elif (
                 situational
                 and pos.dead_after_sec
@@ -802,7 +819,8 @@ def mark_and_maybe_exit(
                     exit_price = mark_price
                     pnl = mark_pnl
             elif pos.bank_at_target:
-                trailed = _trail_exit(pos, decision_pnl) if TRAIL_ENABLED else None
+                use_trail = TRAIL_ENABLED or situational
+                trailed = _trail_exit(pos, decision_pnl) if use_trail else None
                 if trailed is not None:
                     pnl, reason = trailed
                     exit_price = _implied_exit_price(pos, pnl, exit_cost_frac)

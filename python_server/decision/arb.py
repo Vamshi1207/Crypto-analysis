@@ -1,20 +1,10 @@
-"""Parallel paper channel: cross-pool Solana quote arbitrage (no live swaps).
+"""Parallel paper channel: Jupiter circular + Dex-screened Solana arb.
 
-This is the useful slice of the viral “ms arb bot” idea — detect when the *same*
-mint prints different USD prices on two DEXes/pools, size the gap against real
-round-trip costs, and book a paper atomic round-trip when net edge clears.
+DexScreener two-pool mids are only a screen. The fill is always a Jupiter
+SOL→mint→SOL (or seed-mint) quote — the same loop public Jupiter arb bots
+run. Intermediate hops are allowed so a Raydium→Orca imbalance can print.
 
-Honesty upgrades (paper still optimistic vs live MEV/latency, but less naive):
-- Size capped by a fraction of the thinner pool (cannot always deploy $40).
-- Per-mint cooldown + daily fill cap (no double-counting every tick).
-- Cross-DEX only (same-venue gaps are often noise).
-- Half-gap stress gate: if the spread halves, edge must still clear the hurdle.
-- Jupiter round-trip quote (SOL→mint→SOL); booked PnL matches that path.
-- Booked PnL debits/credits the **shared** paper cash ledger with scalps.
-
-It does **not** do mempool racing or Jito bundles yet. True millisecond racing
-needs paid Geyser/gRPC or Jito; this channel asks whether gaps survive *our*
-cost model before any live tips are spent.
+Paper only. No mempool sandwich, no Jito create+buy, no wash volume.
 """
 
 from __future__ import annotations
@@ -81,6 +71,22 @@ JUPITER_IMPACT_LEGS = _env_float("ARB_JUPITER_IMPACT_LEGS", 2.0)
 # Also try SOL→mint Jupiter quote when we can price SOL.
 REQUIRE_BUY_ROUTE = os.getenv("ARB_REQUIRE_BUY_ROUTE", "1").strip() == "1"
 SOL_USD_FALLBACK = _env_float("ARB_SOL_USD_FALLBACK", 140.0)
+# Quote Jupiter A→B→A on every mint, not only when Dex shows two pools.
+CIRCULAR_ENABLED = os.getenv("ARB_CIRCULAR", "1").strip() == "1"
+MAX_CIRCULAR_PER_TICK = _env_int("ARB_MAX_CIRCULAR_PER_TICK", 4)
+# Allow multi-hop Jupiter routes (the actual arb path). Restricted quotes
+# were rejecting every Dex gap because they could not cross venues.
+RESTRICT_INTERMEDIATE = os.getenv("ARB_RESTRICT_INTERMEDIATE", "0").strip() == "1"
+# Liquid majors the Dex-meme universe misses. Comma-separated mint:symbol.
+_DEFAULT_SEEDS = (
+    "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v:USDC,"
+    "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB:USDT,"
+    "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN:JUP,"
+    "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263:BONK,"
+    "EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm:WIF,"
+    "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R:RAY"
+)
+SEED_MINTS_RAW = os.getenv("ARB_SEED_MINTS", _DEFAULT_SEEDS)
 
 
 @dataclass
@@ -105,6 +111,7 @@ class ArbOpportunity:
     size_usd: float
     expected_pnl_usd: float
     stress_pnl_usd: float
+    preverified: Optional[dict[str, Any]] = None
 
 
 @dataclass
@@ -131,6 +138,8 @@ _get_tokens: Optional[Callable[[], dict[str, Any]]] = None
 _cool_until: dict[str, float] = {}
 _fills_today: dict[str, tuple[str, int]] = {}
 _sol_usd_cache: tuple[float, float] = (0.0, 0.0)  # (unix_ts, usd)
+_last_jup_ts = 0.0
+_JUP_GAP_SEC = _env_float("ARB_JUPITER_GAP_SEC", 0.4)
 
 
 def configure(*, get_tokens: Callable[[], dict[str, Any]]) -> None:
@@ -192,6 +201,10 @@ def status() -> dict[str, Any]:
                 "max_jupiter_impact_pct": MAX_JUPITER_IMPACT_PCT,
                 "jupiter_impact_legs": JUPITER_IMPACT_LEGS,
                 "require_buy_route": REQUIRE_BUY_ROUTE,
+                "circular": CIRCULAR_ENABLED,
+                "max_circular_per_tick": MAX_CIRCULAR_PER_TICK,
+                "restrict_intermediate": RESTRICT_INTERMEDIATE,
+                "seed_mints": len(_seed_mints()),
             },
             "enabled_env": ARB_ENABLED,
             "live_trading": False,
@@ -280,11 +293,33 @@ def _run(interval_s: float) -> None:
         _state.running = False
 
 
+def _seed_mints() -> list[tuple[str, str]]:
+    out: list[tuple[str, str]] = []
+    for part in (SEED_MINTS_RAW or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if ":" in part:
+            mint, symbol = part.split(":", 1)
+        else:
+            mint, symbol = part, part[:4]
+        mint = mint.strip()
+        if len(mint) < 32 or mint == WRAPPED_SOL_MINT:
+            continue
+        out.append((mint, symbol.strip() or mint[:4]))
+    return out
+
+
 def _universe_mints() -> list[tuple[str, str]]:
-    """Return [(mint, symbol), ...] from the live discover/extension buffer."""
+    """Seeds first (liquid majors), then the live discover buffer."""
     tokens = (_get_tokens() or {}) if _get_tokens else {}
     out: list[tuple[str, str]] = []
     seen: set[str] = set()
+    for mint, symbol in _seed_mints():
+        if mint in seen:
+            continue
+        seen.add(mint)
+        out.append((mint, symbol))
     for _addr, tok in tokens.items():
         if not isinstance(tok, dict):
             continue
@@ -413,6 +448,123 @@ def find_opportunities(mint: str, *, symbol: str = "") -> list[ArbOpportunity]:
     ]
 
 
+def _jupiter_quote(input_mint: str, output_mint: str, amount_raw: int) -> dict[str, Any]:
+    global _last_jup_ts
+    wait = _JUP_GAP_SEC - (time.time() - _last_jup_ts)
+    if wait > 0:
+        time.sleep(wait)
+    _last_jup_ts = time.time()
+    return fetch_jupiter_quote(
+        input_mint,
+        output_mint,
+        amount_raw,
+        restrict_intermediate=RESTRICT_INTERMEDIATE,
+    )
+
+
+def find_circular(mint: str, *, symbol: str = "") -> Optional[ArbOpportunity]:
+    """Jupiter SOL→mint→SOL. This is what the public arb bots actually trade."""
+    if mint == WRAPPED_SOL_MINT:
+        return None
+    ok, jup = _round_trip_quote(mint, SIZE_USD)
+    if not ok:
+        return None
+    net = float(jup.get("round_trip_net_pct") or 0.0)
+    pnl = float(jup.get("round_trip_pnl_usd") or 0.0)
+    if net < MIN_EDGE_PCT:
+        return None
+    dummy = PoolQuote(
+        pair="jupiter",
+        dex="jupiter",
+        price_usd=1.0,
+        liquidity_usd=1_000_000.0,
+        symbol=symbol or mint[:4],
+    )
+    return ArbOpportunity(
+        mint=mint,
+        symbol=symbol or mint[:4],
+        buy=dummy,
+        sell=dummy,
+        gross_pct=net,
+        cost_pct=0.0,
+        net_pct=net,
+        stress_net_pct=net,
+        size_usd=SIZE_USD,
+        expected_pnl_usd=pnl,
+        stress_pnl_usd=pnl,
+        preverified=jup,
+    )
+
+
+def _round_trip_quote(mint: str, size_usd: float) -> tuple[bool, dict[str, Any]]:
+    """Executable SOL→mint→SOL. Book only this number, never a Dex mid."""
+    sol_usd = _estimate_sol_usd()
+    sol_in = int((size_usd / sol_usd) * (10**9))
+    if sol_in <= 0:
+        return False, {"verified": False, "reason": "buy_size_rounds_to_zero"}
+    try:
+        buy_q = _jupiter_quote(WRAPPED_SOL_MINT, mint, sol_in)
+    except NoRouteError as exc:
+        return False, {"verified": False, "reason": f"no_buy_route: {exc}"}
+    except SourceError as exc:
+        return False, {"verified": False, "reason": f"jupiter_buy_unavailable: {exc}"}
+    try:
+        mint_out = int(buy_q.get("outAmount") or 0)
+    except (TypeError, ValueError):
+        mint_out = 0
+    if mint_out <= 0:
+        return False, {"verified": False, "reason": "buy_quote_empty"}
+    try:
+        sell_q = _jupiter_quote(mint, WRAPPED_SOL_MINT, mint_out)
+    except NoRouteError as exc:
+        return False, {"verified": False, "reason": f"no_route: {exc}"}
+    except SourceError as exc:
+        return False, {"verified": False, "reason": f"jupiter_unavailable: {exc}"}
+    try:
+        sol_out = int(sell_q.get("outAmount") or 0)
+    except (TypeError, ValueError):
+        sol_out = 0
+    if sol_out <= 0:
+        return False, {"verified": False, "reason": "sell_quote_empty"}
+    buy_impact = _impact_pct(buy_q)
+    sell_impact = _impact_pct(sell_q)
+    impact_pct = sell_impact
+    if buy_impact is not None and sell_impact is not None:
+        impact_rt = buy_impact + sell_impact
+    elif sell_impact is not None:
+        impact_rt = sell_impact * JUPITER_IMPACT_LEGS
+    elif buy_impact is not None:
+        impact_rt = buy_impact * JUPITER_IMPACT_LEGS
+        impact_pct = buy_impact
+    else:
+        impact_rt = None
+    if impact_pct is not None and impact_pct > MAX_JUPITER_IMPACT_PCT:
+        return False, {
+            "verified": False,
+            "reason": f"impact {impact_pct:.2f}% > {MAX_JUPITER_IMPACT_PCT}",
+            "impact_pct": round(impact_pct, 4),
+        }
+    pnl_usd = round((sol_out - sol_in) / (10**9) * sol_usd, 4)
+    net_pct = round((pnl_usd / size_usd) * 100.0, 4) if size_usd else 0.0
+    body = {
+        "verified": net_pct >= MIN_EDGE_PCT,
+        "impact_pct": None if impact_pct is None else round(impact_pct, 4),
+        "impact_rt_pct": None if impact_rt is None else round(impact_rt, 4),
+        "round_trip_pnl_usd": pnl_usd,
+        "round_trip_net_pct": net_pct,
+        "booked_net_pct": net_pct,
+        "sol_in_lamports": sol_in,
+        "sol_out_lamports": sol_out,
+        "mint_out_raw": mint_out,
+        "sol_usd": round(sol_usd, 4),
+        "size_usd": size_usd,
+    }
+    if net_pct < MIN_EDGE_PCT:
+        body["reason"] = f"round_trip net {net_pct:.2f}% < {MIN_EDGE_PCT}"
+        return False, body
+    return True, body
+
+
 def _arb_cost_pct() -> float:
     slip = ARB_SLIP_PCT if ARB_SLIP_PCT > 0 else None
     return costs.round_trip_cost_pct(
@@ -490,10 +642,24 @@ def _record_fill_limits(mint: str) -> None:
 def _scan_and_maybe_fill() -> dict[str, Any]:
     universe = _universe_mints()
     opps: list[ArbOpportunity] = []
+    quoted: set[str] = set()
+    if CIRCULAR_ENABLED:
+        for mint, symbol in universe[:MAX_CIRCULAR_PER_TICK]:
+            circ = find_circular(mint, symbol=symbol)
+            quoted.add(mint)
+            if circ is not None:
+                opps.append(circ)
     for mint, symbol in universe:
+        if mint in quoted:
+            continue
         opps.extend(find_opportunities(mint, symbol=symbol))
 
-    opps.sort(key=lambda o: o.stress_net_pct, reverse=True)
+    opps.sort(
+        key=lambda o: (
+            float((o.preverified or {}).get("round_trip_net_pct") or o.stress_net_pct)
+        ),
+        reverse=True,
+    )
     fills: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
     skipped_cooldown_n = 0
@@ -525,7 +691,10 @@ def _scan_and_maybe_fill() -> dict[str, Any]:
             )
             continue
 
-        ok, jup = _jupiter_verify(opp)
+        if opp.preverified:
+            ok, jup = True, opp.preverified
+        else:
+            ok, jup = _jupiter_verify(opp)
         if not ok:
             reason = str(jup.get("reason") or "jupiter_reject")
             if "round_trip" in reason or "stress" in reason or "impact-adjusted" in reason:
@@ -641,7 +810,7 @@ def _jupiter_verify(opp: ArbOpportunity) -> tuple[bool, dict[str, Any]]:
 
     if REQUIRE_BUY_ROUTE:
         try:
-            buy_q = fetch_jupiter_quote(WRAPPED_SOL_MINT, opp.mint, sol_in)
+            buy_q = _jupiter_quote(WRAPPED_SOL_MINT, opp.mint, sol_in)
         except NoRouteError as exc:
             return False, {"verified": False, "reason": f"no_buy_route: {exc}"}
         except SourceError as exc:
@@ -667,7 +836,7 @@ def _jupiter_verify(opp: ArbOpportunity) -> tuple[bool, dict[str, Any]]:
             return False, {"verified": False, "reason": "size_rounds_to_zero"}
 
     try:
-        sell_q = fetch_jupiter_quote(opp.mint, WRAPPED_SOL_MINT, mint_out)
+        sell_q = _jupiter_quote(opp.mint, WRAPPED_SOL_MINT, mint_out)
     except NoRouteError as exc:
         return False, {"verified": False, "reason": f"no_route: {exc}"}
     except SourceError as exc:

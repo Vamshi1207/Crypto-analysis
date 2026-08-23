@@ -38,6 +38,7 @@ def _patch_basic(monkeypatch, *, cost: float = 3.0):
     # These cases assert the Dex stress prefilter, so pin the mode regardless of
     # what the deployed .env selects.
     monkeypatch.setattr(arb, "PREFILTER_MODE", "stress")
+    monkeypatch.setattr(arb, "CIRCULAR_ENABLED", False)
     monkeypatch.setattr(arb, "_arb_cost_pct", lambda: cost)
 
 
@@ -309,6 +310,57 @@ def test_jupiter_gate_skips_unroutable(monkeypatch, tmp_path):
     assert result["fills_n"] == 0
     assert result["skipped_n"] == 1
     assert list(decision_store.read("paper")) == []
+
+
+def test_circular_round_trip_fills_without_dex_pairs(monkeypatch, tmp_path):
+    from decision import paper
+    from decision import store as decision_store
+
+    monkeypatch.setattr(decision_store, "STORE_DIR", tmp_path / "store")
+    _patch_basic(monkeypatch, cost=1.0)
+    monkeypatch.setattr(arb, "CIRCULAR_ENABLED", True)
+    monkeypatch.setattr(arb, "MIN_EDGE_PCT", 0.05)
+    monkeypatch.setattr(arb, "SIZE_USD", 40.0)
+    monkeypatch.setattr(arb, "SEED_MINTS_RAW", "")
+    arb.reset_counters()
+    paper.reset(starting_cash_usd=1000.0)
+    monkeypatch.setattr(arb, "_estimate_sol_usd", lambda: 100.0)
+
+    def fake_quote(input_mint, output_mint, amount_raw, **kwargs):
+        if input_mint == WRAPPED_SOL_MINT:
+            return {"outAmount": "1000000", "priceImpactPct": "0.001"}
+        return {"outAmount": str(int(0.405 * 10**9)), "priceImpactPct": "0.001"}
+
+    monkeypatch.setattr(arb, "fetch_jupiter_quote", fake_quote)
+    monkeypatch.setattr(arb, "fetch_dexscreener_pairs", lambda mint: [])
+    arb.configure(get_tokens=lambda: {"a": {"mint": MEME, "name": "MEME"}})
+    result = arb.scan_once()
+    assert result["fills_n"] == 1
+    assert result["pnl_usd"] == 0.5
+    assert paper.snapshot()["arb_fills"] == 1
+
+
+def test_circular_skips_when_round_trip_loses(monkeypatch, tmp_path):
+    from decision import store as decision_store
+
+    monkeypatch.setattr(decision_store, "STORE_DIR", tmp_path / "store")
+    _patch_basic(monkeypatch, cost=1.0)
+    monkeypatch.setattr(arb, "CIRCULAR_ENABLED", True)
+    monkeypatch.setattr(arb, "MIN_EDGE_PCT", 0.05)
+    monkeypatch.setattr(arb, "SEED_MINTS_RAW", "")
+    arb.reset_counters()
+    monkeypatch.setattr(arb, "_estimate_sol_usd", lambda: 100.0)
+
+    def fake_quote(input_mint, output_mint, amount_raw, **kwargs):
+        if input_mint == WRAPPED_SOL_MINT:
+            return {"outAmount": "1000000", "priceImpactPct": "0.001"}
+        return {"outAmount": str(int(0.39 * 10**9)), "priceImpactPct": "0.001"}
+
+    monkeypatch.setattr(arb, "fetch_jupiter_quote", fake_quote)
+    monkeypatch.setattr(arb, "fetch_dexscreener_pairs", lambda mint: [])
+    arb.configure(get_tokens=lambda: {"a": {"mint": MEME, "name": "MEME"}})
+    result = arb.scan_once()
+    assert result["fills_n"] == 0
 
 
 def test_pick_tf_prefers_5s():

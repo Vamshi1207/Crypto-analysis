@@ -113,6 +113,29 @@ def test_snipe_entry_waits_for_tape_then_buys_on_lift():
     assert ok is False
     assert why == "watch_expired"
 
+    ok, why = pumpfun.snipe_entry(
+        create_px=create, last_px=create * 1.20, unique_buyers=3,
+        buys=4, sells=1, real_sol=4.0, age_sec=8.0, dev_sold=True,
+    )
+    assert ok is False
+    assert why == "dev_sold"
+
+    ok, why = pumpfun.snipe_entry(
+        create_px=create, last_px=create * 1.20, unique_buyers=3,
+        buys=4, sells=1, real_sol=2.0, age_sec=8.0, peak_real_sol=6.0,
+    )
+    assert ok is False
+    assert why == "curve_dump"
+
+
+def test_dev_sell_and_curve_giveback():
+    assert pumpfun.is_dev_sell(creator="Dev", user="Dev", is_buy=False) is True
+    assert pumpfun.is_dev_sell(creator="Dev", user="Dev", is_buy=True) is False
+    assert pumpfun.is_dev_sell(creator="Dev", user="Other", is_buy=False) is False
+    assert pumpfun.curve_gave_back(6.0, 2.8) is True
+    assert pumpfun.curve_gave_back(6.0, 4.0) is False
+    assert pumpfun.curve_gave_back(1.0, 0.4) is False
+
 
 def test_snipe_size_scales_with_tape():
     assert pumpfun.snipe_size(40.0, lift_pct=6.0, unique_buyers=2, real_sol=3.0) == 20.0

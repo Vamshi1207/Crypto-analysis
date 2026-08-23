@@ -261,6 +261,92 @@ def test_scan_sniper_buys_only_after_tape_lifts(monkeypatch, tmp_path):
     paper.reset()
 
 
+def test_scan_sniper_skips_after_dev_sell(monkeypatch):
+    trenches.reset_counters()
+    paper.reset(starting_cash_usd=1000.0)
+    create_px = 1e-6
+    mint = "MintRug11111111111111111111111111111"
+    monkeypatch.setattr(trenches, "_sol_usd", lambda: 150.0)
+    monkeypatch.setattr(trenches, "initial_price_usd", lambda sol: create_px)
+    monkeypatch.setattr(
+        snipe_feed,
+        "drain",
+        lambda limit=32: [
+            {
+                "mint": mint,
+                "symbol": "RUG",
+                "creator": "DevRug111111111111111111111111111",
+                "bonding_curve": "CurveRug",
+                "seen_at": time.time(),
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        snipe_feed,
+        "tapes",
+        lambda sol_usd=150: {
+            mint: {
+                "last_px": create_px * 1.20,
+                "unique_buyers": 4,
+                "buys": 5,
+                "sells": 1,
+                "real_sol": 4.0,
+                "peak_real_sol": 4.0,
+                "dev_sold": True,
+            }
+        },
+    )
+    seen, opens, skipped, expired, hits = trenches._scan_sniper()
+    assert opens == 0
+    assert expired >= 1
+    assert mint not in trenches._watches
+    trenches.reset_counters()
+
+
+def test_snipe_feed_marks_dev_sell_and_peak_sol():
+    snipe_feed.clear_tape()
+    mint = "MintTape111111111111111111111111111"
+    creator = "DevTape111111111111111111111111111"
+    snipe_feed._note_create(
+        {"mint": mint, "creator": creator, "symbol": "TAPE", "bonding_curve": "Curve"}
+    )
+    snipe_feed._note_trade(
+        {
+            "mint": mint,
+            "user": "Buyer11111111111111111111111111111",
+            "is_buy": True,
+            "real_sol_ui": 6.0,
+            "virt_sol": 36_000_000_000,
+            "virt_token": 1_000_000_000_000_000,
+        }
+    )
+    snipe_feed._note_trade(
+        {
+            "mint": mint,
+            "user": creator,
+            "is_buy": False,
+            "real_sol_ui": 2.4,
+            "virt_sol": 32_000_000_000,
+            "virt_token": 1_050_000_000_000_000,
+        }
+    )
+    tape = snipe_feed.tapes(sol_usd=150.0)[mint]
+    assert tape["dev_sold"] is True
+    assert tape["peak_real_sol"] == 6.0
+    assert tape["real_sol"] == 2.4
+    snipe_feed.clear_tape()
+
+
+def test_tape_force_reason_flags_dev_and_curve_dump():
+    assert trenches._tape_force_reason({"dev_sold": True}) == "dev_sell"
+    assert trenches._tape_force_reason(
+        {"dev_sold": False, "peak_real_sol": 8.0, "real_sol": 3.0}
+    ) == "curve_dump"
+    assert trenches._tape_force_reason(
+        {"dev_sold": False, "peak_real_sol": 8.0, "real_sol": 7.0}
+    ) is None
+
+
 def test_execute_signal_and_cluster_sell(tmp_path, monkeypatch):
     from decision import store as decision_store
 

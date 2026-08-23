@@ -32,7 +32,7 @@ GECKO_TRENDING_URL = f"{GECKO_BASE_URL}/networks/solana/trending_pools"
 # back rather than hard-failing the sellability probe.
 JUPITER_QUOTE_URLS = (
     "https://lite-api.jup.ag/swap/v1/quote",
-    "https://quote-api.jup.ag/v6/quote",
+    "https://api.jup.ag/swap/v1/quote",
 )
 
 _rpc_ids = itertools.count(1)
@@ -455,6 +455,7 @@ def fetch_jupiter_quote(
     amount_raw: int,
     *,
     slippage_bps: int = 300,
+    restrict_intermediate: bool = True,
 ) -> dict[str, Any]:
     """Quote a Jupiter swap. Raises NoRouteError when routable-but-impossible."""
 
@@ -464,7 +465,7 @@ def fetch_jupiter_quote(
             "outputMint": output_mint,
             "amount": str(amount_raw),
             "slippageBps": str(slippage_bps),
-            "restrictIntermediateTokens": "true",
+            "restrictIntermediateTokens": "true" if restrict_intermediate else "false",
         }
         last_error: Optional[str] = None
 
@@ -499,7 +500,10 @@ def fetch_jupiter_quote(
 
         raise SourceError(last_error or "jupiter unreachable")
 
-    cache_key = f"{input_mint}->{output_mint}:{amount_raw}:{slippage_bps}"
+    cache_key = (
+        f"{input_mint}->{output_mint}:{amount_raw}:{slippage_bps}:"
+        f"ri={int(restrict_intermediate)}"
+    )
     return cache.get_or_set("jupiter_quote", cache_key, produce)
 
 
