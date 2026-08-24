@@ -189,7 +189,11 @@ def snipe_entry(
     if sells > buys:
         return False, "net_selling"
     lift = ((last_px / create_px) - 1.0) * 100.0 if last_px > 0 else 0.0
-    if unique_buyers >= min_buyers and lift >= min_lift_pct:
+    if (
+        unique_buyers >= min_buyers
+        and lift >= min_lift_pct
+        and real_sol >= min_real_sol
+    ):
         return True, "tape_lift"
     if unique_buyers >= 1 and real_sol >= min_real_sol and lift >= fast_lift_pct:
         return True, "curve_demand"

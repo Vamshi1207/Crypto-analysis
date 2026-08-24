@@ -727,7 +727,8 @@
   function fmtMoney(v, d = 2) {
     if (v == null || Number.isNaN(Number(v))) return "—";
     const n = Number(v);
-    const sign = n > 0 ? "+" : "";
+    if (n === 0) return `$${n.toFixed(d)}`;
+    const sign = n > 0 ? "+" : "-";
     return `${sign}$${Math.abs(n).toFixed(d)}`;
   }
   function fmtMoneyAbs(v, d = 2) {

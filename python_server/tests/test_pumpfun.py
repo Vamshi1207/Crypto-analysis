@@ -87,6 +87,13 @@ def test_snipe_entry_waits_for_tape_then_buys_on_lift():
 
     ok, why = pumpfun.snipe_entry(
         create_px=create, last_px=create * 1.08, unique_buyers=2,
+        buys=3, sells=0, real_sol=0.4, age_sec=8.0,
+    )
+    assert ok is False
+    assert why == "waiting_tape"
+
+    ok, why = pumpfun.snipe_entry(
+        create_px=create, last_px=create * 1.08, unique_buyers=2,
         buys=3, sells=0, real_sol=3.0, age_sec=8.0,
     )
     assert ok is True

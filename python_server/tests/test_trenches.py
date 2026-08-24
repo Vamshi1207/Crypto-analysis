@@ -239,24 +239,65 @@ def test_scan_sniper_buys_only_after_tape_lifts(monkeypatch, tmp_path):
         "tapes",
         lambda sol_usd=150: {
             mint: {
-                "last_px": create_px * 1.10,
-                "unique_buyers": 2,
-                "buys": 3,
+                "last_px": create_px * 1.18,
+                "unique_buyers": 5,
+                "buys": 7,
                 "sells": 0,
-                "real_sol": 3.2,
+                "real_sol": 12.0,
             }
         },
     )
     seen, opens, skipped, expired, hits = trenches._scan_sniper()
     assert opens == 1
     assert hits[0]["entry_why"] == "tape_lift"
-    assert hits[0]["buyers"] == 2
+    assert hits[0]["buyers"] == 5
     snap = paper.snapshot()
     assert snap["open_count"] == 1
     pos = snap["open"][0]
     assert pos["entry_reason"] == "snipe"
     assert pos["dead_after_sec"] == trenches.SNIPER_DEAD_SEC
     assert pos["size_usd"] < trenches.SNIPER_SIZE_USD
+    trenches.reset_counters()
+    paper.reset()
+
+
+def test_scan_sniper_skips_thin_tape(monkeypatch):
+    trenches.reset_counters()
+    paper.reset(starting_cash_usd=1000.0)
+    create_px = 1e-6
+    mint = "MintThin111111111111111111111111111"
+    monkeypatch.setattr(trenches, "_sol_usd", lambda: 150.0)
+    monkeypatch.setattr(trenches, "initial_price_usd", lambda sol: create_px)
+    monkeypatch.setattr(
+        snipe_feed,
+        "drain",
+        lambda limit=32: [
+            {
+                "mint": mint,
+                "symbol": "THIN",
+                "creator": "DevThin11111111111111111111111111",
+                "bonding_curve": "CurveThin",
+                "seen_at": time.time(),
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        snipe_feed,
+        "tapes",
+        lambda sol_usd=150: {
+            mint: {
+                "last_px": create_px * 1.08,
+                "unique_buyers": 2,
+                "buys": 3,
+                "sells": 0,
+                "real_sol": 0.6,
+            }
+        },
+    )
+    seen, opens, skipped, expired, hits = trenches._scan_sniper()
+    assert opens == 0
+    assert hits == []
+    assert mint in trenches._watches
     trenches.reset_counters()
     paper.reset()
 

@@ -68,10 +68,10 @@ SNIPER_ENABLED = os.getenv("SNIPER_ENABLED", "1").strip() == "1"
 SNIPER_INTERVAL_SEC = _env_float("SNIPER_INTERVAL_SEC", 3.0)
 SNIPER_MAX_AGE_SEC = _env_float("SNIPER_MAX_AGE_SEC", 90.0)
 SNIPER_WATCH_SEC = _env_float("SNIPER_WATCH_SEC", 45.0)
-SNIPER_MIN_BUYERS = _env_int("SNIPER_MIN_BUYERS", 2)
-SNIPER_MIN_LIFT_PCT = _env_float("SNIPER_MIN_LIFT_PCT", 5.0)
-SNIPER_FAST_LIFT_PCT = _env_float("SNIPER_FAST_LIFT_PCT", 12.0)
-SNIPER_MIN_REAL_SOL = _env_float("SNIPER_MIN_REAL_SOL", 2.5)
+SNIPER_MIN_BUYERS = _env_int("SNIPER_MIN_BUYERS", 4)
+SNIPER_MIN_LIFT_PCT = _env_float("SNIPER_MIN_LIFT_PCT", 12.0)
+SNIPER_FAST_LIFT_PCT = _env_float("SNIPER_FAST_LIFT_PCT", 25.0)
+SNIPER_MIN_REAL_SOL = _env_float("SNIPER_MIN_REAL_SOL", 10.0)
 SNIPER_MIN_LIQ_USD = _env_float("SNIPER_MIN_LIQ_USD", 1_500.0)
 SNIPER_SIZE_USD = _env_float("SNIPER_SIZE_USD", 40.0)
 SNIPER_TARGET_USD = _env_float("SNIPER_TARGET_USD", 1.0)
@@ -507,6 +507,9 @@ def _scan_sniper() -> tuple[int, int, int, int, list[dict[str, Any]]]:
             )
             continue
         if not ok or mint in _seen_mints:
+            continue
+        liq_usd = real_sol * sol
+        if liq_usd < SNIPER_MIN_LIQ_USD:
             continue
         if opens >= SNIPER_MAX_PER_TICK:
             continue
