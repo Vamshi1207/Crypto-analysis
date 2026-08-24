@@ -26,12 +26,12 @@ def execute_fast_snipe(mint: str, current_price: float, liquidity: float, source
     try:
         pipeline_log.emit("fast_execute", "buy_attempt", mint=mint, price=current_price)
         
-        # Open a paper trade in the 'snipe_tight' lane with hardcoded limits
+        # Open a paper trade in the 'snipe' lane with hardcoded limits
         success = paper.buy(
             mint=mint,
             size_usd=FAST_SNIPE_SIZE_USD,
             price=current_price,
-            lane="snipe_fastpath",
+            lane="snipe",
             why=source,
             limits={
                 "target_profit_usd": FAST_SNIPE_SIZE_USD * (FAST_SNIPE_TP_PCT - 1.0),

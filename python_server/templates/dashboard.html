@@ -656,14 +656,7 @@
       </div>
     </section>
 
-    <section class="labs" aria-label="Parallel paper experiments">
-      <div class="panel-h">
-        <h2>Parallel books</h2>
-        <span id="labs-count">—</span>
-      </div>
-      <p class="lead">Same tape, separate $1000 each. We are not looking for one perfect setup — we are watching which rules survive fees.</p>
-      <div id="labs-body"><div class="empty-row">Loading experiments…</div></div>
-    </section>
+
 
     <div class="strip">
       <div>
@@ -874,39 +867,7 @@
     return `<span class="lane ${cls}">${esc(lane)}</span>`;
   }
 
-  function renderLabs(labs) {
-    const board = labs.board || {};
-    const rows = (board.lanes || []).filter((r) => r.id !== "main" || r.closed_count || r.open_count);
-    const leader = board.leader;
-    const el = document.getElementById("labs-count");
-    if (el) {
-      el.textContent = labs.enabled === false
-        ? "off"
-        : `${rows.length} books · leader ${leader || "—"}`;
-    }
-    const body = document.getElementById("labs-body");
-    if (!body) return;
-    if (!rows.length) {
-      body.innerHTML = `<div class="empty-row">No experiment books yet.</div>`;
-      return;
-    }
-    const tr = rows.map((r) => {
-      const wr = r.win_rate == null ? "—" : `${Math.round(r.win_rate * 100)}%`;
-      const avg = r.avg_pnl_usd == null ? "—" : fmtMoney(r.avg_pnl_usd, 3);
-      return `<tr class="${r.id === leader && r.closed_count ? "leader" : ""}">
-        <td><b>${esc(r.label || r.id)}</b><div class="thesis">${esc(r.thesis || "")}</div></td>
-        <td class="num pnl ${pnlClass(r.realized_pnl_usd)}">${fmtMoney(r.realized_pnl_usd)}</td>
-        <td class="num">${r.closed_count || 0} · ${wr}</td>
-        <td class="num">${avg}</td>
-        <td class="num">${r.open_count || 0}</td>
-        <td class="num">${fmtMoneyAbs(r.cash_usd)}</td>
-      </tr>`;
-    }).join("");
-    body.innerHTML = `<table class="labs-table">
-      <thead><tr><th>Book</th><th>Locked P/L</th><th>Closes · win</th><th>Avg</th><th>Open</th><th>Cash</th></tr></thead>
-      <tbody>${tr}</tbody>
-    </table>`;
-  }
+
 
   function renderSniper(port) {
     const s = port.sniper || {};
@@ -1163,7 +1124,7 @@
       document.getElementById("m-arb-sub").textContent =
         `${arbFills || t.arb_fills || 0} fills · avg ${fmtMoney(arbEv, 3)} · ${fmtMoneyAbs(arbNotional)} deployed`;
 
-      renderLabs(labs);
+
       renderSniper(port);
       renderOpenPositions(port);
       renderClosed(port);

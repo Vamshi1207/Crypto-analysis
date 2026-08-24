@@ -183,7 +183,7 @@ def status() -> dict[str, Any]:
             "skipped": _state.skipped,
             "last_hits": list(_state.last_hits)[:12],
             "wallets_n": len(_wallets()),
-            "helius": bool(SETTINGS.helius_api_key),
+            "helius": bool(SETTINGS.helius_api_keys),
             "limits": {
                 "interval_sec": INTERVAL_SEC,
                 "launch_max_age_min": LAUNCH_MAX_AGE_MIN,
@@ -724,7 +724,7 @@ def unique_buyers_recent(mint: str, *, window_s: float) -> list[str]:
         existing = {
             w: ts for w, ts in (_buys.get(mint) or {}).items() if ts >= cutoff
         }
-    if not SETTINGS.helius_api_key:
+    if not SETTINGS.helius_api_keys:
         return list(existing)
     try:
         txs = fetch_helius_transactions(mint, limit=20)

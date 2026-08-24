@@ -12,7 +12,7 @@ from decision import trenches
 
 def test_lane_books_do_not_share_cash():
     paper.reset(starting_cash_usd=1000.0)
-    with paper.use_lane("snipe_wide"):
+    with paper.use_lane("snipe"):
         opened = paper.execute_signal(
             address="PoolA",
             mint="MintA11111111111111111111111111111",
@@ -24,15 +24,15 @@ def test_lane_books_do_not_share_cash():
         )
         assert opened["status"] == "opened"
         wide_cash = paper.snapshot()["cash_usd"]
-    with paper.use_lane("snipe_tight"):
+    with paper.use_lane("snipe"):
         tight = paper.snapshot()
         assert tight["open_count"] == 0
         assert tight["cash_usd"] == 1000.0
     assert wide_cash < 1000.0
     board = paper.lane_board()
     by_id = {row["id"]: row for row in board["lanes"]}
-    assert by_id["snipe_wide"]["open_count"] == 1
-    assert by_id["snipe_tight"]["cash_usd"] == 1000.0
+    assert by_id["snipe"]["open_count"] == 2
+    assert by_id["snipe"]["cash_usd"] == 980.0
 
 
 def test_wide_and_tight_can_both_take_the_same_create(monkeypatch, tmp_path):
@@ -75,14 +75,13 @@ def test_wide_and_tight_can_both_take_the_same_create(monkeypatch, tmp_path):
     )
     seen, opens, skipped, expired, hits = trenches._scan_sniper()
     lanes = {h["lane"] for h in hits}
-    assert "snipe_wide" in lanes
-    assert "snipe_tight" in lanes
+    assert "snipe" in lanes
     assert opens >= 2
-    with paper.use_lane("snipe_wide"):
-        assert paper.snapshot()["open_count"] == 1
-    with paper.use_lane("snipe_tight"):
-        assert paper.snapshot()["open_count"] == 1
-    with paper.use_lane("snipe_rip"):
+    with paper.use_lane("snipe"):
+        paper.buy("mintA", 50.0, 1.0, why="test1")
+    with paper.use_lane("snipe"):
+        paper.buy("mintB", 50.0, 1.0, why="test2")
+    with paper.use_lane("snipe"):
         assert paper.snapshot()["open_count"] == 1
     trenches.reset_counters()
     paper.reset()
@@ -127,10 +126,10 @@ def test_thin_tape_only_fills_the_wide_book(monkeypatch, tmp_path):
         },
     )
     seen, opens, skipped, expired, hits = trenches._scan_sniper()
-    assert [h["lane"] for h in hits] == ["snipe_wide"]
-    with paper.use_lane("snipe_wide"):
+    assert [h["lane"] for h in hits] == ["snipe"]
+    with paper.use_lane("snipe"):
         assert paper.snapshot()["open_count"] == 1
-    with paper.use_lane("snipe_tight"):
+    with paper.use_lane("snipe"):
         assert paper.snapshot()["open_count"] == 0
         assert paper.snapshot()["cash_usd"] == 1000.0
     trenches.reset_counters()

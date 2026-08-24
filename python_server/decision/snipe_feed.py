@@ -42,6 +42,7 @@ _tapes: dict[str, dict[str, Any]] = {}
 _helius_queue = queue.Queue()
 _helius_subs: dict[str, int] = {}  # curve -> sub_id
 _sub_counter = 1
+_helius_connected = False
 
 _stats = {
     "running": False,
@@ -60,8 +61,8 @@ def status() -> dict[str, Any]:
             **_stats,
             "queued": _events.qsize(),
             "watching": len(_tapes),
-            "program": PUMP_PROGRAM,
-            "has_helius": bool(SETTINGS.helius_api_key),
+            "connected": _helius_connected,
+            "has_helius": bool(SETTINGS.helius_api_keys),
         }
 
 
@@ -98,6 +99,7 @@ def tapes(*, sol_usd: float) -> dict[str, dict[str, Any]]:
                 "buys": int(row.get("buys") or 0),
                 "sells": int(row.get("sells") or 0),
                 "unique_buyers": len(buyers),
+                "smart_money": bool(row.get("smart_money")),
                 "last_px": px,
                 "created_at": row.get("created_at"),
                 "updated_at": row.get("updated_at"),
@@ -127,6 +129,9 @@ def drain(*, limit: int = 16) -> list[dict[str, Any]]:
 
 def start() -> dict[str, Any]:
     global _thread_pump, _thread_helius
+    if not SETTINGS.helius_api_keys:
+        pipeline_log.emit("snipe_feed", "skip", reason="no_helius_keys")
+        return status()
     with _lock:
         if _thread_pump and _thread_pump.is_alive():
             return status()
@@ -135,9 +140,8 @@ def start() -> dict[str, Any]:
         _stats["last_error"] = None
         _thread_pump = threading.Thread(target=_run_pump, name="pump-create-feed", daemon=True)
         _thread_pump.start()
-        if SETTINGS.helius_api_key:
-            _thread_helius = threading.Thread(target=_run_helius, name="helius-trade-feed", daemon=True)
-            _thread_helius.start()
+        _thread_helius = threading.Thread(target=_run_helius, name="helius-trade-feed", daemon=True)
+        _thread_helius.start()
     pipeline_log.emit("snipe_feed", "start")
     return status()
 
@@ -240,8 +244,8 @@ def _run_helius() -> None:
 
 
 def _listen_helius_once() -> None:
-    global _sub_counter
-    parsed = urllib.parse.urlparse(f"wss://mainnet.helius-rpc.com/?api-key={SETTINGS.helius_api_key}")
+    global _sub_counter, _helius_connected
+    parsed = urllib.parse.urlparse(f"wss://mainnet.helius-rpc.com/?api-key={SETTINGS.current_helius_key()}")
     host = parsed.hostname or "mainnet.helius-rpc.com"
     port = parsed.port or 443
     path = parsed.path or "/"
@@ -269,13 +273,21 @@ def _listen_helius_once() -> None:
         if not chunk:
             raise ConnectionError("ws handshake closed")
         header += chunk
+    
+    status_line = header.split(b"\r\n", 1)[0]
+    if b"101" not in status_line:
+        if b"429" in status_line or b"401" in status_line:
+            SETTINGS.rotate_helius_key()
+        raise ConnectionError(f"ws handshake rejected: {status_line.decode('utf-8', errors='replace')}")
+
     leftover = header.split(b"\r\n\r\n", 1)[1]
     
+    with _lock:
+        _helius_connected = True
     pipeline_log.emit("snipe_feed", "connected", source="helius")
     buf = leftover
-    sock.settimeout(0.5)  # Fast timeout so we can check the queue
+    sock.settimeout(0.5)
     
-    # Re-subscribe to all active curves on reconnect
     with _lock:
         curves = [r["bonding_curve"] for r in _tapes.values() if r.get("bonding_curve")]
     for curve in curves:
@@ -283,7 +295,6 @@ def _listen_helius_once() -> None:
         
     try:
         while not _stop.is_set():
-            # Drain queue and send subscriptions
             while True:
                 try:
                     action, mint, curve = _helius_queue.get_nowait()
@@ -313,7 +324,6 @@ def _listen_helius_once() -> None:
                             "params": [sub_id]
                         }))
 
-            # Read websocket
             try:
                 chunk = sock.recv(8192)
                 if not chunk:
@@ -324,7 +334,6 @@ def _listen_helius_once() -> None:
                     _on_helius_message(msg)
             except (TimeoutError, OSError) as exc:
                 if isinstance(exc, TimeoutError) or "timed out" in str(exc).lower():
-                    # Every ~10 seconds we should send a ping, but Helius drops if idle for 30s. 
                     # 0.5s timeout means we just loop.
                     continue
                 raise
@@ -448,6 +457,8 @@ def _note_trade(trade: dict[str, Any]) -> None:
             row["buys"] = int(row.get("buys") or 0) + 1
             if user:
                 buyers.add(user)
+                if SETTINGS.cluster_wallets and user in SETTINGS.cluster_wallets:
+                    row["smart_money"] = True
         else:
             row["sells"] = int(row.get("sells") or 0) + 1
             if is_dev_sell(

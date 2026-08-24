@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import threading
 from dataclasses import dataclass, field
 
 PUBLIC_SOLANA_RPC = "https://api.mainnet-beta.solana.com"
@@ -55,10 +56,10 @@ class SafetyThresholds:
     caution_score: int = field(default_factory=lambda: _env_int("SAFETY_CAUTION_SCORE", 30))
 
 
-@dataclass(frozen=True)
+@dataclass
 class Settings:
     solana_rpc_url: str
-    helius_api_key: str
+    helius_api_keys: list[str]
     birdeye_api_key: str
     agy_model: str
     agy_binary: str
@@ -70,23 +71,48 @@ class Settings:
     live_trading: bool
     http_timeout_s: float
     thresholds: SafetyThresholds
+    cluster_wallets: list[str]
+    _helius_idx: int = 0
+    _lock: threading.Lock = field(default_factory=threading.Lock)
 
     @property
     def rpc_endpoint(self) -> str:
         """Helius free tier is far more reliable than the public RPC."""
-        if self.helius_api_key:
-            return f"https://mainnet.helius-rpc.com/?api-key={self.helius_api_key}"
+        key = self.current_helius_key()
+        if key:
+            return f"https://mainnet.helius-rpc.com/?api-key={key}"
         return self.solana_rpc_url or PUBLIC_SOLANA_RPC
 
     @property
     def using_public_rpc(self) -> bool:
-        return not self.helius_api_key and not self.solana_rpc_url
+        return not self.helius_api_keys and not self.solana_rpc_url
 
+    def current_helius_key(self) -> str:
+        with self._lock:
+            if not self.helius_api_keys:
+                return ""
+            return self.helius_api_keys[self._helius_idx]
+
+    def rotate_helius_key(self) -> None:
+        with self._lock:
+            if not self.helius_api_keys:
+                return
+            old_idx = self._helius_idx
+            self._helius_idx = (self._helius_idx + 1) % len(self.helius_api_keys)
+            print(f"[config] Rotated Helius key from idx {old_idx} to {self._helius_idx}")
+
+    @property
+    def using_public_rpc(self) -> bool:
+        return not self.helius_api_keys and not self.solana_rpc_url
 
 def load_settings() -> Settings:
+    raw_keys = os.getenv("HELIUS_API_KEY", "").split(",")
+    keys = [k.strip() for k in raw_keys if k.strip()]
+    wallets_raw = os.getenv("CLUSTER_WALLETS", "").split(",")
+    wallets = [w.strip() for w in wallets_raw if w.strip()]
     return Settings(
         solana_rpc_url=os.getenv("SOLANA_RPC_URL", "").strip(),
-        helius_api_key=os.getenv("HELIUS_API_KEY", "").strip(),
+        helius_api_keys=keys,
         birdeye_api_key=os.getenv("BIRDEYE_API_KEY", "").strip(),
         # Empty = let agy use its default model for the signed-in account.
         agy_model=os.getenv("AGY_MODEL", os.getenv("GEMINI_MODEL", "")).strip(),
@@ -101,6 +127,7 @@ def load_settings() -> Settings:
         live_trading=os.getenv("LIVE_TRADING", "0").strip() == "1",
         http_timeout_s=_env_float("HTTP_TIMEOUT_S", 12.0),
         thresholds=SafetyThresholds(),
+        cluster_wallets=wallets,
     )
 
 

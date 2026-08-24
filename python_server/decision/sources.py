@@ -115,7 +115,9 @@ def _rpc(method: str, params: list[Any], timeout_s: Optional[float] = None) -> A
         except httpx.HTTPError as exc:
             raise SourceError(f"{method}: {exc}") from exc
 
-        if response.status_code == 429 or response.status_code >= 500:
+        if response.status_code in (401, 429) or response.status_code >= 500:
+            if response.status_code in (401, 429):
+                SETTINGS.rotate_helius_key()
             last_error = f"HTTP {response.status_code}{hint}"
             if attempt < RPC_RETRIES - 1:
                 time.sleep(RPC_BACKOFF_S * (2**attempt))
@@ -536,7 +538,7 @@ def fetch_helius_transactions(address: str, *, limit: int = 20) -> list[dict[str
 
     Used by the paper cluster/launch channel. Requires ``HELIUS_API_KEY``.
     """
-    key = SETTINGS.helius_api_key
+    key = SETTINGS.current_helius_key()
     if not key:
         raise SourceError("HELIUS_API_KEY unset")
     addr = (address or "").strip()
