@@ -1,8 +1,10 @@
-"""Helius logsSubscribe → Pump.fun create + trade tape for paper sniping.
+import os
+
+CONTENT = """\"\"\"Helius logsSubscribe → Pump.fun create + trade tape for paper sniping.
 
 Landed txs only. Creates start a watch; TradeEvents update the bonding-curve
 mid so we buy/mark from the live curve instead of spraying every create.
-"""
+\"\"\"
 
 from __future__ import annotations
 
@@ -66,7 +68,7 @@ def status() -> dict[str, Any]:
 
 
 def tapes(*, sol_usd: float) -> dict[str, dict[str, Any]]:
-    """Live curve tape keyed by mint. Virtual reserves → USD mid."""
+    \"\"\"Live curve tape keyed by mint. Virtual reserves → USD mid.\"\"\"
     now = time.time()
     with _lock:
         stale = [
@@ -180,22 +182,22 @@ def _listen_pump_once() -> None:
     sock.settimeout(20)
     key = b64encode(urandom(16)).decode()
     req = (
-        f"GET {path} HTTP/1.1\r\n"
-        f"Host: {host}\r\n"
-        "Upgrade: websocket\r\n"
-        "Connection: Upgrade\r\n"
-        f"Sec-WebSocket-Key: {key}\r\n"
-        "Sec-WebSocket-Version: 13\r\n"
-        "\r\n"
+        f"GET {path} HTTP/1.1\\r\\n"
+        f"Host: {host}\\r\\n"
+        "Upgrade: websocket\\r\\n"
+        "Connection: Upgrade\\r\\n"
+        f"Sec-WebSocket-Key: {key}\\r\\n"
+        "Sec-WebSocket-Version: 13\\r\\n"
+        "\\r\\n"
     )
     sock.sendall(req.encode())
     header = b""
-    while b"\r\n\r\n" not in header:
+    while b"\\r\\n\\r\\n" not in header:
         chunk = sock.recv(4096)
         if not chunk:
             raise ConnectionError("ws handshake closed")
         header += chunk
-    leftover = header.split(b"\r\n\r\n", 1)[1]
+    leftover = header.split(b"\\r\\n\\r\\n", 1)[1]
     _ws_send(sock, json.dumps({
         "method": "subscribeNewToken"
     }))
@@ -254,22 +256,22 @@ def _listen_helius_once() -> None:
     sock.settimeout(20)
     key = b64encode(urandom(16)).decode()
     req = (
-        f"GET {path} HTTP/1.1\r\n"
-        f"Host: {host}\r\n"
-        "Upgrade: websocket\r\n"
-        "Connection: Upgrade\r\n"
-        f"Sec-WebSocket-Key: {key}\r\n"
-        "Sec-WebSocket-Version: 13\r\n"
-        "\r\n"
+        f"GET {path} HTTP/1.1\\r\\n"
+        f"Host: {host}\\r\\n"
+        "Upgrade: websocket\\r\\n"
+        "Connection: Upgrade\\r\\n"
+        f"Sec-WebSocket-Key: {key}\\r\\n"
+        "Sec-WebSocket-Version: 13\\r\\n"
+        "\\r\\n"
     )
     sock.sendall(req.encode())
     header = b""
-    while b"\r\n\r\n" not in header:
+    while b"\\r\\n\\r\\n" not in header:
         chunk = sock.recv(4096)
         if not chunk:
             raise ConnectionError("ws handshake closed")
         header += chunk
-    leftover = header.split(b"\r\n\r\n", 1)[1]
+    leftover = header.split(b"\\r\\n\\r\\n", 1)[1]
     
     pipeline_log.emit("snipe_feed", "connected", source="helius")
     buf = leftover
@@ -517,3 +519,7 @@ def _on_helius_message(raw: str) -> None:
     for trade in trades:
         _note_trade(trade)
 
+"""
+
+with open("/Users/vamshi/Projects/crypto_platform/python_server/decision/snipe_feed.py", "w") as f:
+    f.write(CONTENT)
