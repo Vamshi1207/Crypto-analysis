@@ -18,6 +18,7 @@ from datetime import date, datetime, timezone
 from typing import Any, Callable, Optional
 
 from decision import costs
+from decision import labs
 from decision import paper
 from decision import pipeline_log
 from decision import store as decision_store
@@ -508,6 +509,8 @@ def _round_trip_quote(mint: str, size_usd: float) -> tuple[bool, dict[str, Any]]
         return False, {"verified": False, "reason": f"no_buy_route: {exc}"}
     except SourceError as exc:
         return False, {"verified": False, "reason": f"jupiter_buy_unavailable: {exc}"}
+    if not isinstance(buy_q, dict):
+        return False, {"verified": False, "reason": "buy_quote_not_object"}
     try:
         mint_out = int(buy_q.get("outAmount") or 0)
     except (TypeError, ValueError):
@@ -520,6 +523,8 @@ def _round_trip_quote(mint: str, size_usd: float) -> tuple[bool, dict[str, Any]]
         return False, {"verified": False, "reason": f"no_route: {exc}"}
     except SourceError as exc:
         return False, {"verified": False, "reason": f"jupiter_unavailable: {exc}"}
+    if not isinstance(sell_q, dict):
+        return False, {"verified": False, "reason": "sell_quote_not_object"}
     try:
         sol_out = int(sell_q.get("outAmount") or 0)
     except (TypeError, ValueError):
@@ -574,8 +579,12 @@ def _arb_cost_pct() -> float:
 
 
 def _quote_from_pair(pair: dict[str, Any], *, mint: str) -> Optional[PoolQuote]:
+    if not isinstance(pair, dict):
+        return None
     base = pair.get("baseToken") or {}
     quote = pair.get("quoteToken") or {}
+    if not isinstance(base, dict) or not isinstance(quote, dict):
+        return None
     base_addr = base.get("address") or ""
     quote_addr = quote.get("address") or ""
     if base_addr == mint:
@@ -815,6 +824,8 @@ def _jupiter_verify(opp: ArbOpportunity) -> tuple[bool, dict[str, Any]]:
             return False, {"verified": False, "reason": f"no_buy_route: {exc}"}
         except SourceError as exc:
             return False, {"verified": False, "reason": f"jupiter_buy_unavailable: {exc}"}
+        if not isinstance(buy_q, dict):
+            return False, {"verified": False, "reason": "buy_quote_not_object"}
         buy_impact = _impact_pct(buy_q)
         try:
             mint_out = int(buy_q.get("outAmount") or 0)
@@ -841,6 +852,8 @@ def _jupiter_verify(opp: ArbOpportunity) -> tuple[bool, dict[str, Any]]:
         return False, {"verified": False, "reason": f"no_route: {exc}"}
     except SourceError as exc:
         return False, {"verified": False, "reason": f"jupiter_unavailable: {exc}"}
+    if not isinstance(sell_q, dict):
+        return False, {"verified": False, "reason": "sell_quote_not_object"}
 
     try:
         sol_out = int(sell_q.get("outAmount") or 0)
@@ -944,13 +957,14 @@ def _paper_fill(opp: ArbOpportunity, *, jupiter: Optional[dict[str, Any]] = None
         "mode": "paper_jupiter_round_trip",
         "jupiter": jup,
     }
-    ledger = paper.execute_arb_fill(
-        size_usd=opp.size_usd,
-        pnl_usd=pnl,
-        mint=opp.mint,
-        symbol=opp.symbol,
-        record=record,
-    )
+    with paper.use_lane(labs.trading_lane("arb")):
+        ledger = paper.execute_arb_fill(
+            size_usd=opp.size_usd,
+            pnl_usd=pnl,
+            mint=opp.mint,
+            symbol=opp.symbol,
+            record=record,
+        )
     if ledger.get("status") != "filled":
         pipeline_log.emit(
             "arb",

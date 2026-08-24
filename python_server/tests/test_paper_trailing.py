@@ -259,7 +259,7 @@ def test_snipe_dump_hits_stop_not_a_twenty_dollar_scratch(trailing, monkeypatch)
     paper.reset()
 
 
-def test_snipe_situational_still_banks_the_dollar(trailing):
+def test_snipe_with_pct_target_lets_winner_run(trailing):
     paper.reset()
     opened = paper.execute_signal(
         address="PoolTrail",
@@ -276,10 +276,13 @@ def test_snipe_situational_still_banks_the_dollar(trailing):
         abs_hold_sec=90.0,
     )
     assert opened["status"] == "opened"
+    # ~7% is past the $1 scalp clip but short of the 40% rip. Leave it on
+    # the trail instead of banking $1 and killing the right tail.
     closed = paper.mark_and_maybe_exit(address="PoolTrail", mark_price=1.07)
-    assert closed
-    assert "snipe_target" in (closed[0].get("close_reason") or "")
-    assert closed[0]["realized_pnl_usd"] == pytest.approx(1.0, abs=0.02)
+    assert closed == []
+    pos = next(p for p in paper._state.open if p.address == "PoolTrail")
+    assert pos.trail_armed is True
+    assert pos.peak_pnl_usd >= 1.0
     paper.reset()
 
 

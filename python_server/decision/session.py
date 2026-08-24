@@ -83,6 +83,12 @@ def reset_board(*, reason: str = "manual") -> dict[str, Any]:
     discover_cleared = discover.clear_rotation()
     arb_snap = arb.reset_counters()
     trench_snap = trenches.reset_counters()
+    try:
+        from decision import labs
+
+        labs.clear_seen()
+    except Exception:
+        pass
 
     marker = {
         "event": "session_reset",

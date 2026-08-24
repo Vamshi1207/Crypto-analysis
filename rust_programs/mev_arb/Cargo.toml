@@ -1,0 +1,21 @@
+[package]
+name = "mev_arb"
+version = "0.1.0"
+description = "Atomic Cross-DEX Arbitrage Program for Solana"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "mev_arb"
+
+[features]
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+cpi = ["no-entrypoint"]
+default = []
+
+[dependencies]
+anchor-lang = "0.30.0"
+anchor-spl = "0.30.0"
+solana-program = "1.18.0"

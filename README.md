@@ -173,5 +173,10 @@ Deeper design history: [`plans/implementation_plan.md`](plans/implementation_pla
 
 - **Mode:** paper only; live flag off.
 - **Desk UI:** brighter slate dashboard with account metrics, open/finished trades, hunt/watch lists, readiness chip, **Reset board**, and a plain-English glossary.
-- **Workers:** discover + swarm + arb configurable; indicator gate after cost edge.
+- **Workers:** 
+  - `discover` + `swarm` (Scalping / AI Forecast)
+  - `arb` (Price-gap)
+  - `snipe_feed` (Pump.fun sniper utilizing PumpPortal free websocket)
+- **Parallel Labs:** Supports running multiple parallel strategy books (`labs.py`) to test configurations (e.g., Master Book, Tight tape) simultaneously using isolated paper environments.
 - **Success bar:** enough finished scalps with non-negative average P/L (and related readiness checks) before considering live or paid speed infra.
+  - *Note:* Free tier APIs (Helius, Jupiter) limit high-frequency execution. Scalping, Arb, and trade-dependent Sniping strategies require a paid RPC plan to bypass HTTP 429 and routing limits.

@@ -34,7 +34,7 @@ def evaluate(*, day=None) -> dict[str, Any]:
     decisions = session.read_since("decisions")
     paper_rows = session.read_since("paper")
     outcomes = session.read_since("outcomes")
-    pipeline = session.read_since("pipeline")
+    pipeline_n = session.count_since("pipeline")
 
     scalp_closes = [
         r
@@ -216,7 +216,7 @@ def evaluate(*, day=None) -> dict[str, Any]:
         "scoreboard_n": sb_n,
         "coverage": None if cov is None else round(float(cov), 3),
         "mae": None if mae is None else round(float(mae), 4),
-        "pipeline_events": len(pipeline),
+        "pipeline_events": pipeline_n,
         "paper_open": port.get("open_count"),
         "paper_realized": port.get("realized_pnl_usd"),
         "paper_arb_fills": port.get("arb_fills"),

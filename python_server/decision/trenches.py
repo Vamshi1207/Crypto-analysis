@@ -25,6 +25,7 @@ from decision import pipeline_log
 from decision import pricefeed
 from decision import snipe_feed
 from decision.config import SETTINGS, WRAPPED_SOL_MINT, _env_float, _env_int
+from decision import labs
 from decision.pumpfun import (
     CreatorBook,
     curve_gave_back,
@@ -47,7 +48,7 @@ USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 USDT = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"
 QUOTE_MINTS = frozenset({WRAPPED_SOL_MINT, USDC, USDT})
 
-LAUNCH_ENABLED = os.getenv("LAUNCH_ENABLED", "1").strip() == "1"
+LAUNCH_ENABLED = os.getenv("LAUNCH_ENABLED", "0").strip() == "1"
 CLUSTER_ENABLED = os.getenv("CLUSTER_ENABLED", "1").strip() == "1"
 INTERVAL_SEC = _env_float("TRENCHES_INTERVAL_SEC", 15.0)
 LAUNCH_MAX_AGE_MIN = _env_float("LAUNCH_MAX_AGE_MIN", 12.0)
@@ -73,7 +74,7 @@ SNIPER_MIN_LIFT_PCT = _env_float("SNIPER_MIN_LIFT_PCT", 12.0)
 SNIPER_FAST_LIFT_PCT = _env_float("SNIPER_FAST_LIFT_PCT", 25.0)
 SNIPER_MIN_REAL_SOL = _env_float("SNIPER_MIN_REAL_SOL", 10.0)
 SNIPER_MIN_LIQ_USD = _env_float("SNIPER_MIN_LIQ_USD", 1_500.0)
-SNIPER_SIZE_USD = _env_float("SNIPER_SIZE_USD", 40.0)
+SNIPER_SIZE_USD = _env_float("SNIPER_SIZE_USD", 20.0)
 SNIPER_TARGET_USD = _env_float("SNIPER_TARGET_USD", 1.0)
 SNIPER_MAX_HOLD_SEC = _env_float("SNIPER_MAX_HOLD_SEC", 45.0)
 SNIPER_DEAD_SEC = _env_float("SNIPER_DEAD_SEC", 6.0)
@@ -81,6 +82,7 @@ SNIPER_ABS_HOLD_SEC = _env_float("SNIPER_ABS_HOLD_SEC", 90.0)
 SNIPER_TARGET_PCT = _env_float("SNIPER_TARGET_PCT", 40.0)
 SNIPER_MAX_PER_TICK = _env_int("SNIPER_MAX_PER_TICK", 1)
 SNIPER_CURVE_DROP_PCT = _env_float("SNIPER_CURVE_DROP_PCT", 50.0)
+SNIPER_STOP_USD = _env_float("SNIPER_STOP_USD", 0.80)
 SNIPER_LISTEN = os.getenv("SNIPER_LISTEN", "1").strip() == "1"
 _SNIPE_DEATH_EXTS = frozenset(
     {"nonTransferable", "permanentDelegate", "transferHook", "pausableConfig"}
@@ -152,6 +154,12 @@ def reset_counters() -> dict[str, Any]:
         _buys.clear()
         _sells.clear()
         _creators.clear()
+    try:
+        from decision import labs
+
+        labs.clear_seen()
+    except Exception:
+        pass
     pipeline_log.emit("trenches", "reset", level="warning")
     return status()
 
@@ -204,6 +212,7 @@ def status() -> dict[str, Any]:
                 "sniper_target_pct": SNIPER_TARGET_PCT,
                 "sniper_max_per_tick": SNIPER_MAX_PER_TICK,
                 "sniper_curve_drop_pct": SNIPER_CURVE_DROP_PCT,
+                "sniper_stop_usd": SNIPER_STOP_USD,
             },
             "launch_enabled": LAUNCH_ENABLED,
             "cluster_enabled": CLUSTER_ENABLED,
@@ -325,13 +334,19 @@ def _scan(*, do_cluster: bool = True) -> dict[str, Any]:
         candidates = list_launch_candidates()
         launch_seen = len(candidates)
 
+    helius_lookups = 0
     for row in candidates:
         if opened_this_tick >= MAX_PER_TICK:
             break
         mint = row["mint"]
         if mint in _seen_mints:
             continue
+        # Helius-per-mint is what stretched a trenches tick to minutes.
+        if helius_lookups >= 3:
+            skipped += 1
+            continue
         buyers = unique_buyers_recent(mint, window_s=CLUSTER_WINDOW_SEC)
+        helius_lookups += 1
         is_cluster = CLUSTER_ENABLED and len(buyers) >= CLUSTER_MIN_WALLETS
         if is_cluster:
             cluster_fires += 1
@@ -506,6 +521,28 @@ def _scan_sniper() -> tuple[int, int, int, int, list[dict[str, Any]]]:
                 reason=why, strategy="snipe",
             )
             continue
+        snipe_lanes = labs.snipe_lanes()
+        if snipe_lanes:
+            for lane in snipe_lanes:
+                opened_n = sum(1 for h in hits if h.get("lane") == lane.id)
+                hit = labs.consider_snipe(
+                    lane=lane,
+                    watch=watch,
+                    tape=tape,
+                    age_sec=age,
+                    sol_usd=sol,
+                    watch_sec=SNIPER_WATCH_SEC,
+                    curve_drop_pct=SNIPER_CURVE_DROP_PCT,
+                    max_per_tick_already=opened_n,
+                    max_per_tick=SNIPER_MAX_PER_TICK,
+                    open_fn=_open,
+                )
+                if hit:
+                    opens += 1
+                    hits.append(hit)
+            if labs.all_snipe_lanes_seen(mint):
+                _watches.pop(mint, None)
+            continue
         if not ok or mint in _seen_mints:
             continue
         liq_usd = real_sol * sol
@@ -543,6 +580,7 @@ def _scan_sniper() -> tuple[int, int, int, int, list[dict[str, Any]]]:
             take_profit_pct=SNIPER_TARGET_PCT,
             dead_after_sec=SNIPER_DEAD_SEC,
             abs_hold_sec=SNIPER_ABS_HOLD_SEC,
+            stop_loss_usd=SNIPER_STOP_USD,
         )
         if result.get("status") == "opened":
             _seen_mints.add(mint)
@@ -761,6 +799,7 @@ def _open(
     take_profit_pct: float = 0.0,
     dead_after_sec: Optional[float] = None,
     abs_hold_sec: Optional[float] = None,
+    stop_loss_usd: Optional[float] = None,
 ) -> dict[str, Any]:
     gecko = float(row.get("price_usd") or 0.0)
     if confirm_dex:
@@ -789,6 +828,7 @@ def _open(
         take_profit_pct=take_profit_pct,
         dead_after_sec=dead_after_sec,
         abs_hold_sec=abs_hold_sec,
+        stop_loss_usd=stop_loss_usd,
     )
     if result.get("status") == "opened":
         pricefeed.track(mint=row["mint"], pool=row["pool"], symbol=str(row.get("symbol") or ""))
@@ -844,35 +884,41 @@ def _tape_force_reason(tape: dict[str, Any]) -> Optional[str]:
 
 def _mark_open_lots() -> None:
     tape_map = snipe_feed.tapes(sol_usd=_sol_usd())
-    snap = paper.snapshot()
-    for pos in snap.get("open") or []:
-        if not isinstance(pos, dict):
-            continue
-        addr = pos.get("address")
-        mint = pos.get("mint")
-        if not addr:
-            continue
-        opened = pos.get("opened_at")
-        reason = pos.get("entry_reason")
-        if reason != "snipe" and _just_opened(opened):
-            continue
-        tape = tape_map.get(str(mint or "")) or {}
-        mark = None
-        if reason == "snipe" and mint:
-            mark = _snipe_marks.get(str(mint))
-            if mark is None:
-                mark = float(tape.get("last_px") or 0.0) or None
-        if mark is None:
-            mark = dex_price_usd(str(mint or ""), pool=str(addr))
-        if mark is None and mint:
-            mark = _snipe_marks.get(str(mint))
-        if mark:
-            force = _tape_force_reason(tape) if reason == "snipe" else None
-            paper.mark_and_maybe_exit(
-                address=str(addr),
-                mark_price=mark,
-                force_reason=force,
-            )
+    lane_ids = [paper.DEFAULT_LANE]
+    for lane in labs.snipe_lanes():
+        if lane.id not in lane_ids:
+            lane_ids.append(lane.id)
+    for lane_id in lane_ids:
+        with paper.use_lane(lane_id):
+            snap = paper.snapshot()
+            for pos in snap.get("open") or []:
+                if not isinstance(pos, dict):
+                    continue
+                addr = pos.get("address")
+                mint = pos.get("mint")
+                if not addr:
+                    continue
+                opened = pos.get("opened_at")
+                reason = pos.get("entry_reason")
+                if reason != "snipe" and _just_opened(opened):
+                    continue
+                tape = tape_map.get(str(mint or "")) or {}
+                mark = None
+                if reason == "snipe" and mint:
+                    mark = _snipe_marks.get(str(mint))
+                    if mark is None:
+                        mark = float(tape.get("last_px") or 0.0) or None
+                if mark is None:
+                    mark = dex_price_usd(str(mint or ""), pool=str(addr))
+                if mark is None and mint:
+                    mark = _snipe_marks.get(str(mint))
+                if mark:
+                    force = _tape_force_reason(tape) if reason == "snipe" else None
+                    paper.mark_and_maybe_exit(
+                        address=str(addr),
+                        mark_price=mark,
+                        force_reason=force,
+                    )
 
 
 def _just_opened(opened_at: Any) -> bool:

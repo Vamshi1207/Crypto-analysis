@@ -13,6 +13,7 @@ from decision import paper
 from decision import pipeline_log
 from decision.config import paper_risk_on
 from decision.decide import decide
+from decision.labs import trading_lane
 from decision.schema import DecideMode
 
 # Paper: decide observe tokens once they have real (non-stub) candles.
@@ -83,58 +84,59 @@ def _run(get_token_data: Callable[[], dict[str, Any]], interval_s: float, mode: 
                 tokens = get_token_data() or {}
                 token_n = len(tokens)
                 pipeline_log.emit("swarm", "tick_start", token_n=token_n)
-                for address, live_token in list(tokens.items()):
-                    if _stop.is_set():
-                        break
-                    if str(address).startswith("0x"):
-                        continue
-                    # Mark exits first (open paper may sit on observe/cooled rows).
-                    mark = _last_close(live_token)
-                    if mark:
-                        closed = paper.mark_and_maybe_exit(address=address, mark_price=mark)
-                        if closed:
-                            paper_status["closed"] += len(closed)
-                    # Stub observe rows stay off the decide path. Pricefeed-
-                    # hydrated observe rows (and any tradeable) get a card so
-                    # the 20–40 name watchlist is not dead weight.
-                    if live_token.get("discover") and live_token.get("tradeable") is False:
-                        lite = bool(live_token.get("observe_lite"))
-                        cooled = bool(live_token.get("cooled"))
-                        if cooled or lite or not DECIDE_OBSERVE:
-                            paper_status["observe_skip"] += 1
+                with paper.use_lane(trading_lane("scalp")):
+                    for address, live_token in list(tokens.items()):
+                        if _stop.is_set():
+                            break
+                        if str(address).startswith("0x"):
                             continue
-                    tf = _pick_tf(live_token)
-                    safety = RUN_SAFETY or live_token.get("tradeable") is False
-                    try:
-                        card = decide(
-                            address=address,
-                            live_token=live_token,
-                            mode=decide_mode,
-                            timeframe=tf,
-                            run_safety=safety,
-                        )
-                    except Exception as exc:  # noqa: BLE001
-                        with _lock:
-                            _status["last_error"] = f"decide {address[:8]}: {exc}"
-                        pipeline_log.emit(
-                            "swarm",
-                            "decide_error",
-                            level="error",
-                            address=address,
-                            symbol=(live_token or {}).get("name"),
-                            reason=str(exc),
-                            timeframe=tf,
-                        )
-                        continue
-                    action = getattr(card.action, "value", str(card.action))
-                    actions[action] += 1
-                    if discover_mod is not None:
+                        # Mark exits first (open paper may sit on observe/cooled rows).
+                        mark = _last_close(live_token)
+                        if mark:
+                            closed = paper.mark_and_maybe_exit(address=address, mark_price=mark)
+                            if closed:
+                                paper_status["closed"] += len(closed)
+                        # Stub observe rows stay off the decide path. Pricefeed-
+                        # hydrated observe rows (and any tradeable) get a card so
+                        # the 20–40 name watchlist is not dead weight.
+                        if live_token.get("discover") and live_token.get("tradeable") is False:
+                            lite = bool(live_token.get("observe_lite"))
+                            cooled = bool(live_token.get("cooled"))
+                            if cooled or lite or not DECIDE_OBSERVE:
+                                paper_status["observe_skip"] += 1
+                                continue
+                        tf = _pick_tf(live_token)
+                        safety = RUN_SAFETY or live_token.get("tradeable") is False
                         try:
-                            discover_mod.note_decision(card)
-                        except Exception:  # noqa: BLE001
-                            pass
-                    exec_result = paper.execute_decision(card, mark_price=mark)
-                    paper_status[str(exec_result.get("status") or "unknown")] += 1
+                            card = decide(
+                                address=address,
+                                live_token=live_token,
+                                mode=decide_mode,
+                                timeframe=tf,
+                                run_safety=safety,
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            with _lock:
+                                _status["last_error"] = f"decide {address[:8]}: {exc}"
+                            pipeline_log.emit(
+                                "swarm",
+                                "decide_error",
+                                level="error",
+                                address=address,
+                                symbol=(live_token or {}).get("name"),
+                                reason=str(exc),
+                                timeframe=tf,
+                            )
+                            continue
+                        action = getattr(card.action, "value", str(card.action))
+                        actions[action] += 1
+                        if discover_mod is not None:
+                            try:
+                                discover_mod.note_decision(card)
+                            except Exception:  # noqa: BLE001
+                                pass
+                        exec_result = paper.execute_decision(card, mark_price=mark)
+                        paper_status[str(exec_result.get("status") or "unknown")] += 1
                 with _lock:
                     _status["ticks"] = int(_status.get("ticks") or 0) + 1
                     _status["last_tick_at"] = time.strftime(

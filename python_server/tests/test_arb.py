@@ -363,6 +363,16 @@ def test_circular_skips_when_round_trip_loses(monkeypatch, tmp_path):
     assert result["fills_n"] == 0
 
 
+def test_round_trip_survives_list_quote(monkeypatch):
+    monkeypatch.setattr(arb, "SIZE_USD", 40.0)
+    monkeypatch.setattr(arb, "MIN_EDGE_PCT", 0.05)
+    monkeypatch.setattr(arb, "_estimate_sol_usd", lambda: 100.0)
+    monkeypatch.setattr(arb, "_jupiter_quote", lambda *a, **k: [])
+    ok, body = arb._round_trip_quote(MEME, 40.0)
+    assert ok is False
+    assert "object" in str(body.get("reason") or "")
+
+
 def test_pick_tf_prefers_5s():
     from decision.swarm import _pick_tf
 

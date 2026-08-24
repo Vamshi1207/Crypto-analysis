@@ -208,6 +208,49 @@
     @media (max-width: 560px) {
       .account { grid-template-columns: repeat(2, 1fr); }
     }
+
+    .labs {
+      margin: 0 0 1.15rem;
+      background: var(--bg-elev);
+      border: 1px solid var(--line-strong);
+      border-radius: 14px;
+      overflow: hidden;
+    }
+    .labs .panel-h { padding: 0.85rem 1rem 0.35rem; }
+    .labs p.lead {
+      margin: 0 1rem 0.7rem;
+      font-size: 0.82rem;
+      color: var(--muted);
+      line-height: 1.45;
+      max-width: 46rem;
+    }
+    table.labs-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.82rem;
+    }
+    table.labs-table th,
+    table.labs-table td {
+      text-align: left;
+      padding: 0.45rem 0.85rem;
+      border-top: 1px solid var(--line);
+      vertical-align: top;
+    }
+    table.labs-table th {
+      font-size: 0.68rem;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      color: var(--faint);
+      font-weight: 600;
+    }
+    table.labs-table td.num { font-family: var(--mono); white-space: nowrap; }
+    table.labs-table .thesis {
+      color: var(--muted);
+      font-size: 0.75rem;
+      max-width: 22rem;
+    }
+    table.labs-table tr.leader td:first-child { color: var(--accent); font-weight: 650; }
+
     .metric {
       background: var(--bg-elev);
       border: 1px solid var(--line-strong);
@@ -613,10 +656,20 @@
       </div>
     </section>
 
+    <section class="labs" aria-label="Parallel paper experiments">
+      <div class="panel-h">
+        <h2>Parallel books</h2>
+        <span id="labs-count">—</span>
+      </div>
+      <p class="lead">Same tape, separate $1000 each. We are not looking for one perfect setup — we are watching which rules survive fees.</p>
+      <div id="labs-body"><div class="empty-row">Loading experiments…</div></div>
+    </section>
+
     <div class="strip">
       <div>
         <div class="strip-meta" id="strip-meta">Loading…</div>
         <div class="links" style="margin-top:0.55rem">
+          <a href="/labs" target="_blank" rel="noopener">labs</a>
           <a href="/portfolio" target="_blank" rel="noopener">portfolio JSON</a>
           <a href="/readiness" target="_blank" rel="noopener">readiness</a>
           <a href="/scoreboard" target="_blank" rel="noopener">scoreboard</a>
@@ -819,6 +872,40 @@
   function laneBadge(lane) {
     const cls = lane === "snipe" ? "lane-snipe" : lane === "cluster" ? "lane-cluster" : lane === "launch" ? "lane-launch" : "";
     return `<span class="lane ${cls}">${esc(lane)}</span>`;
+  }
+
+  function renderLabs(labs) {
+    const board = labs.board || {};
+    const rows = (board.lanes || []).filter((r) => r.id !== "main" || r.closed_count || r.open_count);
+    const leader = board.leader;
+    const el = document.getElementById("labs-count");
+    if (el) {
+      el.textContent = labs.enabled === false
+        ? "off"
+        : `${rows.length} books · leader ${leader || "—"}`;
+    }
+    const body = document.getElementById("labs-body");
+    if (!body) return;
+    if (!rows.length) {
+      body.innerHTML = `<div class="empty-row">No experiment books yet.</div>`;
+      return;
+    }
+    const tr = rows.map((r) => {
+      const wr = r.win_rate == null ? "—" : `${Math.round(r.win_rate * 100)}%`;
+      const avg = r.avg_pnl_usd == null ? "—" : fmtMoney(r.avg_pnl_usd, 3);
+      return `<tr class="${r.id === leader && r.closed_count ? "leader" : ""}">
+        <td><b>${esc(r.label || r.id)}</b><div class="thesis">${esc(r.thesis || "")}</div></td>
+        <td class="num pnl ${pnlClass(r.realized_pnl_usd)}">${fmtMoney(r.realized_pnl_usd)}</td>
+        <td class="num">${r.closed_count || 0} · ${wr}</td>
+        <td class="num">${avg}</td>
+        <td class="num">${r.open_count || 0}</td>
+        <td class="num">${fmtMoneyAbs(r.cash_usd)}</td>
+      </tr>`;
+    }).join("");
+    body.innerHTML = `<table class="labs-table">
+      <thead><tr><th>Book</th><th>Locked P/L</th><th>Closes · win</th><th>Avg</th><th>Open</th><th>Cash</th></tr></thead>
+      <tbody>${tr}</tbody>
+    </table>`;
   }
 
   function renderSniper(port) {
@@ -1040,12 +1127,13 @@
 
   async function refreshOps() {
     try {
-      const [port, swarm, health, ready, arb] = await Promise.all([
-        fetch("/portfolio").then(r => r.json()),
+      const [port, swarm, health, ready, arb, labs] = await Promise.all([
+        fetch("/portfolio?lane=snipe_master").then(r => r.json()),
         fetch("/swarm").then(r => r.json()),
         fetch("/health").then(r => r.json()),
         fetch("/readiness").then(r => r.json()),
         fetch("/arb").then(r => r.json()),
+        fetch("/labs").then(r => r.json()),
       ]);
       const t = ready.session || ready.today || {};
       const eq = port.equity_usd;
@@ -1075,6 +1163,7 @@
       document.getElementById("m-arb-sub").textContent =
         `${arbFills || t.arb_fills || 0} fills · avg ${fmtMoney(arbEv, 3)} · ${fmtMoneyAbs(arbNotional)} deployed`;
 
+      renderLabs(labs);
       renderSniper(port);
       renderOpenPositions(port);
       renderClosed(port);

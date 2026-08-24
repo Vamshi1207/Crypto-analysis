@@ -115,10 +115,6 @@ def drain(*, limit: int = 16) -> list[dict[str, Any]]:
 
 def start() -> dict[str, Any]:
     global _thread
-    if not SETTINGS.helius_api_key:
-        with _lock:
-            _stats["last_error"] = "no HELIUS_API_KEY"
-        return status()
     with _lock:
         if _thread and _thread.is_alive():
             return status()
@@ -141,7 +137,7 @@ def stop() -> dict[str, Any]:
 
 
 def _ws_url() -> str:
-    return f"wss://mainnet.helius-rpc.com/?api-key={SETTINGS.helius_api_key}"
+    return "wss://pumpportal.fun/api/data"
 
 
 def _run() -> None:
@@ -200,13 +196,7 @@ def _listen_once() -> None:
         raise ConnectionError("ws accept mismatch")
     leftover = header.split(b"\r\n\r\n", 1)[1]
     _ws_send(sock, json.dumps({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "logsSubscribe",
-        "params": [
-            {"mentions": [PUMP_PROGRAM]},
-            {"commitment": "processed"},
-        ],
+        "method": "subscribeNewToken"
     }))
     with _lock:
         _stats["connected"] = True
@@ -366,18 +356,17 @@ def _on_message(raw: str) -> None:
         body = json.loads(raw)
     except json.JSONDecodeError:
         return
-    value = ((body.get("params") or {}).get("result") or {}).get("value") or {}
-    if value.get("err"):
-        return
-    logs = value.get("logs") or []
-    if not isinstance(logs, list):
-        return
-    created = parse_create_logs(logs)
-    trades = parse_trade_logs(logs)
-    if created:
-        created["signature"] = value.get("signature") or ""
-        created["seen_at"] = time.time()
-        created["source"] = "pump_create"
+
+    if body.get("txType") == "create" or ("mint" in body and "traderPublicKey" in body):
+        created = {
+            "mint": body.get("mint"),
+            "symbol": body.get("symbol"),
+            "creator": body.get("traderPublicKey"),
+            "bonding_curve": body.get("bondingCurveKey"),
+            "signature": body.get("signature") or "",
+            "seen_at": time.time(),
+            "source": "pump_create",
+        }
         _note_create(created)
         try:
             _events.put_nowait(created)
@@ -400,5 +389,3 @@ def _on_message(raw: str) -> None:
             symbol=created.get("symbol"),
             creator=(created.get("creator") or "")[:8],
         )
-    for trade in trades:
-        _note_trade(trade)

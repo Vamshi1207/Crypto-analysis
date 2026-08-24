@@ -10,9 +10,11 @@ import os
 import threading
 import time
 import uuid
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any, Iterator, Optional
 
 from decision import costs
 from decision import pipeline_log
@@ -132,7 +134,63 @@ class PortfolioState:
 
 
 _lock = threading.Lock()
-_state = PortfolioState(kill_switch=KILL_SWITCH, live_trading_blocked=not LIVE_TRADING)
+DEFAULT_LANE = "main"
+_active_lane: ContextVar[str] = ContextVar("paper_lane", default=DEFAULT_LANE)
+_books: dict[str, PortfolioState] = {}
+
+
+def _new_book() -> PortfolioState:
+    return PortfolioState(kill_switch=KILL_SWITCH, live_trading_blocked=not LIVE_TRADING)
+
+
+def _cur() -> PortfolioState:
+    lane = _active_lane.get() or DEFAULT_LANE
+    book = _books.get(lane)
+    if book is None:
+        book = _new_book()
+        _books[lane] = book
+    return book
+
+
+class _BookProxy:
+    """Attribute access goes to the active lane's book (default: main)."""
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(_cur(), name)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        setattr(_cur(), name, value)
+
+
+_state = _BookProxy()
+
+
+@contextmanager
+def use_lane(lane: str) -> Iterator[str]:
+    """Run paper fills against an isolated book. Each lane has its own $1000."""
+    key = (lane or DEFAULT_LANE).strip() or DEFAULT_LANE
+    token = _active_lane.set(key)
+    _cur()  # create the book lazily
+    try:
+        yield key
+    finally:
+        _active_lane.reset(token)
+
+
+def active_lane() -> str:
+    return _active_lane.get() or DEFAULT_LANE
+
+
+def known_lanes() -> list[str]:
+    with _lock:
+        ids = set(_books) | {DEFAULT_LANE}
+    try:
+        from decision import labs
+
+        ids |= set(labs.all_lane_ids())
+    except Exception:
+        pass
+    return sorted(ids)
 
 
 def snapshot() -> dict[str, Any]:
@@ -142,6 +200,7 @@ def snapshot() -> dict[str, Any]:
         sniper_open = [p for p in _state.open if p.entry_reason == "snipe"]
         sniper_realized = sum(float(p.realized_pnl_usd or 0.0) for p in sniper_closed)
         return {
+            "lane": active_lane(),
             "cash_usd": _state.cash_usd,
             "realized_pnl_usd": _state.realized_pnl_usd,
             "arb_fills": _state.arb_fills,
@@ -194,28 +253,77 @@ def snapshot() -> dict[str, Any]:
         }
 
 
+def lane_board() -> dict[str, Any]:
+    """Side-by-side PnL for every isolated paper book."""
+    try:
+        from decision import labs
+
+        meta = {row["id"]: row for row in labs.lane_meta()}
+    except Exception:
+        meta = {}
+    lanes: list[dict[str, Any]] = []
+    for lid in known_lanes():
+        with use_lane(lid):
+            book = _cur()
+            pnls = [float(p.realized_pnl_usd or 0.0) for p in book.closed]
+            wins = sum(1 for x in pnls if x > 0)
+            losses = sum(1 for x in pnls if x < 0)
+            n = len(pnls)
+            info = meta.get(lid) or {"id": lid, "family": lid, "label": lid, "thesis": ""}
+            lanes.append(
+                {
+                    **info,
+                    "cash_usd": round(book.cash_usd, 4),
+                    "realized_pnl_usd": round(book.realized_pnl_usd, 4),
+                    "open_count": len(book.open),
+                    "closed_count": n,
+                    "wins": wins,
+                    "losses": losses,
+                    "flats": n - wins - losses,
+                    "win_rate": round(wins / n, 4) if n else None,
+                    "avg_pnl_usd": round(sum(pnls) / n, 4) if n else None,
+                    "arb_fills": book.arb_fills,
+                    "arb_realized_pnl_usd": round(book.arb_realized_pnl_usd, 4),
+                }
+            )
+    ranked = sorted(lanes, key=lambda r: (r.get("realized_pnl_usd") or 0.0), reverse=True)
+    return {
+        "lanes": ranked,
+        "leader": ranked[0]["id"] if ranked else None,
+        "n": len(ranked),
+    }
+
+
 def set_kill_switch(enabled: bool) -> dict[str, Any]:
+    flag = bool(enabled)
     with _lock:
-        _state.kill_switch = bool(enabled)
+        for book in _books.values():
+            book.kill_switch = flag
+        _cur().kill_switch = flag
     return snapshot()
 
 
 def reset(*, starting_cash_usd: float = 1_000.0) -> dict[str, Any]:
-    """Wipe open/closed paper book and restore starting cash."""
+    """Wipe every lane's open/closed book and restore starting cash."""
+    cash = float(starting_cash_usd)
     with _lock:
-        _state.cash_usd = float(starting_cash_usd)
-        _state.realized_pnl_usd = 0.0
-        _state.arb_fills = 0
-        _state.arb_realized_pnl_usd = 0.0
-        _state.arb_notional_usd = 0.0
-        _state.open = []
-        _state.closed = []
-        # Keep kill switch as configured; do not force it on.
+        ids = set(_books) | {DEFAULT_LANE}
+        try:
+            from decision import labs
+
+            ids |= set(labs.all_lane_ids())
+        except Exception:
+            pass
+        for lid in ids:
+            book = _new_book()
+            book.cash_usd = cash
+            _books[lid] = book
     pipeline_log.emit(
         "paper",
         "reset",
         level="warning",
         cash_usd=starting_cash_usd,
+        lanes=sorted(ids),
     )
     return snapshot()
 
@@ -303,6 +411,7 @@ def execute_signal(
         record = {
             "event": "open",
             "strategy": strategy,
+            "lane": active_lane(),
             "position": asdict(pos),
             "extra": extra or {},
         }
@@ -318,6 +427,7 @@ def execute_signal(
             symbol=name,
             size_usd=size_usd,
             strategy=strategy,
+            lane=active_lane(),
         )
         return {"status": "opened", "position": asdict(pos), "cash_usd": round(_state.cash_usd, 4)}
 
@@ -756,10 +866,14 @@ def mark_and_maybe_exit(
                     (pos.take_profit_pct or 0.0) > 0
                     and mark_pnl >= pos.size_usd * pos.take_profit_pct / 100.0
                 )
-                or decision_pnl >= pos.target_profit_usd
+                or (
+                    (pos.take_profit_pct or 0.0) <= 0
+                    and decision_pnl >= pos.target_profit_usd
+                )
             ):
-                # Bank the dollar (or the rip) before a later tape force can
-                # flatten a winner that already paid. This was the edge.
+                # Percent targets (sniper 40% rip) must not clip at the $1
+                # scalp dollar. That cut FELIX from +$3.42 down to +$1.
+                # Trail below still banks after the arm once price gives back.
                 rip = pos.size_usd * (pos.take_profit_pct or 0.0) / 100.0
                 if rip > 0 and mark_pnl >= rip:
                     pnl = rip

@@ -8,6 +8,7 @@ verdict instead of treating missing data as a pass.
 from __future__ import annotations
 
 import itertools
+import threading
 import time
 from typing import Any, Optional
 
@@ -46,19 +47,20 @@ class NoRouteError(RuntimeError):
     """Jupiter answered successfully and there is no route. This is a signal."""
 
 
-_client: Optional[httpx.Client] = None
+_tls = threading.local()
 
 
 def _http() -> httpx.Client:
-    global _client
-    if _client is None:
-        _client = httpx.Client(
+    client = getattr(_tls, "client", None)
+    if client is None:
+        client = httpx.Client(
             timeout=httpx.Timeout(SETTINGS.http_timeout_s),
-            limits=httpx.Limits(max_connections=16, max_keepalive_connections=8),
+            limits=httpx.Limits(max_connections=8, max_keepalive_connections=4),
             headers={"User-Agent": "crypto-platform/decision-engine"},
             follow_redirects=True,
         )
-    return _client
+        _tls.client = client
+    return client
 
 
 # Kept deliberately small: this is in the hot path of a trading decision, and
@@ -494,6 +496,9 @@ def fetch_jupiter_quote(
                 last_error = f"{url}: malformed JSON ({exc})"
                 continue
 
+            if not isinstance(body, dict):
+                last_error = f"{url}: unexpected quote payload"
+                continue
             if not body.get("outAmount"):
                 raise NoRouteError("quote returned no output amount")
             return body

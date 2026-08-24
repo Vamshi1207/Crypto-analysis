@@ -15,6 +15,8 @@ from decision.sources import SourceError, resolve_to_mint
 from pathlib import Path
 import json
 import os
+import threading
+import time
 import portguard
 import shutil
 
@@ -664,7 +666,12 @@ def portfolio_endpoint():
         if "kill_switch" in body:
             return jsonify(paper.set_kill_switch(bool(body.get("kill_switch"))))
 
-    snap = paper.snapshot()
+    lane = request.args.get("lane")
+    if lane:
+        with paper.use_lane(lane):
+            snap = paper.snapshot()
+    else:
+        snap = paper.snapshot()
     # Enrich open positions with live marks from the shared buffer (trading-desk PnL).
     open_enriched = []
     unrealized = 0.0
@@ -913,6 +920,16 @@ def session_reset_endpoint():
     return jsonify(decision_session.reset_board(reason=reason))
 
 
+@app.route('/labs', methods=["GET", "OPTIONS"])
+def labs_endpoint():
+    """Parallel paper books — same tape, different rules, isolated cash."""
+    if request.method == "OPTIONS":
+        return _build_cors_preflight_response()
+    from decision import labs
+
+    return jsonify(labs.status())
+
+
 @app.route('/scoreboard', methods=["GET", "OPTIONS"])
 def scoreboard_endpoint():
     if request.method == "OPTIONS":
@@ -953,13 +970,62 @@ def calibrate_endpoint():
     return jsonify(result)
 
 
+_ready_cache: tuple[float, dict] = (0.0, {})
+_ready_lock = threading.Lock()
+_ready_refreshing = False
+_READY_STALE_SEC = 15.0
+
+
+def _refresh_ready() -> None:
+    global _ready_cache, _ready_refreshing
+    try:
+        from decision import readiness
+
+        payload = readiness.evaluate()
+        with _ready_lock:
+            _ready_cache = (time.time(), payload)
+    except Exception:
+        pass
+    finally:
+        with _ready_lock:
+            _ready_refreshing = False
+
+
+def _ready_snapshot() -> dict:
+    """Never block /health on a JSONL scan — that is what made the box unhealthy."""
+    global _ready_refreshing
+    now = time.time()
+    with _ready_lock:
+        ts, payload = _ready_cache
+        stale = (now - ts) > _READY_STALE_SEC or not payload
+        if stale and not _ready_refreshing:
+            _ready_refreshing = True
+            threading.Thread(target=_refresh_ready, daemon=True, name="ready-refresh").start()
+        if payload:
+            return payload
+    return {
+        "ready_for_live": False,
+        "score": None,
+        "passed": 0,
+        "total_checks": 0,
+        "recommendation": "scorecard warming up",
+        "session_started_at": None,
+    }
+
+
+@app.route('/healthz')
+def healthz():
+    """Docker/liveness probe. Must stay cheaper than /health."""
+    return jsonify({"server": "ok"}), 200
+
+
 @app.route('/health')
 def health():
     """Surfaces whether each tier is actually usable, not just whether we're up."""
     agy_status = agy_cli.preflight()
     from decision import forecast as forecast_mod
     from decision import calibrate as calibrate_mod
-    from decision import arb, discover, paper, pipeline_log, pricefeed, readiness, swarm
+    from decision import arb, discover, paper, pipeline_log, pricefeed, swarm
     from decision import trenches
     from decision import session as decision_session
 
@@ -968,7 +1034,7 @@ def health():
     disc = discover.status()
     arb_st = arb.status()
     feed = pricefeed.status()
-    ready = readiness.evaluate()
+    ready = _ready_snapshot()
     trade_n = sum(
         1
         for t in token_data.values()
@@ -1102,6 +1168,23 @@ def _configure_background_channels() -> None:
             flush=True,
         )
 
+    # gRPC Stream Setup (Disabled by default pending paid tier, unless HELIUS_API_KEY is present)
+    geyser_endpoint = os.getenv("GEYSER_ENDPOINT")
+    geyser_token = os.getenv("GEYSER_TOKEN")
+    
+    # Fallback to Helius gRPC if they have a standard Helius key
+    if not geyser_endpoint and os.getenv("HELIUS_API_KEY"):
+        geyser_endpoint = "https://mainnet.helius-rpc.com:2083"
+        geyser_token = os.getenv("HELIUS_API_KEY")
+
+    if geyser_endpoint:
+        # Phase 2: Sniper Mode
+        if os.getenv("FAST_SNIPER_ENABLED", "0").strip() == "1":
+            from decision.grpc_client import grpc_sniper
+            grpc_sniper.start()
+            print(f"geyser: FAST_SNIPER_ENABLED=1, gRPC sniper started at {geyser_endpoint}", flush=True)
+        else:
+            print(f"geyser: gRPC stream available at {geyser_endpoint} but FAST_SNIPER_ENABLED=0", flush=True)
 
 _configure_background_channels()
 
@@ -1122,4 +1205,4 @@ if __name__ == '__main__':
             print(f"warning: port {port} still has a LISTEN socket", flush=True)
 
     print(f"Starting server on {host}:{port}...")
-    app.run(host=host, port=port, debug=False)
+    app.run(host=host, port=port, debug=False, threaded=True)

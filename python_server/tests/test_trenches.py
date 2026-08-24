@@ -221,6 +221,10 @@ def test_scan_sniper_buys_only_after_tape_lifts(monkeypatch, tmp_path):
     mint = "MintHot11111111111111111111111111111"
     monkeypatch.setattr(trenches, "_sol_usd", lambda: 150.0)
     monkeypatch.setattr(trenches, "initial_price_usd", lambda sol: create_px)
+    monkeypatch.setattr(trenches, "SNIPER_MIN_LIQ_USD", 400.0)
+    monkeypatch.setattr(trenches, "SNIPER_MIN_BUYERS", 2)
+    monkeypatch.setattr(trenches, "SNIPER_MIN_LIFT_PCT", 5.0)
+    monkeypatch.setattr(trenches, "SNIPER_MIN_REAL_SOL", 2.5)
     monkeypatch.setattr(
         snipe_feed,
         "drain",
@@ -239,23 +243,23 @@ def test_scan_sniper_buys_only_after_tape_lifts(monkeypatch, tmp_path):
         "tapes",
         lambda sol_usd=150: {
             mint: {
-                "last_px": create_px * 1.18,
-                "unique_buyers": 5,
-                "buys": 7,
+                "last_px": create_px * 1.08,
+                "unique_buyers": 2,
+                "buys": 3,
                 "sells": 0,
-                "real_sol": 12.0,
+                "real_sol": 3.0,
             }
         },
     )
     seen, opens, skipped, expired, hits = trenches._scan_sniper()
     assert opens == 1
     assert hits[0]["entry_why"] == "tape_lift"
-    assert hits[0]["buyers"] == 5
+    assert hits[0]["buyers"] == 2
     snap = paper.snapshot()
     assert snap["open_count"] == 1
     pos = snap["open"][0]
     assert pos["entry_reason"] == "snipe"
-    assert pos["dead_after_sec"] == trenches.SNIPER_DEAD_SEC
+    assert pos["stop_loss_usd"] == trenches.SNIPER_STOP_USD
     assert pos["size_usd"] < trenches.SNIPER_SIZE_USD
     trenches.reset_counters()
     paper.reset()
@@ -268,6 +272,7 @@ def test_scan_sniper_skips_thin_tape(monkeypatch):
     mint = "MintThin111111111111111111111111111"
     monkeypatch.setattr(trenches, "_sol_usd", lambda: 150.0)
     monkeypatch.setattr(trenches, "initial_price_usd", lambda sol: create_px)
+    monkeypatch.setattr(trenches, "SNIPER_MIN_LIQ_USD", 400.0)
     monkeypatch.setattr(
         snipe_feed,
         "drain",

@@ -55,6 +55,16 @@ def paper_concentration_headroom(monkeypatch):
     monkeypatch.setattr(paper, "BLOCK_REPEAT_MINT_AFTER_STOP", False)
 
 
+@pytest.fixture(autouse=True)
+def labs_off_unless_requested(monkeypatch, request):
+    """Keep the old single-book tests on main. test_labs.py turns labs on."""
+    if request.node.fspath.basename == "test_labs.py":
+        return
+    from decision import labs
+
+    monkeypatch.setattr(labs, "ENABLED", False)
+
+
 @pytest.fixture(scope="session")
 def corpus_tokens():
     tokens = dataset.list_tokens()

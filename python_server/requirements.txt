@@ -17,3 +17,7 @@ pytest
 # Phase 2 core (no torch). Heavy zero-shot models are optional — see
 # requirements-forecast.txt and FORECAST_DISABLE_* env vars.
 scikit-learn
+
+# Yellowstone gRPC
+grpcio
+grpcio-tools
