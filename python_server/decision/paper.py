@@ -182,14 +182,19 @@ def active_lane() -> str:
 
 
 def known_lanes() -> list[str]:
-    with _lock:
-        ids = set(_books) | {DEFAULT_LANE}
+    """Declared labs books, plus any leftover book that actually traded."""
     try:
         from decision import labs
 
-        ids |= set(labs.all_lane_ids())
+        ids = set(labs.all_lane_ids())
     except Exception:
-        pass
+        ids = {DEFAULT_LANE}
+    with _lock:
+        for lid, book in _books.items():
+            if lid in ids:
+                continue
+            if book.open or book.closed or book.arb_fills:
+                ids.add(lid)
     return sorted(ids)
 
 
@@ -839,7 +844,17 @@ def mark_and_maybe_exit(
             # the trail. A single +$80 ghost still cannot become the peak in
             # one tick. Never skip the rest of the tick — that froze
             # gamerfaroe through a 300k→15k rug past its 300s max-hold.
-            if mark_pnl - last_accepted > max_jump:
+            # Cluster/launch marks Dex/Gecko: a 7× print is a venue glitch
+            # (Artcoin booked +$522 on an unconfirmed $4.2M mid). Do not
+            # ratchet last_accepted toward that.
+            venue_blowup = (
+                pos.entry_reason in ("launch", "cluster")
+                and pos.entry_price > 0
+                and abs(mark_price / pos.entry_price - 1.0) > 2.0
+            )
+            if venue_blowup:
+                decision_pnl = last_accepted
+            elif mark_pnl - last_accepted > max_jump:
                 decision_pnl = last_accepted + max_jump
             else:
                 decision_pnl = mark_pnl
@@ -864,18 +879,17 @@ def mark_and_maybe_exit(
             elif pos.bank_at_target and (
                 (
                     (pos.take_profit_pct or 0.0) > 0
-                    and mark_pnl >= pos.size_usd * pos.take_profit_pct / 100.0
+                    and decision_pnl >= pos.size_usd * pos.take_profit_pct / 100.0
                 )
                 or (
                     (pos.take_profit_pct or 0.0) <= 0
                     and decision_pnl >= pos.target_profit_usd
                 )
             ):
-                # Percent targets (sniper 40% rip) must not clip at the $1
-                # scalp dollar. That cut FELIX from +$3.42 down to +$1.
-                # Trail below still banks after the arm once price gives back.
+                # Percent targets must clear on the jump-capped mark. A single
+                # Dex ghost used to print snipe_rip $12 with peak PnL of $2.
                 rip = pos.size_usd * (pos.take_profit_pct or 0.0) / 100.0
-                if rip > 0 and mark_pnl >= rip:
+                if rip > 0 and decision_pnl >= rip:
                     pnl = rip
                     reason = f"snipe_rip ${pnl:.2f}"
                 else:

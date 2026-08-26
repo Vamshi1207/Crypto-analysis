@@ -200,11 +200,39 @@ def test_snipe_rip_banks_percent_of_size(trailing):
         take_profit_pct=40.0,
     )
     assert opened["status"] == "opened"
-    # ~50% up clears the 40% rip ($16) before the $1 clip.
-    closed = paper.mark_and_maybe_exit(address="PoolRip", mark_price=1.55)
+    # Jump cap is 15% of size ($6). A real 55% move has to climb over a few
+    # ticks before the 40% rip ($16) can fire.
+    closed = []
+    for _ in range(8):
+        closed = paper.mark_and_maybe_exit(address="PoolRip", mark_price=1.55)
+        if closed:
+            break
     assert closed
     assert "snipe_rip" in (closed[0].get("close_reason") or "")
     assert closed[0]["realized_pnl_usd"] == pytest.approx(16.0, abs=0.05)
+    paper.reset()
+
+
+def test_snipe_rip_ignores_a_one_tick_ghost(trailing):
+    paper.reset()
+    opened = paper.execute_signal(
+        address="PoolGhost",
+        mint="MintGhost",
+        name="GHOST",
+        mark_price=1.0,
+        size_usd=20.0,
+        strategy="snipe",
+        max_hold_sec=12.0,
+        bank_at_target=True,
+        target_profit_usd=1.0,
+        take_profit_pct=40.0,
+    )
+    assert opened["status"] == "opened"
+    # Dex once printed TSP as +60% of a $20 clip while peak PnL was $2.74.
+    closed = paper.mark_and_maybe_exit(address="PoolGhost", mark_price=2.0)
+    assert closed == []
+    pos = next(p for p in paper._state.open if p.address == "PoolGhost")
+    assert pos.peak_pnl_usd < 20.0 * 0.40
     paper.reset()
 
 
@@ -229,6 +257,31 @@ def test_snipe_dead_tape_scratches_early(trailing):
     closed = paper.mark_and_maybe_exit(address="PoolDead", mark_price=1.0)
     assert closed
     assert "dead_tape" in (closed[0].get("close_reason") or "")
+    paper.reset()
+
+
+def test_hold_book_does_not_scratch_a_quiet_tape(trailing):
+    """Cluster logs: max_hold + trail paid; dead_tape sniper scratches did not."""
+    paper.reset()
+    opened = paper.execute_signal(
+        address="PoolHold",
+        mint="MintHold",
+        name="HOLD",
+        mark_price=1.0,
+        size_usd=40.0,
+        strategy="snipe",
+        max_hold_sec=300.0,
+        bank_at_target=False,
+        target_profit_usd=2.0,
+        take_profit_pct=0.0,
+        stop_loss_usd=1.60,
+        dead_after_sec=None,
+        abs_hold_sec=300.0,
+    )
+    assert opened["status"] == "opened"
+    pos = next(p for p in paper._state.open if p.address == "PoolHold")
+    pos.opened_at = (datetime.now(timezone.utc) - timedelta(seconds=12)).isoformat()
+    assert paper.mark_and_maybe_exit(address="PoolHold", mark_price=1.02) == []
     paper.reset()
 
 

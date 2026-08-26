@@ -667,6 +667,10 @@ def portfolio_endpoint():
             return jsonify(paper.set_kill_switch(bool(body.get("kill_switch"))))
 
     lane = request.args.get("lane")
+    if not lane:
+        from decision import labs
+
+        lane = labs.primary_lane_id()
     if lane:
         with paper.use_lane(lane):
             snap = paper.snapshot()
@@ -1030,7 +1034,10 @@ def health():
     from decision import session as decision_session
 
     residuals = calibrate_mod.load_residuals()
-    port = paper.snapshot()
+    from decision import labs
+
+    with paper.use_lane(labs.primary_lane_id()):
+        port = paper.snapshot()
     disc = discover.status()
     arb_st = arb.status()
     feed = pricefeed.status()

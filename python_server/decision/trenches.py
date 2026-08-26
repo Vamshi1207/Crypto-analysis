@@ -1,5 +1,7 @@
 """Paper launch + cluster + create-event sniper.
 
+Runner for the isolated engines under ``decision.engines``:
+cluster, launch (this file), sniper (``engines.sniper``), hold (labs).
 Public events only: Pump.fun ``Create`` / ``Trade`` logs (already landed)
 plus Gecko new_pools and unique-buyer clusters. Paper only — no live swaps,
 no wash volume, no pending-tx front-running, no create+buy bundles.
@@ -26,6 +28,7 @@ from decision import pricefeed
 from decision import snipe_feed
 from decision.config import SETTINGS, WRAPPED_SOL_MINT, _env_float, _env_int
 from decision import labs
+from decision import snipe_desk
 from decision.pumpfun import (
     CreatorBook,
     curve_gave_back,
@@ -330,7 +333,7 @@ def _scan(*, do_cluster: bool = True) -> dict[str, Any]:
         cluster_exits += _process_watchlist_and_exits()
 
     candidates: list[dict[str, Any]] = []
-    if LAUNCH_ENABLED and do_cluster:
+    if (LAUNCH_ENABLED or CLUSTER_ENABLED) and do_cluster:
         candidates = list_launch_candidates()
         launch_seen = len(candidates)
 
@@ -350,8 +353,13 @@ def _scan(*, do_cluster: bool = True) -> dict[str, Any]:
         is_cluster = CLUSTER_ENABLED and len(buyers) >= CLUSTER_MIN_WALLETS
         if is_cluster:
             cluster_fires += 1
-        elif len(buyers) < LAUNCH_MIN_BUYERS:
-            # Empty new pool — wait for buyers instead of locking the mint out.
+        elif LAUNCH_ENABLED and len(buyers) >= LAUNCH_MIN_BUYERS:
+            pass
+        else:
+            # Wait for buyers instead of locking the mint out.
+            skipped += 1
+            continue
+        if not is_cluster and not LAUNCH_ENABLED:
             skipped += 1
             continue
         strategy = "cluster" if is_cluster else "launch"
@@ -365,7 +373,8 @@ def _scan(*, do_cluster: bool = True) -> dict[str, Any]:
                 "trenches", "skip", mint=mint, symbol=row.get("symbol"), reason=reason
             )
             continue
-        result = _open(row, strategy=strategy, size=size, hold=hold, extra={"buyers": buyers})
+        with paper.use_lane(labs.trading_lane(strategy)):
+            result = _open(row, strategy=strategy, size=size, hold=hold, extra={"buyers": buyers})
         if result.get("status") == "opened":
             _seen_mints.add(mint)
             opened_this_tick += 1
@@ -520,6 +529,12 @@ def _scan_sniper() -> tuple[int, int, int, int, list[dict[str, Any]]]:
                 "trenches", "skip", mint=mint, symbol=watch.get("symbol"),
                 reason=why, strategy="snipe",
             )
+            snipe_desk.observe(
+                unique_buyers=unique,
+                lift_pct=snipe_lift_pct(create_px, last_px),
+                real_sol=real_sol,
+                age_sec=age,
+            )
             continue
         snipe_lanes = labs.snipe_lanes()
         if snipe_lanes:
@@ -540,6 +555,12 @@ def _scan_sniper() -> tuple[int, int, int, int, list[dict[str, Any]]]:
                 if hit:
                     opens += 1
                     hits.append(hit)
+            snipe_desk.observe(
+                unique_buyers=unique,
+                lift_pct=snipe_lift_pct(create_px, last_px),
+                real_sol=real_sol,
+                age_sec=age,
+            )
             if labs.all_snipe_lanes_seen(mint):
                 _watches.pop(mint, None)
             continue
@@ -888,6 +909,10 @@ def _mark_open_lots() -> None:
     for lane in labs.snipe_lanes():
         if lane.id not in lane_ids:
             lane_ids.append(lane.id)
+    if labs.ENABLED:
+        for lid in (labs.CLUSTER_LANE, labs.SCALP_LANE):
+            if lid not in lane_ids:
+                lane_ids.append(lid)
     for lane_id in lane_ids:
         with paper.use_lane(lane_id):
             snap = paper.snapshot()
@@ -904,7 +929,7 @@ def _mark_open_lots() -> None:
                     continue
                 tape = tape_map.get(str(mint or "")) or {}
                 mark = None
-                if reason == "snipe" and mint:
+                if reason in {"snipe", "cluster", "launch"} and mint:
                     mark = _snipe_marks.get(str(mint))
                     if mark is None:
                         mark = float(tape.get("last_px") or 0.0) or None
@@ -913,7 +938,11 @@ def _mark_open_lots() -> None:
                 if mark is None and mint:
                     mark = _snipe_marks.get(str(mint))
                 if mark:
-                    force = _tape_force_reason(tape) if reason == "snipe" else None
+                    force = (
+                        _tape_force_reason(tape)
+                        if reason in {"snipe", "cluster", "launch"}
+                        else None
+                    )
                     paper.mark_and_maybe_exit(
                         address=str(addr),
                         mark_price=mark,

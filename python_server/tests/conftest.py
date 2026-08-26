@@ -56,6 +56,15 @@ def paper_concentration_headroom(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def clear_snipe_desk():
+    from decision import snipe_desk
+
+    snipe_desk.clear()
+    yield
+    snipe_desk.clear()
+
+
+@pytest.fixture(autouse=True)
 def labs_off_unless_requested(monkeypatch, request):
     """Keep the old single-book tests on main. test_labs.py turns labs on."""
     if request.node.fspath.basename == "test_labs.py":
