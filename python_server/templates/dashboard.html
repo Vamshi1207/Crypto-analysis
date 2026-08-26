@@ -367,6 +367,55 @@
     .lane-snipe { color: #1a1408; background: var(--accent); border-color: transparent; }
     .lane-cluster { color: #062033; background: var(--hold); border-color: transparent; }
     .lane-launch { color: #3a2a00; background: var(--warn); border-color: transparent; }
+    .lane-hold { color: #042816; background: var(--buy); border-color: transparent; }
+    .lane-arb { color: #3a0810; background: rgba(255,107,122,0.85); border-color: transparent; }
+    .lane-scalp { color: #1a1408; background: #ffd08a; border-color: transparent; }
+
+    .desk-tabs {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.35rem;
+      margin-bottom: 1.15rem;
+      padding: 0.28rem;
+      background: var(--bg-elev);
+      border: 1px solid var(--line-strong);
+      border-radius: 14px;
+    }
+    .desk-tabs button {
+      flex: 1 1 auto;
+      min-width: 6.4rem;
+      display: flex;
+      flex-direction: column;
+      align-items: flex-start;
+      gap: 0.12rem;
+      padding: 0.55rem 0.85rem;
+      border-radius: 10px;
+      font-size: 0.82rem;
+      font-weight: 700;
+      color: var(--muted);
+      text-align: left;
+    }
+    .desk-tabs button .tab-meta {
+      font-family: var(--mono);
+      font-size: 0.68rem;
+      font-weight: 600;
+      color: var(--faint);
+    }
+    .desk-tabs button .tab-meta.pos { color: var(--buy); }
+    .desk-tabs button .tab-meta.neg { color: var(--sell); }
+    .desk-tabs button.on {
+      background: var(--accent);
+      color: #1a1408;
+    }
+    .desk-tabs button.on .tab-meta { color: #1a1408; opacity: 0.82; }
+    .desk-pane[hidden] { display: none !important; }
+    .engine-thesis {
+      margin: -0.25rem 0 1rem;
+      font-size: 0.85rem;
+      color: var(--muted);
+      line-height: 1.45;
+      max-width: 46rem;
+    }
     .snipe-grid {
       display: grid;
       grid-template-columns: 1fr 1fr;
@@ -623,133 +672,132 @@
       </div>
     </header>
 
-    <section class="account" aria-label="Your practice account">
-      <div class="metric">
-        <div class="label">Total value <span class="hint" title="What your practice account is worth right now: leftover cash plus the current value of any open trades. You start with $1000 fake dollars.">?</span></div>
-        <div class="val" id="m-equity">—</div>
-        <div class="sublabel" id="m-equity-sub">vs $1000 start</div>
-      </div>
-      <div class="metric">
-        <div class="label">Sitting cash <span class="hint" title="Fake dollars not currently tied up in a trade. Available to open a new practice buy.">?</span></div>
-        <div class="val" id="m-cash">—</div>
-        <div class="sublabel" id="m-cash-sub">not in a trade</div>
-      </div>
-      <div class="metric">
-        <div class="label">Profit locked in <span class="hint" title="Money won or lost on finished trades (scalps + price-gap round-trips). Updates as trades close or arb fills book.">?</span></div>
-        <div class="val" id="m-realized">—</div>
-        <div class="sublabel" id="m-realized-sub">finished trades</div>
-      </div>
-      <div class="metric">
-        <div class="label">Open gain/loss <span class="hint" title="If you sold every open trade right now at the latest price, roughly how much you’d be up or down (before exit fees). It can change every few seconds.">?</span></div>
-        <div class="val" id="m-unrealized">—</div>
-        <div class="sublabel" id="m-unrealized-sub">still open</div>
-      </div>
-      <div class="metric">
-        <div class="label">Quick trades <span class="hint" title="Scalps = short buy-then-sell bets on one token. Totals since your last Reset board (or server start), not UTC midnight.">?</span></div>
-        <div class="val" id="m-scalp">—</div>
-        <div class="sublabel" id="m-scalp-sub">closes · avg / trade</div>
-      </div>
-      <div class="metric">
-        <div class="label">Price-gap trades <span class="hint" title="Arb = same token priced differently in two pools. Totals since your last Reset board (or server start).">?</span></div>
-        <div class="val" id="m-arb">—</div>
-        <div class="sublabel" id="m-arb-sub">fills · avg / fill</div>
-      </div>
-    </section>
+    <nav class="desk-tabs" role="tablist" aria-label="Trading engines">
+      <button type="button" class="on" data-desk="cluster" role="tab" aria-selected="true">Cluster<span class="tab-meta" id="tab-cluster">—</span></button>
+      <button type="button" data-desk="snipe" role="tab" aria-selected="false">Sniper<span class="tab-meta" id="tab-snipe">—</span></button>
+      <button type="button" data-desk="hold" role="tab" aria-selected="false">Hold<span class="tab-meta" id="tab-hold">—</span></button>
+      <button type="button" data-desk="launch" role="tab" aria-selected="false">Launch<span class="tab-meta" id="tab-launch">—</span></button>
+      <button type="button" data-desk="arb" role="tab" aria-selected="false">Arb<span class="tab-meta" id="tab-arb">—</span></button>
+      <button type="button" data-desk="scalp" role="tab" aria-selected="false">Scalp<span class="tab-meta" id="tab-scalp">—</span></button>
+      <button type="button" data-desk="finder" role="tab" aria-selected="false">Finder<span class="tab-meta" id="tab-finder">—</span></button>
+    </nav>
 
+    <div id="pane-engine" class="desk-pane">
+      <p class="engine-thesis" id="engine-thesis">Isolated $1000 book for this engine.</p>
 
+      <section class="account" aria-label="This engine’s practice book">
+        <div class="metric">
+          <div class="label">Total value <span class="hint" title="This engine’s leftover cash plus the current value of its open trades. Each engine starts with $1000 fake dollars.">?</span></div>
+          <div class="val" id="m-equity">—</div>
+          <div class="sublabel" id="m-equity-sub">vs $1000 start</div>
+        </div>
+        <div class="metric">
+          <div class="label">Sitting cash <span class="hint" title="Fake dollars in this book not currently tied up in a trade.">?</span></div>
+          <div class="val" id="m-cash">—</div>
+          <div class="sublabel" id="m-cash-sub">not in a trade</div>
+        </div>
+        <div class="metric">
+          <div class="label">Profit locked in <span class="hint" title="Money won or lost on this engine’s finished trades.">?</span></div>
+          <div class="val" id="m-realized">—</div>
+          <div class="sublabel" id="m-realized-sub">finished trades</div>
+        </div>
+        <div class="metric">
+          <div class="label">Open gain/loss <span class="hint" title="If this engine sold every open trade right now at the latest price, roughly how much it would be up or down (before exit fees).">?</span></div>
+          <div class="val" id="m-unrealized">—</div>
+          <div class="sublabel" id="m-unrealized-sub">still open</div>
+        </div>
+        <div class="metric">
+          <div class="label" id="m-extra-label">Win rate <span class="hint" title="Wins vs losses on this engine’s finished trades.">?</span></div>
+          <div class="val" id="m-scalp">—</div>
+          <div class="sublabel" id="m-scalp-sub">closes</div>
+        </div>
+        <div class="metric">
+          <div class="label" id="m-engine-label">Engine <span class="hint" title="Live status for this technique only.">?</span></div>
+          <div class="val" id="m-arb">—</div>
+          <div class="sublabel" id="m-arb-sub">status</div>
+        </div>
+      </section>
 
-    <div class="strip">
-      <div>
-        <div class="strip-meta" id="strip-meta">Loading…</div>
-        <div class="links" style="margin-top:0.55rem">
-          <a href="/labs" target="_blank" rel="noopener">labs</a>
-          <a href="/portfolio" target="_blank" rel="noopener">portfolio JSON</a>
-          <a href="/readiness" target="_blank" rel="noopener">readiness</a>
-          <a href="/scoreboard" target="_blank" rel="noopener">scoreboard</a>
-          <a href="/health" target="_blank" rel="noopener">health</a>
-          <a href="/discover" target="_blank" rel="noopener">discover</a>
-          <a href="/arb" target="_blank" rel="noopener">arb</a>
-          <a href="/trenches" target="_blank" rel="noopener">trenches</a>
+      <div class="strip">
+        <div>
+          <div class="strip-meta" id="strip-meta">Loading…</div>
+          <div class="links" style="margin-top:0.55rem">
+            <a href="/labs" target="_blank" rel="noopener">labs</a>
+            <a href="/portfolio" target="_blank" rel="noopener">portfolio JSON</a>
+            <a href="/readiness" target="_blank" rel="noopener">readiness</a>
+            <a href="/scoreboard" target="_blank" rel="noopener">scoreboard</a>
+            <a href="/health" target="_blank" rel="noopener">health</a>
+            <a href="/discover" target="_blank" rel="noopener">discover</a>
+            <a href="/arb" target="_blank" rel="noopener">arb</a>
+            <a href="/trenches" target="_blank" rel="noopener">trenches</a>
+          </div>
+        </div>
+        <div class="strip-actions">
+          <button type="button" class="btn ghost" id="session-reset" title="Archive today's logs, reset practice cash to $1000, clear pauses">Reset board</button>
+          <button type="button" class="btn ghost" id="swarm-toggle" hidden>Start auto-trader</button>
         </div>
       </div>
-      <div class="strip-actions">
-        <button type="button" class="btn ghost" id="session-reset" title="Archive today's logs, reset practice cash to $1000, clear pauses">Reset board</button>
-        <button type="button" class="btn ghost" id="swarm-toggle">Start auto-trader</button>
-      </div>
-    </div>
 
-    <section class="panel panel-snipe" aria-label="Sniper trades">
-      <div class="panel-h">
-        <h2>Sniper — create-event scalps</h2>
-        <span id="snipe-count">—</span>
-      </div>
-      <div class="snipe-grid">
-        <div class="snipe-col">
-          <h3>Open now</h3>
-          <div id="snipe-open-body"><div class="empty-row">No sniper lots open.</div></div>
+      <section class="panel" aria-label="Trades still open">
+        <div class="panel-h">
+          <h2 id="open-heading">Open in this book</h2>
+          <span id="open-count">0 open</span>
         </div>
-        <div class="snipe-col">
-          <h3>Recently finished</h3>
-          <div id="snipe-closed-body"><div class="empty-row">No finished snipes yet.</div></div>
+        <div id="open-body"><div class="empty-row">No open practice trades right now.</div></div>
+      </section>
+
+      <section class="panel" aria-label="Recently finished trades">
+        <div class="panel-h">
+          <h2 id="closed-heading">Recently finished</h2>
+          <span id="closed-count">—</span>
+        </div>
+        <div id="closed-body"><div class="empty-row">No finished trades yet this session.</div></div>
+      </section>
+    </div>
+
+    <div id="pane-finder" class="desk-pane" hidden>
+      <div class="strip" style="margin-bottom:1rem">
+        <div class="strip-meta" id="finder-strip">Finder loads tokens the scalp engine may hunt.</div>
+        <div class="strip-actions">
+          <button type="button" class="btn ghost" id="session-reset-finder" title="Archive today's logs, reset practice cash to $1000, clear pauses">Reset board</button>
         </div>
       </div>
-    </section>
-
-    <section class="panel" aria-label="Trades still open">
-      <div class="panel-h">
-        <h2>Trades still open</h2>
-        <span id="open-count">0 open</span>
+      <div class="bar">
+        <div class="tabs" role="tablist">
+          <button type="button" class="on" data-filter="trade" title="Tokens the bot is allowed to buy/sell in practice">Active hunt</button>
+          <button type="button" data-filter="observe" title="Tokens on the board for watching only (paused or cooling down)">Watch only</button>
+          <button type="button" data-filter="all">All tokens</button>
+        </div>
+        <div class="count" id="count"></div>
       </div>
-      <div id="open-body"><div class="empty-row">No open practice trades right now.</div></div>
-    </section>
 
-    <section class="panel" aria-label="Recently finished trades">
-      <div class="panel-h">
-        <h2>Recently finished</h2>
-        <span id="closed-count">—</span>
+      <div class="list" id="list">
+        <div class="colhead">
+          <span title="Coin name. “Liq” = money in the pool; “vol24h” = how much traded in the last day.">Token</span>
+          <span title="Latest price from the candle chart the bot is watching.">Price</span>
+          <span title="What the bot would do: buy, hold (wait), avoid (skip), or watch (not hunting this one).">Bot says</span>
+          <span title="After fees, how much % the forecast thinks you might make. Roughly +2.5% on a $40 trade ≈ $1 target.">Expected edge</span>
+          <span class="c-ta" title="Do chart indicators agree with a buy? Positive = supportive; negative can block a buy.">Chart agree?</span>
+          <span class="c-role" title="Active hunt = bot may trade. Watch only = shown on the board but not traded right now.">Role</span>
+        </div>
+        <div class="empty" id="empty">Waiting for tokens to appear…</div>
       </div>
-      <div id="closed-body"><div class="empty-row">No finished trades yet this session.</div></div>
-    </section>
 
-    <div class="bar">
-      <div class="tabs" role="tablist">
-        <button type="button" class="on" data-filter="trade" title="Tokens the bot is allowed to buy/sell in practice">Active hunt</button>
-        <button type="button" data-filter="observe" title="Tokens on the board for watching only (paused or cooling down)">Watch only</button>
-        <button type="button" data-filter="all">All tokens</button>
-      </div>
-      <div class="count" id="count"></div>
+      <section class="glossary" aria-label="Plain-English glossary">
+        <h2>Plain English</h2>
+        <p class="lead">Each tab is one isolated $1000 practice book. Finder only lists tokens — it does not size trades.</p>
+        <div class="legend">
+          <div><b>Cluster</b> — Gecko new pools with enough unique buyers, 5-minute hold and trail.</div>
+          <div><b>Sniper</b> — Pump.fun creates; scratch book with a faster exit for comparison.</div>
+          <div><b>Hold</b> — same Pump tape as sniper, cluster-style 5-minute trail.</div>
+          <div><b>Launch</b> — young Gecko pools before a full cluster forms (lives in the cluster book).</div>
+          <div><b>Arb</b> — same coin priced differently in two places; paper buy-cheap / sell-rich.</div>
+          <div><b>Scalp</b> — forecast buy/sell on Finder tokens. Pause auto-trader lives on this tab.</div>
+          <div><b>Finder</b> — token hunt board. Active hunt can be traded by scalp; watch-only is paused or cooling down.</div>
+          <div><b>Reset board</b> — archive logs and start every book from $1000 again.</div>
+        </div>
+      </section>
     </div>
-
-    <div class="list" id="list">
-      <div class="colhead">
-        <span title="Coin name. “Liq” = money in the pool; “vol24h” = how much traded in the last day.">Token</span>
-        <span title="Latest price from the candle chart the bot is watching.">Price</span>
-        <span title="What the bot would do: buy, hold (wait), avoid (skip), or watch (not hunting this one).">Bot says</span>
-        <span title="After fees, how much % the forecast thinks you might make. Roughly +2.5% on a $40 trade ≈ $1 target.">Expected edge</span>
-        <span class="c-ta" title="Do chart indicators agree with a buy? Positive = supportive; negative can block a buy.">Chart agree?</span>
-        <span class="c-role" title="Active hunt = bot may trade. Watch only = shown on the board but not traded right now.">Role</span>
-      </div>
-      <div class="empty" id="empty">Waiting for tokens to appear…</div>
-    </div>
-
-    <section class="glossary" aria-label="Plain-English glossary">
-      <h2>Plain English</h2>
-      <p class="lead">This board practices with fake money so you can see whether the bot’s ideas actually make a dollar after fees — before any real wallet is used.</p>
-      <div class="legend">
-        <div><b>Total value</b> — your practice account balance (cash + open trades).</div>
-        <div><b>Profit locked in</b> — wins/losses from trades already sold.</div>
-        <div><b>Open gain/loss</b> — paper profit if you closed open trades at the latest price.</div>
-        <div><b>Quick trade (scalp)</b> — buy a coin, sell soon, aim for about $1 net after fees.</div>
-        <div><b>Price-gap trade (arb)</b> — same coin priced differently in two places; paper “buy cheap / sell rich.” Books a <em>conservative</em> profit (assumes the gap shrinks + fees). No timer cool-down by default — if analysis still says yes, it can jump in again.</div>
-        <div><b>Expected edge</b> — forecast upside minus fees. Positive is hopeful; it still has to clear the ~$1 target.</div>
-        <div><b>Chart agree? (TA)</b> — do RSI/MACD-style signals support the buy, or fight it?</div>
-        <div><b>Active hunt / Watch only</b> — hunting tokens can be traded; watch-only are paused or cooling down.</div>
-        <div><b>Readiness score</b> — checklist score for “is practice strong enough to consider real money?” Keep live trading off until it says ready.</div>
-        <div><b>Reset board</b> — archive logs and start a new session from $1000 (trade totals count from that point, not midnight).</div>
-        <div><b>Fees / slip</b> — trading isn’t free: pool fees plus price moving while you buy/sell. The bot subtracts these before calling something a good idea.</div>
-        <div><b>Add-on lot</b> — if the bot already holds a coin and analysis still says “buy for profit,” it can open another separate ~$40 lot (each with its own take-profit / stop), as long as cash and book limits allow.</div>
-      </div>
-    </section>
     <p class="foot" id="ready-rec"></p>
   </div>
 
@@ -758,6 +806,17 @@
   let filter = "trade";
   let openAddr = null;
   let lastTokens = {};
+  let desk = "cluster";
+
+  const DESKS = {
+    cluster: { lane: "cluster", reason: "cluster", thesis: "Gecko new pools with ≥3 unique buyers. 5-minute hold and trail on its own $1000 book. Launch lots share this cash but live on the Launch tab." },
+    snipe: { lane: "snipe", thesis: "Pump.fun creates on the scratch book — faster exit, comparison only." },
+    hold: { lane: "hold", thesis: "Same Pump tape as sniper, cluster-style 5-minute trail on an isolated book." },
+    launch: { lane: "cluster", reason: "launch", thesis: "Young Gecko pools before a full cluster forms. Fills live in the cluster book; this tab shows launch lots only." },
+    arb: { lane: "arb", thesis: "Jupiter round-trip / Dex price-gap paper fills on isolated cash." },
+    scalp: { lane: "scalp", thesis: "Forecast scalp on Finder tokens. Pause auto-trader is on this tab only." },
+    finder: { lane: null, thesis: "Token hunt board. Does not size trades." },
+  };
 
   const SAFETY_TTL_MS = 60000;
   const DECIDE_TTL_MS = 30000;
@@ -863,64 +922,81 @@
     return String(p.entry_reason || p.timeframe || "—").toLowerCase();
   }
   function laneBadge(lane) {
-    const cls = lane === "snipe" ? "lane-snipe" : lane === "cluster" ? "lane-cluster" : lane === "launch" ? "lane-launch" : "";
+    const known = ["snipe", "cluster", "launch", "hold", "arb", "scalp"];
+    const cls = known.includes(lane) ? `lane-${lane}` : "";
     return `<span class="lane ${cls}">${esc(lane)}</span>`;
   }
 
-
-
-  function renderSniper(port) {
-    const s = port.sniper || {};
-    const open = (s.open && s.open.length)
-      ? s.open
-      : (port.open || []).filter(p => laneOf(p) === "snipe");
-    const closedSrc = (s.closed_recent && s.closed_recent.length)
-      ? s.closed_recent
-      : (port.closed_recent || []).filter(p => laneOf(p) === "snipe");
-    const closed = closedSrc.slice().reverse();
-    const realized = s.realized_pnl_usd != null
-      ? s.realized_pnl_usd
-      : closedSrc.reduce((a, p) => a + (Number(p.realized_pnl_usd) || 0), 0);
-    document.getElementById("snipe-count").textContent =
-      `${open.length} open · ${s.closed_count || 0} finished · ${fmtMoney(realized)}`;
-
-    if (!open.length) {
-      document.getElementById("snipe-open-body").innerHTML = `<div class="empty-row">No sniper lots open.</div>`;
-    } else {
-      const body = open.map(p => {
-        const u = p.unrealized_pnl_usd;
-        return `<tr>
-          <td><b>${esc(p.name || "—")}</b></td>
-          <td>${fmtMoneyAbs(p.size_usd)}</td>
-          <td class="pnl ${pnlClass(u)}">${fmtMoney(u)}</td>
-        </tr>`;
-      }).join("");
-      document.getElementById("snipe-open-body").innerHTML = `
-        <table class="pos-table">
-          <thead><tr><th>Coin</th><th>Size</th><th>Open P/L</th></tr></thead>
-          <tbody>${body}</tbody>
-        </table>`;
-    }
-
-    if (!closed.length) {
-      document.getElementById("snipe-closed-body").innerHTML = `<div class="empty-row">No finished snipes yet.</div>`;
-    } else {
-      const body = closed.slice(0, 8).map(p => {
-        const pnl = p.realized_pnl_usd;
-        const why = (p.close_reason || "—").split(" (")[0];
-        return `<tr>
-          <td><b>${esc(p.name || "—")}</b></td>
-          <td class="pnl ${pnlClass(pnl)}">${fmtMoney(pnl)}</td>
-          <td class="muted-cell">${esc(why)}</td>
-        </tr>`;
-      }).join("");
-      document.getElementById("snipe-closed-body").innerHTML = `
-        <table class="close-table">
-          <thead><tr><th>Coin</th><th>Final P/L</th><th>Why</th></tr></thead>
-          <tbody>${body}</tbody>
-        </table>`;
-    }
+  function deskFromHash() {
+    const h = (location.hash || "").replace("#", "").toLowerCase();
+    if (h === "sniper") return "snipe";
+    return DESKS[h] ? h : "cluster";
   }
+
+  function applyDesk() {
+    desk = deskFromHash();
+    document.querySelectorAll(".desk-tabs button").forEach(btn => {
+      const on = btn.dataset.desk === desk;
+      btn.classList.toggle("on", on);
+      btn.setAttribute("aria-selected", on ? "true" : "false");
+    });
+    const isFinder = desk === "finder";
+    document.getElementById("pane-engine").hidden = isFinder;
+    document.getElementById("pane-finder").hidden = !isFinder;
+    const swarmBtn = document.getElementById("swarm-toggle");
+    if (swarmBtn) swarmBtn.hidden = desk !== "scalp";
+    const thesis = document.getElementById("engine-thesis");
+    if (thesis && DESKS[desk]) thesis.textContent = DESKS[desk].thesis;
+  }
+
+  function laneRow(labs, id) {
+    const lanes = ((labs && labs.board) || {}).lanes || [];
+    return lanes.find(row => row.id === id) || {};
+  }
+
+  function setTabChip(id, text, cls) {
+    const el = document.getElementById("tab-" + id);
+    if (!el) return;
+    el.className = "tab-meta" + (cls ? " " + cls : "");
+    el.textContent = text;
+  }
+
+  function renderTabChips(labs, health) {
+    const ids = ["cluster", "snipe", "hold", "arb", "scalp"];
+    for (const id of ids) {
+      const row = laneRow(labs, id);
+      const pnl = Number(row.realized_pnl_usd);
+      const open = row.open_count || 0;
+      const closed = row.closed_count || 0;
+      const txt = Number.isFinite(pnl)
+        ? `${fmtMoney(pnl)} · ${open} open · ${closed} closed`
+        : "—";
+      setTabChip(id, txt, pnlClass(pnl));
+    }
+    const trenches = (health && health.trenches) || {};
+    setTabChip("launch", `${trenches.launch_opens || 0} opens · ${trenches.launch_seen || 0} seen`);
+    const hunt = health ? `${health.tokens_tradeable || 0} hunt / ${health.tokens_observe || 0} watch` : "—";
+    setTabChip("finder", hunt);
+  }
+
+  function filterPort(port, reason) {
+    if (!reason) return port;
+    const open = (port.open || []).filter(p => laneOf(p) === reason);
+    const closedAll = (port.closed_recent || []).filter(p => laneOf(p) === reason);
+    const realized = closedAll.reduce((s, p) => s + (Number(p.realized_pnl_usd) || 0), 0);
+    const unrealized = open.reduce((s, p) => s + (Number(p.unrealized_pnl_usd) || 0), 0);
+    return Object.assign({}, port, {
+      open,
+      closed_recent: closedAll,
+      open_count: open.length,
+      closed_count: closedAll.length,
+      open_notional_usd: open.reduce((s, p) => s + (Number(p.size_usd) || 0), 0),
+      unrealized_pnl_usd: unrealized,
+      realized_pnl_usd: realized,
+    });
+  }
+
+
 
   function renderOpenPositions(port) {
     const rows = port.open || [];
@@ -1088,54 +1164,111 @@
 
   async function refreshOps() {
     try {
-      const [port, swarm, health, ready, arb, labs] = await Promise.all([
-        fetch("/portfolio?lane=snipe_master").then(r => r.json()),
+      const [swarm, health, ready, arb, labs] = await Promise.all([
         fetch("/swarm").then(r => r.json()),
         fetch("/health").then(r => r.json()),
         fetch("/readiness").then(r => r.json()),
         fetch("/arb").then(r => r.json()),
         fetch("/labs").then(r => r.json()),
       ]);
+      const spec = DESKS[desk] || DESKS.cluster;
+      const lane = spec.lane || "cluster";
+      const rawPort = await fetch(`/portfolio?lane=${encodeURIComponent(lane)}`).then(r => r.json());
+      const port = filterPort(rawPort, spec.reason);
+      const row = laneRow(labs, spec.reason ? "cluster" : lane);
       const t = ready.session || ready.today || {};
-      const eq = port.equity_usd;
-      const eqPnl = port.equity_pnl_usd;
-      setMetric("m-equity", fmtMoneyAbs(eq), pnlClass(eqPnl));
-      document.getElementById("m-equity-sub").textContent =
-        `${fmtMoney(eqPnl)} vs $1000 start`;
-      setMetric("m-cash", fmtMoneyAbs(port.cash_usd));
-      const arbFills = port.arb_fills || 0;
-      const arbNotional = port.arb_notional_usd || 0;
-      document.getElementById("m-cash-sub").textContent =
-        arbFills
-          ? `${arbFills} price-gap fills · ${fmtMoneyAbs(arbNotional)} deployed`
-          : "not in a trade";
-      setMetric("m-realized", fmtMoney(port.realized_pnl_usd), pnlClass(port.realized_pnl_usd));
-      document.getElementById("m-realized-sub").textContent =
-        `${port.closed_count || 0} scalp closes · ${arbFills} price-gap fills · emergency stop ${port.kill_switch ? "ON" : "off"}`;
-      setMetric("m-unrealized", fmtMoney(port.unrealized_pnl_usd), pnlClass(port.unrealized_pnl_usd));
-      document.getElementById("m-unrealized-sub").textContent =
-        `${port.open_count || 0} open · ${fmtMoneyAbs(port.open_notional_usd)} in trades`;
-      setMetric("m-scalp", fmtMoney(port.scalp_realized_pnl_usd), pnlClass(port.scalp_realized_pnl_usd));
-      document.getElementById("m-scalp-sub").textContent =
-        `${port.closed_count || 0} closes · avg ${fmtMoney(t.scalp_ev, 3)}`;
-      const arbPnl = port.arb_realized_pnl_usd != null ? port.arb_realized_pnl_usd : t.arb_pnl_sum;
-      const arbEv = arbFills ? (arbPnl / arbFills) : t.arb_ev;
-      setMetric("m-arb", fmtMoney(arbPnl), pnlClass(arbPnl));
-      document.getElementById("m-arb-sub").textContent =
-        `${arbFills || t.arb_fills || 0} fills · avg ${fmtMoney(arbEv, 3)} · ${fmtMoneyAbs(arbNotional)} deployed`;
+      const trenches = health.trenches || {};
+      const feed = (trenches.snipe_feed) || {};
+      renderTabChips(labs, health);
 
+      if (desk === "finder") {
+        const disc = health.discover || {};
+        document.getElementById("finder-strip").innerHTML =
+          `finder <b>${disc.running ? "on" : "off"}</b> · ${health.tokens_tradeable || 0} hunting / ${health.tokens_observe || 0} watching` +
+          ` · auto-trader <b>${swarm.running ? "on" : "off"}</b> (Scalp tab)`;
+      } else {
+        const eq = port.equity_usd;
+        const eqPnl = spec.reason ? null : port.equity_pnl_usd;
+        setMetric("m-equity", fmtMoneyAbs(eq), pnlClass(eqPnl));
+        document.getElementById("m-equity-sub").textContent =
+          spec.reason ? `${fmtMoney(port.equity_pnl_usd)} vs $1000 start · ${spec.reason} lots below` : `${fmtMoney(eqPnl)} vs $1000 start`;
+        setMetric("m-cash", fmtMoneyAbs(port.cash_usd));
+        document.getElementById("m-cash-sub").textContent = "not in a trade";
+        setMetric("m-realized", fmtMoney(port.realized_pnl_usd), pnlClass(port.realized_pnl_usd));
+        document.getElementById("m-realized-sub").textContent =
+          `${port.closed_count || 0} closes · emergency stop ${port.kill_switch ? "ON" : "off"}`;
+        setMetric("m-unrealized", fmtMoney(port.unrealized_pnl_usd), pnlClass(port.unrealized_pnl_usd));
+        document.getElementById("m-unrealized-sub").textContent =
+          `${port.open_count || 0} open · ${fmtMoneyAbs(port.open_notional_usd)} in trades`;
 
-      renderSniper(port);
-      renderOpenPositions(port);
-      renderClosed(port);
+        const extraLabel = document.getElementById("m-extra-label");
+        const engineLabel = document.getElementById("m-engine-label");
+        if (desk === "arb") {
+          extraLabel.innerHTML = `Price-gap fills <span class="hint" title="Paper arb fills in this book.">?</span>`;
+          const arbPnl = port.arb_realized_pnl_usd != null ? port.arb_realized_pnl_usd : port.realized_pnl_usd;
+          const arbFills = port.arb_fills || 0;
+          const arbEv = arbFills ? (arbPnl / arbFills) : null;
+          setMetric("m-scalp", fmtMoney(arbPnl), pnlClass(arbPnl));
+          document.getElementById("m-scalp-sub").textContent =
+            `${arbFills} fills · avg ${fmtMoney(arbEv, 3)}`;
+          engineLabel.innerHTML = `Scanner <span class="hint" title="Arb loop on/off.">?</span>`;
+          setMetric("m-arb", arb.running ? "on" : "off");
+          document.getElementById("m-arb-sub").textContent = `${arb.paper_fills || 0} session fills`;
+        } else if (desk === "scalp") {
+          extraLabel.innerHTML = `Quick trades <span class="hint" title="Scalp closes in this book.">?</span>`;
+          setMetric("m-scalp", fmtMoney(port.scalp_realized_pnl_usd), pnlClass(port.scalp_realized_pnl_usd));
+          document.getElementById("m-scalp-sub").textContent =
+            `${port.closed_count || 0} closes · avg ${fmtMoney(t.scalp_ev, 3)}`;
+          engineLabel.innerHTML = `Auto-trader <span class="hint" title="Swarm loop that sizes scalp trades.">?</span>`;
+          setMetric("m-arb", swarm.running ? "on" : "off");
+          document.getElementById("m-arb-sub").textContent = `${swarm.ticks || 0} checks`;
+        } else {
+          extraLabel.innerHTML = `Win rate <span class="hint" title="Wins vs losses on finished trades in this book.">?</span>`;
+          const wr = row.win_rate != null ? `${Math.round(row.win_rate * 100)}%` : "—";
+          setMetric("m-scalp", wr);
+          document.getElementById("m-scalp-sub").textContent =
+            `${row.wins || 0}W / ${row.losses || 0}L · ${row.closed_count || 0} closes`;
+          engineLabel.innerHTML = `Tape <span class="hint" title="Whether this engine’s feed is live.">?</span>`;
+          if (desk === "snipe" || desk === "hold") {
+            setMetric("m-arb", feed.connected ? "live" : "off");
+            document.getElementById("m-arb-sub").textContent =
+              `${feed.creates || 0} creates · ${feed.trades || 0} trades · ${trenches.sniper_watching || 0} watching`;
+          } else if (desk === "cluster" || desk === "launch") {
+            setMetric("m-arb", trenches.running ? "on" : "off");
+            document.getElementById("m-arb-sub").textContent =
+              `${trenches.cluster_opens || 0} clusters · ${trenches.launch_opens || 0} launches`;
+          } else {
+            setMetric("m-arb", "—");
+            document.getElementById("m-arb-sub").textContent = "status";
+          }
+        }
 
-      document.getElementById("strip-meta").innerHTML =
-        `<span>auto-trader <b>${swarm.running ? "on" : "off"}</b> · ${swarm.ticks || 0} checks</span>` +
-        `<span>finder <b>${(health.discover && health.discover.running) ? "on" : "off"}</b> · ${health.tokens_tradeable || 0} hunting / ${health.tokens_observe || 0} watching</span>` +
-        `<span>price-gap <b>${arb.running ? "on" : "off"}</b> · ${arb.paper_fills || 0} fills</span>` +
-        `<span>launch/cluster <b>${(health.trenches && health.trenches.running) ? "on" : "off"}</b> · ${((health.trenches && health.trenches.launch_opens) || 0)} launches / ${((health.trenches && health.trenches.cluster_opens) || 0)} clusters / ${((health.trenches && health.trenches.sniper_opens) || 0)} snipes</span>` +
-        `<span>pump-create <b>${((health.trenches && health.trenches.snipe_feed && health.trenches.snipe_feed.connected) ? "live" : "off")}</b> · ${((health.trenches && health.trenches.snipe_feed && health.trenches.snipe_feed.creates) || 0)} creates · ${((health.trenches && health.trenches.snipe_feed && health.trenches.snipe_feed.trades) || 0)} trades · ${((health.trenches && health.trenches.sniper_watching) || 0)} watching</span>` +
-        `<span>bot opinions <b>${t.decisions || 0}</b> · buys <b>${(t.actions && t.actions.buy) || 0}</b> this session</span>`;
+        renderOpenPositions(port);
+        renderClosed(port);
+
+        let strip = "";
+        if (desk === "snipe" || desk === "hold") {
+          strip =
+            `<span>pump-create <b>${feed.connected ? "live" : "off"}</b> · ${feed.creates || 0} creates · ${feed.trades || 0} trades</span>` +
+            `<span>watching <b>${trenches.sniper_watching || 0}</b> · snipes ${trenches.sniper_opens || 0}</span>`;
+        } else if (desk === "cluster") {
+          strip =
+            `<span>trenches <b>${trenches.running ? "on" : "off"}</b></span>` +
+            `<span>clusters <b>${trenches.cluster_opens || 0}</b> · launches ${trenches.launch_opens || 0}</span>`;
+        } else if (desk === "launch") {
+          strip =
+            `<span>trenches <b>${trenches.running ? "on" : "off"}</b></span>` +
+            `<span>launch opens <b>${trenches.launch_opens || 0}</b> · seen ${trenches.launch_seen || 0}</span>` +
+            `<span>lots below are launch-tagged rows from the cluster book</span>`;
+        } else if (desk === "arb") {
+          strip = `<span>price-gap <b>${arb.running ? "on" : "off"}</b> · ${arb.paper_fills || 0} fills</span>`;
+        } else if (desk === "scalp") {
+          strip =
+            `<span>auto-trader <b>${swarm.running ? "on" : "off"}</b> · ${swarm.ticks || 0} checks</span>` +
+            `<span>finder <b>${(health.discover && health.discover.running) ? "on" : "off"}</b> · ${health.tokens_tradeable || 0} hunting</span>`;
+        }
+        document.getElementById("strip-meta").innerHTML = strip || "—";
+      }
 
       document.getElementById("swarm-toggle").textContent = swarm.running ? "Pause auto-trader" : "Start auto-trader";
 
@@ -1163,6 +1296,24 @@
     } catch (e) {}
   }
 
+  function selectDesk(id) {
+    if (!DESKS[id]) id = "cluster";
+    if (location.hash.replace("#", "") !== id) {
+      history.replaceState(null, "", "#" + id);
+    }
+    applyDesk();
+    refreshOps();
+    if (id === "finder") refresh();
+  }
+
+  document.querySelectorAll(".desk-tabs button").forEach(btn => {
+    btn.addEventListener("click", () => selectDesk(btn.dataset.desk));
+  });
+  window.addEventListener("hashchange", () => {
+    applyDesk();
+    refreshOps();
+  });
+
   document.getElementById("swarm-toggle").addEventListener("click", async () => {
     const swarm = await fetch("/swarm").then(r => r.json());
     await fetch("/swarm", {
@@ -1173,7 +1324,7 @@
     refreshOps();
   });
 
-  document.getElementById("session-reset").addEventListener("click", async () => {
+  async function resetBoard(btn) {
     const ok = window.confirm(
       "Reset monitoring board?\n\n" +
       "• Archives today's decision/paper/outcome/pipeline logs\n" +
@@ -1182,9 +1333,8 @@
       "• Triggers a fresh discover scan"
     );
     if (!ok) return;
-    const btn = document.getElementById("session-reset");
-    btn.disabled = true;
-    btn.textContent = "Resetting…";
+    const buttons = [document.getElementById("session-reset"), document.getElementById("session-reset-finder")].filter(Boolean);
+    buttons.forEach(b => { b.disabled = true; b.textContent = "Resetting…"; });
     try {
       const res = await fetch("/session/reset", {
         method: "POST",
@@ -1195,18 +1345,20 @@
       if (data.status !== "ok") {
         window.alert("Reset failed: " + (data.error || res.status));
       } else {
-        document.getElementById("strip-meta").textContent =
-          `Board reset ${data.started_at || "now"} · monitoring from this point`;
+        const strip = document.getElementById("strip-meta");
+        if (strip) strip.textContent = `Board reset ${data.started_at || "now"} · monitoring from this point`;
       }
     } catch (e) {
       window.alert("Reset failed: " + e);
     } finally {
-      btn.disabled = false;
-      btn.textContent = "Reset board";
+      buttons.forEach(b => { b.disabled = false; b.textContent = "Reset board"; });
       refreshOps();
       refresh();
     }
-  });
+  }
+
+  document.getElementById("session-reset").addEventListener("click", ev => resetBoard(ev.currentTarget));
+  document.getElementById("session-reset-finder").addEventListener("click", ev => resetBoard(ev.currentTarget));
 
   document.querySelectorAll(".tabs button").forEach(btn => {
     btn.addEventListener("click", () => {
@@ -1217,6 +1369,7 @@
     });
   });
 
+  applyDesk();
   refresh();
   refreshOps();
   setInterval(refresh, 3000);
