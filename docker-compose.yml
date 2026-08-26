@@ -4,14 +4,15 @@ services:
       context: ./python_server
     container_name: crypto-analysis-python-server
     ports:
-      # Dashboard + APIs. Defaults match .env.example (8080 → 8000).
+      # Dashboard + APIs. Defaults match .env.settings (8080 → 8000).
       - "${HOST_PORT:-8080}:${CONTAINER_PORT:-8000}"
       - "${DATASET_PREP_DASHBOARD_HOST_PORT:-8765}:${DATASET_PREP_DASHBOARD_CONTAINER_PORT:-8765}"
-    # Whole file so DISCOVER_/SWARM_/ARB_/PAPER_/READY_ knobs reach the process.
-    # Listing vars one-by-one silently dropped every knob not enumerated.
-    # `environment:` still wins on conflicts.
+    # Settings first, secrets last so .env can override a knob locally
+    # without committing it. `environment:` still wins on conflicts.
     env_file:
-      - .env
+      - .env.settings
+      - path: .env
+        required: false
     environment:
       HOST: 0.0.0.0
       PORT: ${CONTAINER_PORT:-8000}

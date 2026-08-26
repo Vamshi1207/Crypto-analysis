@@ -53,12 +53,12 @@ Dashboard: open `http://127.0.0.1:8080/` (hard-refresh after UI changes). Hover 
 
 ## Quick start (laptop or overnight server)
 
-One command after `.env` exists — Flask **auto-starts** (no manual `./dev-server.sh`).
+One command after secrets exist — Flask **auto-starts** (no manual `./dev-server.sh`). Paper knobs are tracked in `.env.settings`; API keys stay in gitignored `.env`.
 
 ```bash
 # From repo root
 cp .env.example .env
-# Edit .env: keep LIVE_TRADING=0; drop in a fresh Helius/QuickNode free key.
+# Edit .env: paste Helius/NVIDIA keys only. Keep LIVE_TRADING=0 in .env.settings.
 
 docker compose up -d --build
 
@@ -72,7 +72,7 @@ curl -s http://127.0.0.1:8080/health | python3 -m json.tool
 ```bash
 git clone <your-repo-url> crypto_platform && cd crypto_platform
 git checkout codex   # or your deploy branch
-cp .env.example .env && nano .env   # paste secrets; LIVE_TRADING=0
+cp .env.example .env && nano .env   # paste secrets only; knobs are in .env.settings
 
 docker compose up -d --build
 docker compose ps    # python_server should be healthy / up
@@ -101,7 +101,7 @@ Cheap checks first; expensive ones later:
 ## Safety rules (do not skip)
 
 - Keep **`LIVE_TRADING=0`** until readiness looks ready **and** you’ve reviewed the paper log yourself.
-- Do not commit `.env` (secrets). Use `.env.example` as the template.
+- Do not commit `.env` (secrets). Copy `.env.example` → `.env` for keys. Track tunables in `.env.settings`.
 - Free-tier APIs (DexScreener, Helius free, etc.) are rate-limited — discover backs off; don’t burn paid credits until paper EV is clear.
 - This is **not** financial advice. Memecoins can go to zero; paper success does not guarantee live success.
 
@@ -111,7 +111,8 @@ Cheap checks first; expensive ones later:
 
 ```text
 crypto_platform/
-  .env.example          # All tunables documented
+  .env.settings         # Tracked paper/trading knobs
+  .env.example          # Secrets template → copy to gitignored .env
   docker-compose.yml    # python_server on :8080
   python_server/
     server.py           # Flask app + workers wiring
