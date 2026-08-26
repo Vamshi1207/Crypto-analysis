@@ -103,8 +103,23 @@ def test_snipe_entry_waits_for_tape_then_buys_on_lift():
         create_px=create, last_px=create * 1.20, unique_buyers=1,
         buys=1, sells=0, real_sol=3.0, age_sec=4.0,
     )
+    assert ok is False
+    assert why == "waiting_tape"
+
+    ok, why = pumpfun.snipe_entry(
+        create_px=create, last_px=create * 1.20, unique_buyers=2,
+        buys=1, sells=0, real_sol=3.0, age_sec=4.0,
+        min_lift_pct=50.0, fast_lift_pct=12.0, min_buyers=2,
+    )
     assert ok is True
     assert why == "curve_demand"
+
+    ok, why = pumpfun.snipe_entry(
+        create_px=create, last_px=create * 2.50, unique_buyers=4,
+        buys=5, sells=0, real_sol=12.0, age_sec=4.0,
+    )
+    assert ok is False
+    assert why == "too_extended"
 
     ok, why = pumpfun.snipe_entry(
         create_px=create, last_px=create * 1.08, unique_buyers=2,
