@@ -730,6 +730,7 @@
             <a href="/discover" target="_blank" rel="noopener">discover</a>
             <a href="/arb" target="_blank" rel="noopener">arb</a>
             <a href="/trenches" target="_blank" rel="noopener">trenches</a>
+            <a href="/fill-audit" target="_blank" rel="noopener">fill-audit</a>
           </div>
         </div>
         <div class="strip-actions">
@@ -1255,6 +1256,11 @@
           strip =
             `<span>trenches <b>${trenches.running ? "on" : "off"}</b></span>` +
             `<span>clusters <b>${trenches.cluster_opens || 0}</b> · launches ${trenches.launch_opens || 0}</span>`;
+          const fa = health.fill_audit || {};
+          if (fa.n) {
+            const pct = fa.pct_fast_enough != null ? `${fa.pct_fast_enough}% tape-real` : "—";
+            strip += `<span>fill-audit <b>${fa.n}</b> · ${pct}</span>`;
+          }
         } else if (desk === "launch") {
           strip =
             `<span>trenches <b>${trenches.running ? "on" : "off"}</b></span>` +

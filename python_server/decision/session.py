@@ -19,6 +19,7 @@ KINDS = (
     "outcomes",
     "pipeline",
     "safety",
+    "fill_audit",
 )
 
 _started_at: Optional[str] = None

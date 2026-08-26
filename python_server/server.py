@@ -878,6 +878,16 @@ def trenches_endpoint():
     return jsonify(trenches.status())
 
 
+@app.route('/fill-audit', methods=["GET", "OPTIONS"])
+def fill_audit_endpoint():
+    """Paper fill vs Dex/Gecko/Helius tape. Observation only."""
+    if request.method == "OPTIONS":
+        return _build_cors_preflight_response()
+    from decision import fill_audit
+
+    return jsonify(fill_audit.status())
+
+
 @app.route('/arb', methods=["GET", "POST", "OPTIONS"])
 def arb_endpoint():
     """Paper-only cross-pool quote arbitrage (parallel to directional swarm)."""
@@ -1031,6 +1041,7 @@ def health():
     from decision import calibrate as calibrate_mod
     from decision import arb, discover, paper, pipeline_log, pricefeed, swarm
     from decision import trenches
+    from decision import fill_audit
     from decision import session as decision_session
 
     residuals = calibrate_mod.load_residuals()
@@ -1052,6 +1063,8 @@ def health():
         for t in token_data.values()
         if isinstance(t, dict) and t.get("tradeable") is False
     )
+    trench_st = trenches.status()
+    audit_st = fill_audit.status()
     return jsonify({
         "server": "ok",
         "tokens_loaded": len(token_data),
@@ -1099,7 +1112,17 @@ def health():
             "samples": feed.get("samples"),
             "last_error": feed.get("last_error"),
         },
-        "trenches": trenches.status(),
+        "trenches": trench_st,
+        "fill_audit": {
+            "running": audit_st.get("running"),
+            "audited": audit_st.get("audited"),
+            "n": audit_st.get("n"),
+            "pct_fast_enough": audit_st.get("pct_fast_enough"),
+            "by_verdict": audit_st.get("by_verdict"),
+            "mean_paper_pnl_usd": audit_st.get("mean_paper_pnl_usd"),
+            "mean_chain_last_pnl_usd": audit_st.get("mean_chain_last_pnl_usd"),
+            "mean_chain_low_pnl_usd": audit_st.get("mean_chain_low_pnl_usd"),
+        },
         "readiness": {
             "ready_for_live": ready.get("ready_for_live"),
             "score": ready.get("score"),
@@ -1166,6 +1189,11 @@ def _configure_background_channels() -> None:
     if trenches.LAUNCH_ENABLED or trenches.CLUSTER_ENABLED or trenches.SNIPER_ENABLED:
         trenches.start()
         print("trenches: auto-started launch/cluster/sniper paper channel", flush=True)
+    from decision import fill_audit
+
+    if fill_audit.ENABLED:
+        fill_audit.start()
+        print("fill_audit: comparing paper closes to Dex/Gecko/Helius tape", flush=True)
     if os.getenv("SWARM_ENABLED", "0").strip() == "1":
         interval = float(os.getenv("SWARM_INTERVAL_SEC", "12") or 12)
         swarm_mode = (os.getenv("SWARM_MODE") or "fast").strip() or "fast"

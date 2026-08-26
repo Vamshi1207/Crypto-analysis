@@ -19,6 +19,14 @@ def pytest_configure(config):
 
 
 @pytest.fixture(autouse=True)
+def disable_fill_audit(monkeypatch):
+    """Fill-audit hits Dex/Gecko/Helius; tests stay offline."""
+    from decision import fill_audit
+
+    monkeypatch.setattr(fill_audit, "ENABLED", False)
+
+
+@pytest.fixture(autouse=True)
 def isolated_store(tmp_path, monkeypatch):
     """Redirect the append-only log to a temp dir for every test.
 

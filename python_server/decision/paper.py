@@ -484,6 +484,7 @@ def close_by_mint(*, mint: str, mark_price: float, reason: str) -> list[dict[str
                 held_sec=round(held, 1),
             )
             closed.append(asdict(pos))
+            _queue_fill_audit(pos)
         _state.open = still
     return closed
 
@@ -1033,6 +1034,7 @@ def mark_and_maybe_exit(
                 held_sec=round(held, 1),
             )
             closed.append(asdict(pos))
+            _queue_fill_audit(pos)
         _state.open = still_open
     return closed
 
@@ -1227,6 +1229,16 @@ def _cooldown_remaining(address: str) -> float:
     if latest <= 0:
         return 0.0
     return max(0.0, REENTRY_COOLDOWN_SEC - (now - latest))
+
+
+def _queue_fill_audit(pos: PaperPosition) -> None:
+    """Log-only: compare this close to Dex/Gecko/Helius. Never blocks a fill."""
+    try:
+        from decision import fill_audit
+
+        fill_audit.observe_close(asdict(pos))
+    except Exception:
+        pass
 
 
 def _parse_ts(raw: str) -> Optional[float]:
