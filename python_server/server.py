@@ -1039,10 +1039,12 @@ def health():
     agy_status = agy_cli.preflight()
     from decision import forecast as forecast_mod
     from decision import calibrate as calibrate_mod
-    from decision import arb, discover, paper, pipeline_log, pricefeed, swarm
+    from decision import arb, discover, jev as jev_mod, paper, pipeline_log, pricefeed, swarm
     from decision import trenches
     from decision import fill_audit
     from decision import session as decision_session
+
+    jev_status = jev_mod.preflight()
 
     residuals = calibrate_mod.load_residuals()
     from decision import labs
@@ -1076,6 +1078,14 @@ def health():
             "authenticated": agy_status.authenticated,
             "model": agy_status.model,
             "detail": agy_status.detail,
+        },
+        "jev": {
+            "enabled": jev_status.enabled,
+            "configured": jev_status.configured,
+            "ready": jev_status.ready,
+            "endpoint": jev_status.endpoint,
+            "model": jev_status.model,
+            "detail": jev_status.detail,
         },
         "forecast_backends": forecast_mod.available_backends(),
         "calibration": {

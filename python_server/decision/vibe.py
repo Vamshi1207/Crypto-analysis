@@ -66,11 +66,20 @@ def review_card(
         for o in opinions
     ]
 
+    if mode in (DecideMode.FULL, DecideMode.DEEP):
+        jev = _jev_chair_review(card, packet, opinions)
+        if jev is not None:
+            _apply_chair_proposal(card, review, jev, chair_name="jev")
+        elif _jev_enabled():
+            review.warnings.append("jev unavailable — heuristic desk only")
+
     if mode is DecideMode.DEEP:
         deep = _deep_agy_review(card, packet)
         if deep is not None:
             review.warnings.append("deep agy review applied")
-            review.backend = "heuristic+agy"
+            review.backend = (
+                f"{review.backend}+agy" if review.backend != "heuristic" else "heuristic+agy"
+            )
             if deep.get("veto"):
                 review.risk_pass = False
                 review.veto_reasons.append(str(deep.get("reason") or "agy veto"))
@@ -326,6 +335,76 @@ def _blowoff_return_pct(card: DecisionCard, packet: MarketPacket) -> Optional[fl
     if len(closes) < 8 or not closes[0]:
         return None
     return (closes[-1] / closes[0] - 1.0) * 100.0
+
+
+def _jev_enabled() -> bool:
+    try:
+        from decision import jev as jev_mod
+    except Exception:
+        return False
+    return bool(getattr(jev_mod, "ENABLED", False))
+
+
+def _jev_chair_review(
+    card: DecisionCard, packet: MarketPacket, opinions: list[SpecialistOpinion]
+) -> Optional[dict[str, Any]]:
+    """Typed JEV chair. Returns None when disabled/unconfigured (heuristic stands)."""
+    try:
+        from decision import jev as jev_mod
+    except Exception:
+        return None
+    try:
+        return jev_mod.chair_review(card, packet, opinions)
+    except Exception:
+        return None
+
+
+def _apply_chair_proposal(
+    card: DecisionCard, review: DeskReview, proposal: dict[str, Any], *, chair_name: str = "jev"
+) -> None:
+    """Apply a chair proposal with the same guards as the agy chair.
+
+    Guards (never loosened for JEV):
+    * veto → risk fails, force AVOID.
+    * chair BUY ignored when the risk committee already vetoed.
+    * chair BUY ignored when the fast path did not clear Gate 2.
+    * chair never upgrades a fast-path AVOID (downside edge stays out).
+    """
+    label = str(chair_name or "chair")
+    if proposal.get("veto"):
+        review.risk_pass = False
+        review.veto_reasons.append(str(proposal.get("reason") or f"{label} veto"))
+        review.action_override = Action.AVOID
+    elif proposal.get("action") in ("hold", "avoid", "buy"):
+        proposed = Action(proposal["action"])
+        if proposed is Action.BUY and not review.risk_pass:
+            review.warnings.append(f"{label} buy ignored — risk committee veto stands")
+        elif proposed is Action.BUY and card.action is not Action.BUY:
+            review.warnings.append(f"{label} buy ignored — fast path did not clear Gate 2")
+        elif card.action is Action.AVOID and proposed is not Action.AVOID:
+            review.warnings.append(f"{label} {proposed.value} ignored — fast path avoid stands")
+        else:
+            # Downgrades (buy→hold/avoid) and confirmations only.
+            if review.action_override is None or proposed is not Action.BUY:
+                review.action_override = proposed
+            elif review.action_override is Action.BUY:
+                pass
+    if proposal.get("claim"):
+        review.drivers.append(
+            Driver(source=f"vibe:{label}", claim=str(proposal["claim"]), weight=1.2)
+        )
+    meta = proposal.get("reason") or proposal.get("action")
+    latency = proposal.get("latency_ms")
+    model = proposal.get("model")
+    extra = f"{label} chair applied"
+    if model:
+        extra += f" model={model}"
+    if latency is not None:
+        extra += f" {latency}ms"
+    if meta:
+        extra += f" — {meta}"
+    review.warnings.append(extra)
+    review.backend = f"{review.backend}+{label}" if review.backend != "heuristic" else f"heuristic+{label}"
 
 
 def _deep_agy_review(card: DecisionCard, packet: MarketPacket) -> Optional[dict[str, Any]]:
