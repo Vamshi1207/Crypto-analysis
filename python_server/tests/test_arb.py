@@ -384,3 +384,77 @@ def test_pick_tf_prefers_5s():
     }
     assert _pick_tf(token) == "5S"
     assert _pick_tf({"timeframes": {"1": [{"close": 1}] * 20}}) == "1"
+
+
+def _arb_opp():
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        mint="ArbMint111111111111111111111111111111",
+        symbol="ARB",
+        net_pct=0.6,
+        gross_pct=1.2,
+        stress_net_pct=0.4,
+        size_usd=40.0,
+        expected_pnl_usd=0.24,
+    )
+
+
+def _trap_review(state):
+    return {"veto": True, "p": 0.9, "latency_ms": 5, "model": "t"}
+
+
+def _safe_review(state):
+    return {"veto": False, "p": 0.05, "latency_ms": 5, "model": "t"}
+
+
+def test_arb_review_vetoes_trap(monkeypatch):
+    from decision import jev as jev_mod
+
+    monkeypatch.setattr(
+        jev_mod, "_post",
+        lambda *a, **k: ({"model": "t", "answers": {"route_safe": {"noul": 0.1}}}, 5),
+    )
+    out = jev_mod.arb_review({"symbol": "X"})
+    assert out is not None and out["veto"] is True and out["p"] == 0.9
+
+
+def test_arb_review_passes_safe_route(monkeypatch):
+    from decision import jev as jev_mod
+
+    monkeypatch.setattr(
+        jev_mod, "_post",
+        lambda *a, **k: ({"model": "t", "answers": {"route_safe": {"noul": 0.95}}}, 5),
+    )
+    out = jev_mod.arb_review({"symbol": "X"})
+    assert out is not None and out["veto"] is False
+
+
+def test_arb_gate_blocks_trap_fill(monkeypatch):
+    from decision import jev as jev_mod
+
+    monkeypatch.setattr(arb, "JEV_ARB_GATE", True)
+    monkeypatch.setattr(jev_mod, "arb_review", _trap_review)
+    arb._jev_vetoed.clear()
+    ok, reason = arb._jev_arb_gate(_arb_opp(), {"verified": True})
+    assert ok is False
+    assert reason.startswith("jev_veto")
+    # Cooldown suppresses re-asks without another chair call.
+    calls = []
+    monkeypatch.setattr(
+        jev_mod, "arb_review", lambda s: calls.append(s) or _trap_review(s)
+    )
+    ok, reason = arb._jev_arb_gate(_arb_opp(), {"verified": True})
+    assert (ok, reason) == (False, "jev_cooldown")
+    assert calls == []
+
+
+def test_arb_gate_offline_fails_open(monkeypatch):
+    from decision import jev as jev_mod
+
+    monkeypatch.setattr(arb, "JEV_ARB_GATE", True)
+    monkeypatch.setattr(jev_mod, "arb_review", lambda state: None)
+    arb._jev_vetoed.clear()
+    ok, reason = arb._jev_arb_gate(_arb_opp(), {"verified": True})
+    assert ok is True
+    assert reason == "jev_offline"

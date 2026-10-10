@@ -33,6 +33,12 @@ from decision.sources import (
 import decision.engines.arb.amm as local_amm
 
 ARB_ENABLED = os.getenv("ARB_ENABLED", "0").strip() == "1"
+# JEV veto-only gate on verified fills (0 = off). The edge is computed
+# math and is never second-guessed: only hard route danger (honeypot /
+# freeze / unroutable leg) vetoes, everything else fills. Fail-open.
+JEV_ARB_GATE = os.getenv("JEV_ARB_GATE", "1").strip() == "1"
+JEV_ARB_RECHECK_SEC = _env_float("JEV_ARB_RECHECK_SEC", 300.0)
+_jev_vetoed: dict[str, float] = {}
 INTERVAL_SEC = _env_float("ARB_INTERVAL_SEC", 20.0)
 MIN_EDGE_PCT = _env_float("ARB_MIN_EDGE_PCT", 0.8)
 MIN_POOL_LIQ_USD = _env_float("ARB_MIN_POOL_LIQ_USD", 8_000.0)
@@ -634,6 +640,43 @@ def _quote_from_pair(pair: dict[str, Any], *, mint: str) -> Optional[PoolQuote]:
     )
 
 
+def _jev_arb_gate(opp: ArbOpportunity, jup: dict[str, Any]) -> tuple[bool, str]:
+    """Veto-only chair review of a Jupiter-verified opportunity.
+
+    Returns (proceed, reason). Only hard route danger blocks the fill;
+    an offline chair fails open so the computed edge stands. Vetoed
+    mints cool down without re-asking.
+    """
+    if not JEV_ARB_GATE:
+        return True, "jev_gate_off"
+    now = time.time()
+    if now - _jev_vetoed.get(opp.mint, 0.0) < JEV_ARB_RECHECK_SEC:
+        return False, "jev_cooldown"
+    try:
+        from decision import jev as jev_mod
+    except Exception:  # noqa: BLE001
+        return True, "jev_unavailable"
+    state = {
+        "symbol": opp.symbol,
+        "mint": opp.mint,
+        "net_pct": round(float(opp.net_pct or 0.0), 3),
+        "gross_pct": round(float(opp.gross_pct or 0.0), 3),
+        "size_usd": opp.size_usd,
+        "impact_pct": (jup or {}).get("impact_pct"),
+        "jupiter": {k: (jup or {}).get(k) for k in ("verified", "legs", "buy_route", "sell_route")},
+    }
+    try:
+        review = jev_mod.arb_review(state)
+    except Exception:  # noqa: BLE001 — never break the fill loop
+        return True, "jev_error"
+    if review is None:
+        return True, "jev_offline"
+    if review.get("veto"):
+        _jev_vetoed[opp.mint] = now
+        return False, f"jev_veto p={review.get('p')}"
+    return True, "jev_ok"
+
+
 def _mint_blocked(mint: str) -> Optional[str]:
     """Optional timer/quota barriers. Both default off — analysis decides.
 
@@ -758,6 +801,25 @@ def _scan_and_maybe_fill(target_mint: Optional[str] = None) -> dict[str, Any]:
             )
             continue
 
+        fill = None
+        proceed, jev_reason = _jev_arb_gate(opp, jup if isinstance(jup, dict) else {})
+        if not proceed:
+            skipped.append(
+                {
+                    "mint": opp.mint,
+                    "symbol": opp.symbol,
+                    "net_pct": opp.net_pct,
+                    "reason": jev_reason,
+                }
+            )
+            pipeline_log.emit(
+                "arb",
+                "jev_skip",
+                mint=opp.mint,
+                symbol=opp.symbol,
+                reason=jev_reason,
+            )
+            continue
         fill = _paper_fill(opp, jupiter=jup)
         if fill is None:
             skipped_jupiter_n += 1

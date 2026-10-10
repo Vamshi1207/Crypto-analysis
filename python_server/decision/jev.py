@@ -801,3 +801,64 @@ def exit_review(state: dict[str, Any]) -> Optional[dict[str, Any]]:
         "latency_ms": latency_ms,
         "model": str(payload.get("model") or MODEL),
     }
+
+
+def build_arb_questions() -> dict[str, Any]:
+    """One Noul: can this verified round trip complete?
+
+    The edge itself is computed math (quotes minus costs) and is never
+    second-guessed here. The one judgment code cannot make: does the
+    intermediate mint look like a trap — honeypot, freeze, or a route
+    that simulates fine but cannot complete on-chain.
+    """
+    return {
+        "route_safe": {
+            "type": "noul",
+            "instructions": (
+                "Can the verified `symbol` round trip (SOL→mint→SOL) "
+                "complete on-chain — the mint is routable both ways, no "
+                "honeypot/freeze/trap pattern, `impact_pct` sane for "
+                "`size_usd`? Judge `jupiter` verification, `net_pct`, and "
+                "`mint`."
+            ),
+            "criteria": {
+                "true": "Route completes: no trap pattern, impact sane.",
+                "false": "Trap risk: honeypot, freeze, or unroutable leg.",
+            },
+        },
+    }
+
+
+def arb_review(state: dict[str, Any]) -> Optional[dict[str, Any]]:
+    """Veto-only review of a Jupiter-verified arb opportunity.
+
+    Returns ``{"veto", "p", "latency_ms", "model"}``; ``None`` when the
+    chair is disabled/unavailable (fail-open: the computed edge stands).
+    Only hard danger vetoes — a weak ``avoid``-style read must never kill
+    a verified profitable fill, so callers check ``veto`` alone.
+    """
+    try:
+        payload, latency_ms = _post(
+            state, build_arb_questions(), timeout_s=float(TIMEOUT_S)
+        )
+    except JevUnavailable:
+        return None
+    answers = payload.get("answers")
+    if not isinstance(answers, dict):
+        answers = {}
+    ans = answers.get("route_safe")
+    p_trap = 0.5
+    if isinstance(ans, dict):
+        try:
+            # route_safe asks "can it complete" (high = safe), so the
+            # danger probability is its complement.
+            p_trap = 1.0 - max(0.0, min(1.0, float(ans.get("noul", 0.5))))
+        except (TypeError, ValueError):
+            p_trap = 0.5
+    p_trap = round(p_trap, 3)
+    return {
+        "veto": p_trap >= VETO_THRESHOLD and p_trap != 0.5,
+        "p": p_trap,
+        "latency_ms": latency_ms,
+        "model": str(payload.get("model") or MODEL),
+    }
