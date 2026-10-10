@@ -17,6 +17,7 @@ from datetime import datetime, timezone
 from typing import Any, Iterator, Optional
 
 from decision import costs
+from decision import exec_sim
 from decision import pipeline_log
 from decision import session as session_scope
 from decision import store as decision_store
@@ -70,6 +71,13 @@ ALLOW_ADD_ON = os.getenv("PAPER_ALLOW_ADD_ON", "1").strip() == "1"
 MAX_OPEN_LOTS_PER_ADDRESS = _env_int("PAPER_MAX_OPEN_LOTS_PER_ADDRESS", 2)
 BLOCK_ADD_ON_IF_OPEN_LOSING = os.getenv("PAPER_BLOCK_ADD_ON_IF_OPEN_LOSING", "1").strip() == "1"
 BLOCK_REPEAT_MINT_AFTER_STOP = os.getenv("PAPER_BLOCK_REPEAT_MINT_AFTER_STOP", "1").strip() == "1"
+# JEV exit monitor on open lots (0 = off; stops/trails own exits alone).
+# The chair may force-exit a loser early; each lot is re-asked at most
+# every JEV_EXIT_RECHECK_SEC once held past JEV_EXIT_MIN_HOLD_SEC.
+JEV_EXIT_MONITOR = os.getenv("JEV_EXIT_MONITOR", "1").strip() == "1"
+JEV_EXIT_RECHECK_SEC = _env_float("JEV_EXIT_RECHECK_SEC", 60.0)
+JEV_EXIT_MIN_HOLD_SEC = _env_float("JEV_EXIT_MIN_HOLD_SEC", 10.0)
+_jev_exit_checked: dict[str, float] = {}
 
 
 @dataclass
@@ -118,6 +126,11 @@ class PaperPosition:
     predicted_p90: Optional[float] = None
     timeframe: Optional[str] = None
     horizon_bars: int = 0
+    # On-chain latency sim: mid we decided on, and deferred exit state.
+    signal_entry_price: Optional[float] = None
+    pending_exit_at: Optional[float] = None
+    pending_exit_reason: Optional[str] = None
+    pending_exit_signal_price: Optional[float] = None
 
 
 @dataclass
@@ -248,6 +261,7 @@ def snapshot() -> dict[str, Any]:
                 "trail_max_jump_pct": TRAIL_MAX_JUMP_PCT,
                 "stop_grace_sec": STOP_GRACE_SEC,
                 "entry_confirm_pct": ENTRY_CONFIRM_PCT,
+                "exec_sim": exec_sim.status(),
                 "required_move_pct": round(
                     costs.required_move_pct(
                         size_usd=SCALP_SIZE_USD, target_usd=TARGET_PROFIT_USD
@@ -255,6 +269,7 @@ def snapshot() -> dict[str, Any]:
                     4,
                 ),
             },
+            "pending_buys": exec_sim.status().get("pending_buys"),
         }
 
 
@@ -323,6 +338,7 @@ def reset(*, starting_cash_usd: float = 1_000.0) -> dict[str, Any]:
             book = _new_book()
             book.cash_usd = cash
             _books[lid] = book
+    exec_sim.reset()
     pipeline_log.emit(
         "paper",
         "reset",
@@ -331,6 +347,283 @@ def reset(*, starting_cash_usd: float = 1_000.0) -> dict[str, Any]:
         lanes=sorted(ids),
     )
     return snapshot()
+
+
+def observe_mark(mint: str, price: float) -> None:
+    """Feed a venue mid into the latency buffer (call on every Dex/pricefeed tick)."""
+    if exec_sim.ENABLED:
+        exec_sim.observe(mint, price)
+
+
+def drain_pending_buys(
+    *, fallback_price_fn: Optional[Any] = None
+) -> list[dict[str, Any]]:
+    """Materialize buys whose on-chain latency window has elapsed."""
+    if not exec_sim.ENABLED:
+        return []
+    filled: list[dict[str, Any]] = []
+    for pending in exec_sim.due_buys():
+        fb = None
+        if fallback_price_fn is not None:
+            try:
+                fb = fallback_price_fn(pending.mint, pending.address)
+            except Exception:  # noqa: BLE001
+                fb = None
+        if fb and fb > 0:
+            exec_sim.observe(pending.mint, float(fb))
+        resolved = exec_sim.resolve_buy(pending, fallback_price=fb)
+        with use_lane(pending.lane):
+            result = _materialize_pending_buy(pending, resolved)
+        filled.append(result)
+    return filled
+
+
+def drain_pending_exits(
+    *, fallback_price_fn: Optional[Any] = None
+) -> list[dict[str, Any]]:
+    """Resolve deferred sells on the latency timer (not the next trenches tick).
+
+    For each open lot past ``pending_exit_at + LATENCY``:
+      1. Poll Dex for a land mid (fallback)
+      2. Fill at the worst mid in ``[signal, signal+LATENCY]``
+      3. Book the close
+
+    Also polls Dex once for *waiting* pending exits so the 1.5s window has
+    real marks even when pricefeed is sparse.
+    """
+    if not exec_sim.ENABLED:
+        return []
+    now = time.time()
+    due: list[tuple[str, PaperPosition]] = []
+    waiting: list[tuple[str, PaperPosition]] = []
+    with _lock:
+        for lane in list(_books.keys()):
+            book = _books[lane]
+            for pos in book.open:
+                if pos.status != "open" or pos.pending_exit_at is None:
+                    continue
+                if now >= float(pos.pending_exit_at) + exec_sim.LATENCY_SEC:
+                    due.append((lane, pos))
+                else:
+                    waiting.append((lane, pos))
+
+    # Seed the land window while we wait.
+    for lane, pos in waiting:
+        if not pos.mint or fallback_price_fn is None:
+            continue
+        try:
+            fb = fallback_price_fn(str(pos.mint), str(pos.address))
+        except Exception:  # noqa: BLE001
+            fb = None
+        if fb and fb > 0:
+            exec_sim.observe(str(pos.mint), float(fb), ts=now)
+
+    closed: list[dict[str, Any]] = []
+    for lane, pos in due:
+        fb = None
+        if fallback_price_fn is not None and pos.mint:
+            try:
+                fb = fallback_price_fn(str(pos.mint), str(pos.address))
+            except Exception:  # noqa: BLE001
+                fb = None
+        if fb and fb > 0 and pos.mint:
+            exec_sim.observe(str(pos.mint), float(fb), ts=now)
+        with use_lane(lane):
+            row = _resolve_due_pending_exit(pos.id, fallback_price=fb, now=now)
+            if row:
+                closed.append(row)
+    return closed
+
+
+def tick_exec_sim(*, fallback_price_fn: Optional[Any] = None) -> dict[str, Any]:
+    """Drain due buys and sells. Safe to call from a fast timer thread."""
+    if not exec_sim.ENABLED:
+        return {"buys": [], "sells": []}
+    buys = drain_pending_buys(fallback_price_fn=fallback_price_fn)
+    sells = drain_pending_exits(fallback_price_fn=fallback_price_fn)
+    return {"buys": buys, "sells": sells}
+
+
+_resolver_thread: Optional[threading.Thread] = None
+_resolver_stop = threading.Event()
+RESOLVER_TICK_SEC = _env_float("EXEC_SIM_RESOLVER_TICK_SEC", 0.25)
+
+
+def start_exec_resolver() -> dict[str, Any]:
+    """Background timer: resolve pending buys/sells at LATENCY_SEC with Dex polls."""
+    global _resolver_thread
+    if not exec_sim.ENABLED:
+        return {"running": False, "reason": "EXEC_SIM_ENABLED=0"}
+    with _lock:
+        if _resolver_thread and _resolver_thread.is_alive():
+            return {"running": True, "tick_sec": RESOLVER_TICK_SEC}
+        _resolver_stop.clear()
+        _resolver_thread = threading.Thread(
+            target=_exec_resolver_loop, name="exec-sim-resolver", daemon=True
+        )
+        _resolver_thread.start()
+    pipeline_log.emit(
+        "exec_sim",
+        "resolver_start",
+        latency_sec=exec_sim.LATENCY_SEC,
+        tick_sec=RESOLVER_TICK_SEC,
+    )
+    return {"running": True, "tick_sec": RESOLVER_TICK_SEC}
+
+
+def stop_exec_resolver() -> None:
+    _resolver_stop.set()
+
+
+def _default_dex_fallback(mint: str, pool: str = "") -> Optional[float]:
+    try:
+        from decision import trenches
+
+        return trenches.dex_price_usd(mint, pool=pool or None)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _exec_resolver_loop() -> None:
+    while not _resolver_stop.wait(RESOLVER_TICK_SEC):
+        try:
+            tick_exec_sim(fallback_price_fn=_default_dex_fallback)
+        except Exception as exc:  # noqa: BLE001
+            pipeline_log.emit(
+                "exec_sim",
+                "resolver_error",
+                level="warning",
+                reason=type(exc).__name__,
+            )
+
+
+def _resolve_due_pending_exit(
+    position_id: str,
+    *,
+    fallback_price: Optional[float],
+    now: float,
+) -> Optional[dict[str, Any]]:
+    """Book one due pending exit under the active lane lock."""
+    with _lock:
+        pos = next((p for p in _state.open if p.id == position_id and p.status == "open"), None)
+        if pos is None or pos.pending_exit_at is None:
+            return None
+        if now < float(pos.pending_exit_at) + exec_sim.LATENCY_SEC:
+            return None
+
+        exit_fee_frac = costs.EXIT_FEE_PCT / 100.0
+        exit_slip_frac = costs.EXIT_SLIP_PCT / 100.0
+        exit_cost_frac = exit_fee_frac + exit_slip_frac
+        signal = float(pos.pending_exit_signal_price or pos.entry_price)
+        resolved = exec_sim.resolve_sell(
+            mint=str(pos.mint or ""),
+            signal_price=signal,
+            signal_at=float(pos.pending_exit_at),
+            fallback_price=fallback_price,
+            now=now,
+        )
+        exit_price = float(resolved["fill_price_raw"])
+        pnl = pos.qty * exit_price - pos.size_usd - pos.size_usd * exit_cost_frac
+        if "stop_loss" in str(pos.pending_exit_reason or ""):
+            exit_price, pnl, stop_reason = _resolve_stop_exit(
+                pos, exit_price, pnl, exit_cost_frac
+            )
+            reason = (
+                f"{pos.pending_exit_reason} → {stop_reason} "
+                f"exec_lag {resolved['latency_sec']}s "
+                f"adverse {resolved['adverse_pct']}%"
+            )
+        else:
+            reason = (
+                f"{pos.pending_exit_reason} "
+                f"exec_lag {resolved['latency_sec']}s "
+                f"adverse {resolved['adverse_pct']}% "
+                f"fill=${exit_price:.8g} (signal ${pos.pending_exit_signal_price})"
+            )
+        return _book_close_locked(pos, exit_price=exit_price, pnl=pnl, reason=reason, now=now)
+
+
+def _book_close_locked(
+    pos: PaperPosition,
+    *,
+    exit_price: float,
+    pnl: float,
+    reason: str,
+    now: float,
+) -> dict[str, Any]:
+    """Finalize a close. Caller must hold ``_lock`` and ``pos`` must be in ``_state.open``."""
+    exit_fee_frac = costs.EXIT_FEE_PCT / 100.0
+    exit_slip_frac = costs.EXIT_SLIP_PCT / 100.0
+    exit_fee = pos.size_usd * exit_fee_frac
+    exit_slip = pos.size_usd * exit_slip_frac
+    proceeds = pos.qty * exit_price - exit_fee - exit_slip
+    _state.cash_usd += proceeds
+    _state.realized_pnl_usd += pnl
+    pos.status = "closed"
+    pos.exit_price = exit_price
+    pos.realized_pnl_usd = round(pnl, 4)
+    pos.closed_at = datetime.now(timezone.utc).isoformat()
+    pos.close_reason = reason
+    pos.pending_exit_at = None
+    pos.fills.append(
+        asdict(
+            PaperFill(
+                side="sell",
+                price=exit_price,
+                size_usd=proceeds,
+                fee_usd=exit_fee,
+                slippage_pct=costs.EXIT_SLIP_PCT,
+                ts=pos.closed_at,
+            )
+        )
+    )
+    _state.closed.append(pos)
+    _state.open = [p for p in _state.open if p.id != pos.id]
+    record = {"event": "close", "position": asdict(pos)}
+    try:
+        decision_store.append("paper", record)
+        from decision import scoreboard
+
+        scoreboard.record_outcome(
+            address=pos.address,
+            mint=pos.mint,
+            timeframe=pos.timeframe or "live",
+            horizon_bars=pos.horizon_bars,
+            predicted_p50=float(pos.predicted_p50 or 0.0),
+            predicted_p10=float(
+                pos.predicted_p10
+                if pos.predicted_p10 is not None
+                else -pos.stop_loss_usd / max(pos.size_usd, 1e-9) * 100.0
+            ),
+            predicted_p90=float(
+                pos.predicted_p90
+                if pos.predicted_p90 is not None
+                else pos.target_profit_usd / max(pos.size_usd, 1e-9) * 100.0
+            ),
+            entry_price=pos.entry_price,
+            exit_price=exit_price,
+            action="paper_scalp",
+        )
+    except OSError:
+        pass
+    except Exception:  # noqa: BLE001
+        pass
+    opened_ts = _parse_ts(pos.opened_at)
+    pipeline_log.emit(
+        "paper",
+        "close",
+        address=pos.address,
+        mint=pos.mint,
+        symbol=pos.name,
+        position_id=pos.id,
+        realized_pnl_usd=pos.realized_pnl_usd,
+        reason=reason,
+        exit_price=exit_price,
+        entry_price=pos.entry_price,
+        held_sec=round(now - opened_ts, 1) if opened_ts else None,
+    )
+    _queue_fill_audit(pos)
+    return asdict(pos)
 
 
 def execute_signal(
@@ -350,7 +643,13 @@ def execute_signal(
     dead_after_sec: Optional[float] = None,
     abs_hold_sec: Optional[float] = None,
 ) -> dict[str, Any]:
-    """Open a paper lot from a launch/cluster signal (no DecisionCard)."""
+    """Open a paper lot from a launch/cluster signal (no DecisionCard).
+
+    When ``EXEC_SIM_ENABLED=1``, cash is reserved at the signal mid and the lot
+    only opens after ``EXEC_SIM_LATENCY_SEC``, filled at the worst mid observed
+    in that window (plus modeled entry slip) — matching submit→land adverse
+    selection on Solana.
+    """
     if LIVE_TRADING:
         return {"status": "refused", "reason": "LIVE_TRADING=1 is blocked in this build"}
     if _state.kill_switch or KILL_SWITCH:
@@ -361,10 +660,8 @@ def execute_signal(
     slip_pct = costs.entry_slip_pct()
     stop_usd = float(stop_loss_usd) if stop_loss_usd is not None else stop_loss_for_size(size_usd)
     target_usd = float(target_profit_usd) if target_profit_usd is not None else TARGET_PROFIT_USD
-    fill_price = mark_price * (1.0 + slip_pct / 100.0)
     fee_usd = size_usd * costs.ENTRY_FEE_PCT / 100.0
     notional = size_usd + fee_usd
-    qty = size_usd / fill_price
 
     with _lock:
         already = [p for p in _state.open if p.address == address and p.status == "open"]
@@ -379,6 +676,49 @@ def execute_signal(
             return {"status": "refused", "reason": "max notional"}
         if _state.cash_usd < notional:
             return {"status": "refused", "reason": "insufficient paper cash"}
+
+        if exec_sim.ENABLED:
+            _state.cash_usd -= notional
+            pending = exec_sim.queue_buy(
+                lane=active_lane(),
+                address=address,
+                mint=mint,
+                name=name,
+                signal_price=mark_price,
+                size_usd=size_usd,
+                strategy=strategy,
+                reserved_usd=notional,
+                max_hold_sec=max_hold_sec,
+                extra=extra or {},
+                target_profit_usd=target_usd,
+                bank_at_target=bank_at_target,
+                stop_loss_usd=stop_usd,
+                take_profit_pct=take_profit_pct,
+                dead_after_sec=dead_after_sec,
+                abs_hold_sec=abs_hold_sec,
+            )
+            pipeline_log.emit(
+                "paper",
+                "buy_pending",
+                address=address,
+                mint=mint,
+                symbol=name,
+                size_usd=size_usd,
+                strategy=strategy,
+                signal_price=mark_price,
+                latency_sec=exec_sim.LATENCY_SEC,
+                lane=active_lane(),
+            )
+            return {
+                "status": "pending",
+                "pending_id": pending.id,
+                "signal_price": mark_price,
+                "fill_at_in_sec": exec_sim.LATENCY_SEC,
+                "cash_usd": round(_state.cash_usd, 4),
+            }
+
+        fill_price = mark_price * (1.0 + slip_pct / 100.0)
+        qty = size_usd / fill_price
         _state.cash_usd -= notional
         pos = PaperPosition(
             id=str(uuid.uuid4())[:8],
@@ -397,6 +737,7 @@ def execute_signal(
             take_profit_pct=float(take_profit_pct or 0.0),
             dead_after_sec=float(dead_after_sec) if dead_after_sec else None,
             abs_hold_sec=float(abs_hold_sec) if abs_hold_sec else None,
+            signal_entry_price=mark_price,
             fills=[
                 asdict(
                     PaperFill(
@@ -436,6 +777,105 @@ def execute_signal(
         )
         return {"status": "opened", "position": asdict(pos), "cash_usd": round(_state.cash_usd, 4)}
 
+
+def _materialize_pending_buy(
+    pending: exec_sim.PendingBuy, resolved: dict[str, Any]
+) -> dict[str, Any]:
+    """Turn a reserved pending buy into an open lot at the adverse fill."""
+    slip_pct = costs.entry_slip_pct()
+    raw = float(resolved["fill_price_raw"])
+    fill_price = raw * (1.0 + slip_pct / 100.0)
+    fee_usd = pending.size_usd * costs.ENTRY_FEE_PCT / 100.0
+    qty = pending.size_usd / fill_price if fill_price > 0 else 0.0
+    extra = dict(pending.extra or {})
+    extra.update(
+        {
+            "exec_sim": {
+                "signal_price": resolved["signal_price"],
+                "fill_price_raw": raw,
+                "fill_price": fill_price,
+                "adverse_pct": resolved["adverse_pct"],
+                "latency_sec": resolved["latency_sec"],
+                "marks_n": resolved["marks_n"],
+            }
+        }
+    )
+    with _lock:
+        pos = PaperPosition(
+            id=str(uuid.uuid4())[:8],
+            address=pending.address,
+            mint=pending.mint,
+            name=pending.name,
+            entry_price=fill_price,
+            size_usd=pending.size_usd,
+            qty=qty,
+            opened_at=datetime.now(timezone.utc).isoformat(),
+            target_profit_usd=float(
+                pending.target_profit_usd
+                if pending.target_profit_usd is not None
+                else TARGET_PROFIT_USD
+            ),
+            stop_loss_usd=float(
+                pending.stop_loss_usd
+                if pending.stop_loss_usd is not None
+                else stop_loss_for_size(pending.size_usd)
+            ),
+            entry_reason=pending.strategy,
+            max_hold_sec=pending.max_hold_sec,
+            bank_at_target=bool(pending.bank_at_target),
+            take_profit_pct=float(pending.take_profit_pct or 0.0),
+            dead_after_sec=float(pending.dead_after_sec)
+            if pending.dead_after_sec
+            else None,
+            abs_hold_sec=float(pending.abs_hold_sec) if pending.abs_hold_sec else None,
+            signal_entry_price=float(pending.signal_price),
+            fills=[
+                asdict(
+                    PaperFill(
+                        side="buy",
+                        price=fill_price,
+                        size_usd=pending.size_usd,
+                        fee_usd=fee_usd,
+                        slippage_pct=slip_pct,
+                        ts=datetime.now(timezone.utc).isoformat(),
+                    )
+                )
+            ],
+            timeframe=pending.strategy,
+            horizon_bars=0,
+        )
+        _state.open.append(pos)
+        record = {
+            "event": "open",
+            "strategy": pending.strategy,
+            "lane": active_lane(),
+            "position": asdict(pos),
+            "extra": extra,
+        }
+        try:
+            decision_store.append("paper", record)
+        except OSError:
+            pass
+        pipeline_log.emit(
+            "paper",
+            "open",
+            address=pending.address,
+            mint=pending.mint,
+            symbol=pending.name,
+            size_usd=pending.size_usd,
+            strategy=pending.strategy,
+            lane=active_lane(),
+            signal_price=pending.signal_price,
+            fill_price=fill_price,
+            adverse_pct=resolved["adverse_pct"],
+            latency_sec=resolved["latency_sec"],
+        )
+        return {
+            "status": "opened",
+            "position": asdict(pos),
+            "cash_usd": round(_state.cash_usd, 4),
+            "exec_sim": resolved,
+        }
 
 def close_by_mint(*, mint: str, mark_price: float, reason: str) -> list[dict[str, Any]]:
     """Force-close every open lot on ``mint`` (cluster-sell / creator dump)."""
@@ -808,6 +1248,10 @@ def mark_and_maybe_exit(
     price that realizes exactly ``-stop_loss_usd``, so a gap through the level
     does not invent a -$9 loss on a $1.50 stop. ``mark`` keeps live-like gaps
     but still clamps to ``PAPER_MAX_LOSS_PCT`` of size as a circuit breaker.
+
+    With ``EXEC_SIM_ENABLED=1``, an exit signal does not sell at this tick's mid.
+    We wait ``EXEC_SIM_LATENCY_SEC``, keep recording mids, then fill at the
+    *lowest* mid in that window (worst sell) — submit→land adverse selection.
     """
     if mark_price <= 0:
         return []
@@ -819,156 +1263,171 @@ def mark_and_maybe_exit(
             if pos.address != address or pos.status != "open":
                 still_open.append(pos)
                 continue
+
+            if exec_sim.ENABLED and pos.mint:
+                exec_sim.observe(str(pos.mint), mark_price, ts=now)
+
             exit_fee_frac = costs.EXIT_FEE_PCT / 100.0
             exit_slip_frac = costs.EXIT_SLIP_PCT / 100.0
             exit_cost_frac = exit_fee_frac + exit_slip_frac
 
-            mark_pnl = pos.qty * mark_price - pos.size_usd - pos.size_usd * exit_cost_frac
-            opened = _parse_ts(pos.opened_at)
-            held = now - opened if opened else 0.0
+            # Deferred exit: resolver thread books the fill at signal+LATENCY.
+            # Keep observing mids here; do not widen/resolve on the next tick.
+            if exec_sim.ENABLED and pos.pending_exit_at is not None:
+                still_open.append(pos)
+                continue
 
-            reason = None
-            exit_price = mark_price
-            pnl = mark_pnl
-
-            # Grace is only for launch/cluster Gecko→Dex venue gaps. A sniper
-            # marks the same Pump curve it bought — a 50% print is a dump.
-            suppress_stop = (
-                pos.entry_reason in ("launch", "cluster")
-                and _venue_gap(pos.entry_price, mark_price)
-                and held < STOP_GRACE_SEC
-            )
-
-            max_jump = pos.size_usd * TRAIL_MAX_JUMP_PCT / 100.0
-            last_accepted = pos.last_mark_pnl_usd
-            # Climb toward a huge up-print in steps so a real runner can arm
-            # the trail. A single +$80 ghost still cannot become the peak in
-            # one tick. Never skip the rest of the tick — that froze
-            # gamerfaroe through a 300k→15k rug past its 300s max-hold.
-            # Cluster/launch marks Dex/Gecko: a 7× print is a venue glitch
-            # (Artcoin booked +$522 on an unconfirmed $4.2M mid). Do not
-            # ratchet last_accepted toward that.
-            venue_blowup = (
-                pos.entry_reason in ("launch", "cluster")
-                and pos.entry_price > 0
-                and abs(mark_price / pos.entry_price - 1.0) > 2.0
-            )
-            if venue_blowup:
-                decision_pnl = last_accepted
-            elif mark_pnl - last_accepted > max_jump:
-                decision_pnl = last_accepted + max_jump
             else:
-                decision_pnl = mark_pnl
-            pos.last_mark_pnl_usd = decision_pnl
-            if decision_pnl > pos.peak_pnl_usd:
-                pos.peak_pnl_usd = decision_pnl
+                mark_pnl = pos.qty * mark_price - pos.size_usd - pos.size_usd * exit_cost_frac
+                opened = _parse_ts(pos.opened_at)
+                held = now - opened if opened else 0.0
 
-            hold_limit = pos.max_hold_sec if pos.max_hold_sec else MAX_HOLD_SEC
-            abs_limit = pos.abs_hold_sec if pos.abs_hold_sec else None
-            situational = pos.dead_after_sec is not None
-            stalled = pos.peak_pnl_usd <= 0 or decision_pnl <= 0
+                reason = None
+                exit_price = mark_price
+                pnl = mark_pnl
 
-            # Stop first on the real mark. Dumps are down-jumps and always apply.
-            # A first-tick venue gap only suppresses the stop — a sniper can
-            # still bank the dollar if the print ran.
-            if mark_pnl <= -pos.stop_loss_usd and not suppress_stop:
-                exit_price, pnl, reason = _resolve_stop_exit(
-                    pos, mark_price, mark_pnl, exit_cost_frac
+                suppress_stop = (
+                    pos.entry_reason in ("launch", "cluster")
+                    and _venue_gap(pos.entry_price, mark_price)
+                    and held < STOP_GRACE_SEC
+                    and mark_price > pos.entry_price
                 )
-                if force_reason:
-                    reason = f"{force_reason} {reason}"
-            elif pos.bank_at_target and (
-                (
-                    (pos.take_profit_pct or 0.0) > 0
-                    and decision_pnl >= pos.size_usd * pos.take_profit_pct / 100.0
+
+                max_jump = pos.size_usd * TRAIL_MAX_JUMP_PCT / 100.0
+                last_accepted = pos.last_mark_pnl_usd
+                venue_blowup = (
+                    pos.entry_reason in ("launch", "cluster")
+                    and pos.entry_price > 0
+                    and abs(mark_price / pos.entry_price - 1.0) > 2.0
                 )
-                or (
-                    (pos.take_profit_pct or 0.0) <= 0
-                    and decision_pnl >= pos.target_profit_usd
-                )
-            ):
-                # Percent targets must clear on the jump-capped mark. A single
-                # Dex ghost used to print snipe_rip $12 with peak PnL of $2.
-                rip = pos.size_usd * (pos.take_profit_pct or 0.0) / 100.0
-                if rip > 0 and decision_pnl >= rip:
-                    pnl = rip
-                    reason = f"snipe_rip ${pnl:.2f}"
+                if venue_blowup:
+                    decision_pnl = last_accepted
+                elif mark_pnl - last_accepted > max_jump:
+                    decision_pnl = last_accepted + max_jump
                 else:
-                    pnl = pos.target_profit_usd
-                    reason = f"snipe_target ${pnl:.2f}"
-                exit_price = _implied_exit_price(pos, pnl, exit_cost_frac)
-            elif force_reason:
-                if _venue_gap(pos.entry_price, mark_price):
-                    pnl = last_accepted
-                    exit_price = _implied_exit_price(pos, pnl, exit_cost_frac)
-                    reason = (
-                        f"{force_reason} pnl=${pnl:.2f} "
-                        f"(unconfirmed mark ${mark_pnl:.2f})"
-                    )
-                else:
-                    reason = f"{force_reason} pnl=${mark_pnl:.2f}"
-                    exit_price = mark_price
-                    pnl = mark_pnl
-            elif (
-                situational
-                and pos.dead_after_sec
-                and pos.peak_pnl_usd <= 0
-                and held >= pos.dead_after_sec
-            ):
-                if mark_pnl <= -pos.stop_loss_usd:
+                    decision_pnl = mark_pnl
+                pos.last_mark_pnl_usd = decision_pnl
+                if decision_pnl > pos.peak_pnl_usd:
+                    pos.peak_pnl_usd = decision_pnl
+
+                hold_limit = pos.max_hold_sec if pos.max_hold_sec else MAX_HOLD_SEC
+                abs_limit = pos.abs_hold_sec if pos.abs_hold_sec else None
+                situational = pos.dead_after_sec is not None
+                stalled = pos.peak_pnl_usd <= 0 or decision_pnl <= 0
+
+                if mark_pnl <= -pos.stop_loss_usd and not suppress_stop:
                     exit_price, pnl, reason = _resolve_stop_exit(
                         pos, mark_price, mark_pnl, exit_cost_frac
                     )
-                    reason = f"dead_tape {held:.0f}s {reason}"
-                elif _venue_gap(pos.entry_price, mark_price):
-                    pnl = last_accepted
-                    exit_price = _implied_exit_price(pos, pnl, exit_cost_frac)
-                    reason = (
-                        f"dead_tape {held:.0f}s pnl=${pnl:.2f} "
-                        f"(unconfirmed mark ${mark_pnl:.2f})"
+                    if force_reason:
+                        reason = f"{force_reason} {reason}"
+                elif pos.bank_at_target and (
+                    (
+                        (pos.take_profit_pct or 0.0) > 0
+                        and decision_pnl >= pos.size_usd * pos.take_profit_pct / 100.0
                     )
-                else:
-                    reason = f"dead_tape {held:.0f}s pnl=${mark_pnl:.2f}"
+                    or (
+                        (pos.take_profit_pct or 0.0) <= 0
+                        and decision_pnl >= pos.target_profit_usd
+                    )
+                ):
+                    rip = pos.size_usd * (pos.take_profit_pct or 0.0) / 100.0
+                    if rip > 0 and decision_pnl >= rip:
+                        pnl = rip
+                        reason = f"snipe_rip ${pnl:.2f}"
+                    else:
+                        pnl = pos.target_profit_usd
+                        reason = f"snipe_target ${pnl:.2f}"
+                    exit_price = _implied_exit_price(pos, pnl, exit_cost_frac)
+                elif force_reason:
+                    if _venue_gap(pos.entry_price, mark_price):
+                        pnl = last_accepted
+                        exit_price = _implied_exit_price(pos, pnl, exit_cost_frac)
+                        reason = (
+                            f"{force_reason} pnl=${pnl:.2f} "
+                            f"(unconfirmed mark ${mark_pnl:.2f})"
+                        )
+                    else:
+                        reason = f"{force_reason} pnl=${mark_pnl:.2f}"
+                        exit_price = mark_price
+                        pnl = mark_pnl
+                elif (
+                    situational
+                    and pos.dead_after_sec
+                    and pos.peak_pnl_usd <= 0
+                    and held >= pos.dead_after_sec
+                ):
+                    if mark_pnl <= -pos.stop_loss_usd:
+                        exit_price, pnl, reason = _resolve_stop_exit(
+                            pos, mark_price, mark_pnl, exit_cost_frac
+                        )
+                        reason = f"dead_tape {held:.0f}s {reason}"
+                    elif _venue_gap(pos.entry_price, mark_price):
+                        pnl = last_accepted
+                        exit_price = _implied_exit_price(pos, pnl, exit_cost_frac)
+                        reason = (
+                            f"dead_tape {held:.0f}s pnl=${pnl:.2f} "
+                            f"(unconfirmed mark ${mark_pnl:.2f})"
+                        )
+                    else:
+                        reason = f"dead_tape {held:.0f}s pnl=${mark_pnl:.2f}"
+                        exit_price = mark_price
+                        pnl = mark_pnl
+                elif abs_limit and held >= abs_limit:
+                    reason = f"abs_hold {held:.0f}s pnl=${mark_pnl:.2f}"
                     exit_price = mark_price
                     pnl = mark_pnl
-            elif abs_limit and held >= abs_limit:
-                reason = f"abs_hold {held:.0f}s pnl=${mark_pnl:.2f}"
-                exit_price = mark_price
-                pnl = mark_pnl
-            elif held >= hold_limit and (not situational or stalled):
-                if mark_pnl - last_accepted > max_jump:
-                    pnl = last_accepted
-                    exit_price = _implied_exit_price(pos, pnl, exit_cost_frac)
-                    reason = (
-                        f"max_hold {held:.0f}s pnl=${pnl:.2f} "
-                        f"(unconfirmed mark ${mark_pnl:.2f})"
-                    )
+                elif held >= hold_limit and (not situational or stalled):
+                    if mark_pnl - last_accepted > max_jump:
+                        pnl = last_accepted
+                        exit_price = _implied_exit_price(pos, pnl, exit_cost_frac)
+                        reason = (
+                            f"max_hold {held:.0f}s pnl=${pnl:.2f} "
+                            f"(unconfirmed mark ${mark_pnl:.2f})"
+                        )
+                    else:
+                        reason = f"max_hold {held:.0f}s pnl=${mark_pnl:.2f}"
+                        exit_price = mark_price
+                        pnl = mark_pnl
+                elif pos.bank_at_target:
+                    use_trail = TRAIL_ENABLED or situational
+                    trailed = _trail_exit(pos, decision_pnl) if use_trail else None
+                    if trailed is not None:
+                        pnl, reason = trailed
+                        exit_price = _implied_exit_price(pos, pnl, exit_cost_frac)
                 else:
-                    reason = f"max_hold {held:.0f}s pnl=${mark_pnl:.2f}"
-                    exit_price = mark_price
-                    pnl = mark_pnl
-            elif pos.bank_at_target:
-                use_trail = TRAIL_ENABLED or situational
-                trailed = _trail_exit(pos, decision_pnl) if use_trail else None
-                if trailed is not None:
-                    pnl, reason = trailed
-                    exit_price = _implied_exit_price(pos, pnl, exit_cost_frac)
-            else:
-                trailed = _trail_exit(pos, decision_pnl) if TRAIL_ENABLED else None
-                if trailed is not None:
-                    pnl, reason = trailed
-                    exit_price = _implied_exit_price(pos, pnl, exit_cost_frac)
-                elif TRAIL_ENABLED and pos.trail_armed:
+                    trailed = _trail_exit(pos, decision_pnl) if TRAIL_ENABLED else None
+                    if trailed is not None:
+                        pnl, reason = trailed
+                        exit_price = _implied_exit_price(pos, pnl, exit_cost_frac)
+                    elif TRAIL_ENABLED and pos.trail_armed:
+                        still_open.append(pos)
+                        continue
+                    elif mark_pnl >= pos.target_profit_usd and not TRAIL_ENABLED:
+                        reason = f"target_profit ${mark_pnl:.2f}"
+                        exit_price = mark_price
+                        pnl = mark_pnl
+
+                if reason is None:
                     still_open.append(pos)
                     continue
-                elif mark_pnl >= pos.target_profit_usd and not TRAIL_ENABLED:
-                    reason = f"target_profit ${mark_pnl:.2f}"
-                    exit_price = mark_price
-                    pnl = mark_pnl
 
-            if reason is None:
-                still_open.append(pos)
-                continue
+                if exec_sim.ENABLED:
+                    pos.pending_exit_at = now
+                    pos.pending_exit_reason = reason
+                    pos.pending_exit_signal_price = float(exit_price)
+                    pipeline_log.emit(
+                        "paper",
+                        "sell_pending",
+                        address=pos.address,
+                        mint=pos.mint,
+                        symbol=pos.name,
+                        reason=reason,
+                        signal_price=exit_price,
+                        latency_sec=exec_sim.LATENCY_SEC,
+                    )
+                    still_open.append(pos)
+                    continue
 
             exit_fee = pos.size_usd * exit_fee_frac
             exit_slip = pos.size_usd * exit_slip_frac
@@ -1020,6 +1479,9 @@ def mark_and_maybe_exit(
                 )
             except OSError:
                 pass
+            except Exception:  # noqa: BLE001
+                pass
+            opened_ts = _parse_ts(pos.opened_at)
             pipeline_log.emit(
                 "paper",
                 "close",
@@ -1031,12 +1493,96 @@ def mark_and_maybe_exit(
                 reason=reason,
                 exit_price=exit_price,
                 entry_price=pos.entry_price,
-                held_sec=round(held, 1),
+                held_sec=round(now - opened_ts, 1) if opened_ts else None,
             )
             closed.append(asdict(pos))
             _queue_fill_audit(pos)
         _state.open = still_open
+    if force_reason is None:
+        closed.extend(_maybe_jev_exit(address, mark_price, now))
     return closed
+
+
+def _exit_state(pos: Any, mark_price: float, held: float) -> dict[str, Any]:
+    """Evidence the chair judges an open lot on — all computed in code."""
+    last = float(getattr(pos, "last_mark_pnl_usd", 0.0) or 0.0)
+    size = float(getattr(pos, "size_usd", 0.0) or 0.0)
+    peak = float(getattr(pos, "peak_pnl_usd", 0.0) or 0.0)
+    stop = float(getattr(pos, "stop_loss_usd", 0.0) or 0.0)
+    target = float(getattr(pos, "target_profit_usd", 0.0) or 0.0)
+    return {
+        "symbol": str(getattr(pos, "name", "") or ""),
+        "strategy": str(getattr(pos, "entry_reason", "") or ""),
+        "size_usd": size,
+        "entry_price": getattr(pos, "entry_price", None),
+        "mark_price": mark_price,
+        "pnl_usd": round(last, 2),
+        "pnl_pct": round(last / size * 100.0, 2) if size > 0 else 0.0,
+        "peak_usd": round(peak, 2),
+        "held_sec": round(held, 1),
+        "dist_to_stop_usd": round(last + stop, 2),
+        "dist_to_target_usd": round(target - last, 2),
+    }
+
+
+def _maybe_jev_exit(address: str, mark_price: float, now: float) -> list[dict[str, Any]]:
+    """Ask the chair whether still-open lots should exit now.
+
+    Fail-open: any failure or an unavailable chair leaves lots untouched.
+    One API call per due lot at most; force-closes route through the
+    normal ``force_reason`` path so fills, store, and audit stay uniform.
+    """
+    if not JEV_EXIT_MONITOR or mark_price <= 0:
+        return []
+    try:
+        from decision import jev as jev_mod
+    except Exception:  # noqa: BLE001
+        return []
+    with _lock:
+        candidates = [
+            p
+            for p in _state.open
+            if p.address == address
+            and p.status == "open"
+            and p.pending_exit_at is None
+        ]
+    extra: list[dict[str, Any]] = []
+    for pos in candidates:
+        opened = _parse_ts(pos.opened_at)
+        held = now - opened if opened else 0.0
+        if held < JEV_EXIT_MIN_HOLD_SEC:
+            continue
+        last = _jev_exit_checked.get(pos.id, 0.0)
+        if now - last < JEV_EXIT_RECHECK_SEC:
+            continue
+        _jev_exit_checked[pos.id] = now
+        try:
+            review = jev_mod.exit_review(_exit_state(pos, mark_price, held))
+        except Exception:  # noqa: BLE001 — never break the mark loop
+            continue
+        if not review or not review.get("exit"):
+            continue
+        try:
+            pipeline_log.emit(
+                "paper",
+                "jev_exit",
+                address=pos.address,
+                mint=pos.mint,
+                symbol=pos.name,
+                position_id=pos.id,
+                p=review.get("p"),
+                latency_ms=review.get("latency_ms"),
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        extra.extend(
+            mark_and_maybe_exit(
+                address=address,
+                mark_price=mark_price,
+                force_reason=f"jev_exit p={review.get('p')}",
+            )
+        )
+    return extra
 
 
 def _resolve_stop_exit(

@@ -14,6 +14,7 @@ def trailing(monkeypatch):
     monkeypatch.setattr(paper, "TRAIL_ENABLED", True)
     monkeypatch.setattr(paper, "TRAIL_ARM_USD", 1.0)
     monkeypatch.setattr(paper, "TRAIL_GIVEBACK_PCT", 0.5)
+    monkeypatch.setattr(paper, "TRAIL_GIVEBACK_OF_PEAK", 0.35)
     return paper
 
 
@@ -104,21 +105,25 @@ def test_trail_never_closes_below_the_arm(trailing):
     assert pos.trail_armed is False
 
 
-def test_launch_grace_ignores_first_tick_venue_gap(trailing, monkeypatch):
+def test_first_tick_dump_fills_at_the_mark(trailing, monkeypatch):
+    """Live-like: a 50% Dex dump books the gapped loss, not a -$1.60 barrier."""
     monkeypatch.setattr(paper, "STOP_LOSS_PCT", 2.0)
-    monkeypatch.setattr(paper, "STOP_FILL_MODE", "barrier")
+    monkeypatch.setattr(paper, "STOP_FILL_MODE", "mark")
+    monkeypatch.setattr(paper, "MAX_LOSS_PCT", 90.0)
     monkeypatch.setattr(paper, "STOP_GRACE_SEC", 12.0)
     monkeypatch.setattr(paper, "ENTRY_CONFIRM_PCT", 8.0)
     paper.reset()
     pos = _position(size=80.0)
-    pos.entry_reason = "launch"
+    pos.entry_reason = "cluster"
     pos.stop_loss_usd = 1.60
     with paper._lock:
         paper._state.open.append(pos)
         paper._state.cash_usd = 920.0
-    # Same-tick Dex print 50% below the Gecko fill — used to book -$1.60.
-    assert paper.mark_and_maybe_exit(address="Pool1", mark_price=0.50) == []
-    assert pos.status == "open"
+    closed = paper.mark_and_maybe_exit(address="Pool1", mark_price=0.50)
+    assert closed
+    assert pos.status == "closed"
+    assert closed[0]["realized_pnl_usd"] < -20
+    assert "barrier" not in (closed[0].get("close_reason") or "")
     paper.reset()
 
 

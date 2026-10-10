@@ -49,6 +49,9 @@ VETO_THRESHOLD = _env_float("JEV_VETO_THRESHOLD", 0.70)
 # new entries (buy→hold) instead of forcing avoid. Per the docs' three
 # paths: act / proceed-with-caution / don't act.
 VETO_CAUTION = _env_float("JEV_VETO_CAUTION", 0.40)
+# Exit monitor on open lots: force-exit when the chair says get out.
+# Missing a rug costs more than an early exit, so this sits at 0.70.
+EXIT_THRESHOLD = _env_float("JEV_EXIT_THRESHOLD", 0.70)
 MAX_STATE_CHARS = int(_env_float("JEV_MAX_STATE_CHARS", 4000))
 
 # Atomic veto conditions — one yes/no judgment each. Combined in code as
@@ -207,6 +210,59 @@ def preflight() -> JevStatus:
     )
 
 
+def _indicator_context(card: Any, packet: Any) -> Optional[dict[str, Any]]:
+    """Tape agreement, computed in code — never raw numbers for the model.
+
+    Reads the card timeframe's indicator snapshot off the packet, scores it
+    with the same ``score_indicators`` Gate 2 uses, and reduces it to named
+    buckets (docs: semantic beats numeric; filter to what the question
+    needs). Returns ``None`` when no snapshot exists (cluster path, short
+    series) so the questions judge without it.
+    """
+
+    def _f(v: Any) -> Optional[float]:
+        try:
+            return None if v is None else float(v)
+        except (TypeError, ValueError):
+            return None
+
+    try:
+        from decision import indicators_signal as ind_mod
+    except Exception:  # noqa: BLE001
+        return None
+    try:
+        tfs = getattr(packet, "timeframes", None) or {}
+        tf_name = getattr(card, "timeframe", None)
+        tfp = tfs.get(tf_name) if isinstance(tfs, dict) else None
+        snap = getattr(tfp, "indicators", None)
+    except Exception:  # noqa: BLE001
+        snap = None
+    if not isinstance(snap, dict) or not snap or snap.get("error"):
+        return None
+    try:
+        sig = ind_mod.score_indicators(snap)
+    except Exception:  # noqa: BLE001
+        return None
+    if not sig.available:
+        return None
+    ctx: dict[str, Any] = {"score": round(sig.score, 2)}
+    rsi = _f(snap.get("rsi"))
+    if rsi is not None:
+        ctx["rsi"] = "overbought" if rsi >= 70 else ("oversold" if rsi <= 30 else "neutral")
+    macd_hist = _f(snap.get("macd_hist"))
+    if macd_hist is not None:
+        ctx["macd"] = "positive" if macd_hist > 0 else ("negative" if macd_hist < 0 else "flat")
+    plus_di, minus_di, adx = _f(snap.get("plus_di")), _f(snap.get("minus_di")), _f(snap.get("adx"))
+    if plus_di is not None and minus_di is not None:
+        spread = plus_di - minus_di
+        trend = "up" if spread > 0 else ("down" if spread < 0 else "flat")
+        if adx is not None and adx >= 25 and trend != "flat":
+            trend += "-strong"
+        ctx["trend"] = trend
+    ctx["note"] = str(sig.reason or "")[:120]
+    return ctx
+
+
 def build_state(card: Any, packet: Any, opinions: Optional[list[Any]] = None) -> dict[str, Any]:
     """Compact evidence bundle. Small on purpose — state is the token bill."""
     band = getattr(card, "expected_return_pct", None)
@@ -288,6 +344,7 @@ def build_state(card: Any, packet: Any, opinions: Optional[list[Any]] = None) ->
         },
         "specialists": specs[:6],
         "momentum_entry": bool((getattr(card, "notes", None) or {}).get("momentum_entry")),
+        "indicators": _indicator_context(card, packet),
     }
     return state
 
@@ -313,9 +370,10 @@ def build_questions() -> dict[str, Any]:
             "criteria": {
                 "buy": (
                     "Clear long edge after costs with a safe exit route, "
-                    "healthy liquidity, no holder-concentration flag, and "
-                    "specialist buy consensus. Only when evidence supports "
-                    "an immediate entry."
+                    "healthy liquidity, no holder-concentration flag, "
+                    "`indicators` showing the tape agreeing (bullish score, "
+                    "no overbought exhaustion), and specialist buy consensus. "
+                    "Only when evidence supports an immediate entry."
                 ),
                 "hold": (
                     "Unclear, sideways forecast, or weak/mixed specialist "
@@ -379,7 +437,8 @@ def build_questions() -> dict[str, Any]:
             "type": "score",
             "instructions": (
                 "Entry quality from stay-out to high-quality, judging "
-                "`edge_pct`, `liquidity_usd`, `agreement`, and `specialists`."
+                "`edge_pct`, `liquidity_usd`, `agreement`, `indicators`, "
+                "and `specialists`."
             ),
             "criteria": [
                 "Stay out: unsafe or no edge.",
@@ -684,4 +743,61 @@ def chair_review(
         "probs": dict(verdict.action_probs),
         "latency_ms": verdict.latency_ms,
         "model": verdict.model,
+    }
+
+
+def build_exit_questions() -> dict[str, Any]:
+    """One Noul: should the book exit this open lot now?
+
+    The state carries everything computed in code (pnl, peak giveback,
+    hold time, distance to stop/target). The model contributes the one
+    judgment code cannot make: does this tape look dead or rugging.
+    """
+    return {
+        "exit_now": {
+            "type": "noul",
+            "instructions": (
+                "Should the book exit `symbol` now at market — momentum "
+                "dead with no recovery (negative `pnl_usd`, never green), "
+                "rug signs (deep red `pnl_pct`, large giveback from "
+                "`peak_usd`), or capital better redeployed? Judge `pnl_usd`, "
+                "`peak_usd`, `held_sec`, `dist_to_stop_usd`, and "
+                "`dist_to_target_usd`."
+            ),
+            "criteria": {
+                "true": "Exit now: dead tape, rug forming, or the loss will only grow.",
+                "false": "Hold: still constructive — green, recovering, or too early to tell.",
+            },
+        },
+    }
+
+
+def exit_review(state: dict[str, Any]) -> Optional[dict[str, Any]]:
+    """Ask the chair whether to force-exit an open lot.
+
+    Returns ``{"exit", "p", "latency_ms", "model"}``; ``None`` when the
+    chair is disabled/unavailable so the normal stop/trail logic owns the
+    lot. Callers throttle per lot — this makes one API call per review.
+    """
+    try:
+        payload, latency_ms = _post(
+            state, build_exit_questions(), timeout_s=float(TIMEOUT_S)
+        )
+    except JevUnavailable:
+        return None
+    answers = payload.get("answers")
+    if not isinstance(answers, dict):
+        answers = {}
+    ans = answers.get("exit_now")
+    p = 0.5
+    if isinstance(ans, dict):
+        try:
+            p = max(0.0, min(1.0, float(ans.get("noul", 0.5))))
+        except (TypeError, ValueError):
+            p = 0.5
+    return {
+        "exit": p >= EXIT_THRESHOLD,
+        "p": round(p, 3),
+        "latency_ms": latency_ms,
+        "model": str(payload.get("model") or MODEL),
     }
