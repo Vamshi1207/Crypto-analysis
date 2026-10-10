@@ -91,7 +91,13 @@ COPY_SIZE_USD = _env_float("COPY_SIZE_USD", 40.0)
 COPY_MAX_HOLD_SEC = _env_float("COPY_MAX_HOLD_SEC", 300.0)
 COPY_DEAD_SEC = _env_float("COPY_DEAD_SEC", 90.0)
 COPY_STOP_USD = _env_float("COPY_STOP_USD", 1.60)
-# JEV chair gate on trenches opens (0 = off, today's behavior per
+# Bonding-curve guard on opens: refuse when our size is the exit
+# liquidity (moves curve > max impact) or dwarfs real pool depth.
+# Pure constant-product math (decision.pump_curve), no RPC.
+PUMP_CURVE_GUARD = os.getenv("PUMP_CURVE_GUARD", "1").strip() == "1"
+PUMP_CURVE_MAX_IMPACT_PCT = _env_float("PUMP_CURVE_MAX_IMPACT_PCT", 10.0)
+PUMP_CURVE_MAX_LIQ_FRAC = _env_float("PUMP_CURVE_MAX_LIQ_FRAC", 0.05)
+# JEV chair gate on trenches opens (0 = off, today's behavior, per
 # strategy). Veto or avoid from the chair blocks the open; hold/buy (or
 # an offline chair) proceeds. Blocks are remembered per mint so a
 # rejected name is not re-asked every tick. Arb fills stay out (their
@@ -1214,6 +1220,19 @@ def _open(
         price = gecko
         if price <= 0:
             return {"status": "skipped", "reason": "no price"}
+    if PUMP_CURVE_GUARD and strategy in ("cluster", "launch", "snipe", "copy"):
+        from decision import pump_curve
+
+        curve_ok, curve_why, _ = pump_curve.guard_buy(
+            size_usd=size,
+            price_usd=price,
+            liquidity_usd=row.get("liquidity_usd"),
+            sol_usd=_sol_usd(),
+            max_impact_pct=PUMP_CURVE_MAX_IMPACT_PCT,
+            max_liq_frac=PUMP_CURVE_MAX_LIQ_FRAC,
+        )
+        if not curve_ok:
+            return {"status": "skipped", "reason": curve_why}
     result = paper.execute_signal(
         address=row["pool"],
         mint=row["mint"],
