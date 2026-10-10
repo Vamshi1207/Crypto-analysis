@@ -49,7 +49,9 @@ def test_missing_indicators_skip_gate():
     assert sig.hard_block is False
 
 
-def test_confidence_multiplier_moves_with_score():
+def test_confidence_multiplier_moves_with_score(monkeypatch):
+    # Formula test, not gate test: pin ENABLED so deploy config can't flip it.
+    monkeypatch.setattr(indicators_signal, "ENABLED", True)
     bull = indicators_signal.IndicatorSignal(
         score=0.8, votes={"rsi": 0.8}, available=True, reason="ok", hard_block=False, soft_ok=True
     )

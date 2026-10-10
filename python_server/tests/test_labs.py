@@ -79,9 +79,34 @@ def test_lane_books_do_not_share_cash():
 
 
 def test_strong_tape_opens_the_snipe_book(monkeypatch, tmp_path):
+    from decision import jev as jev_mod
     from decision import store as decision_store
 
     monkeypatch.setattr(decision_store, "STORE_DIR", tmp_path / "store")
+    monkeypatch.setattr(
+        jev_mod,
+        "chair_review",
+        lambda *a, **k: {
+            "veto": False, "action": "hold", "claim": "jev hold",
+            "reason": "jev hold", "backend": "jev", "confidence": 0.8,
+            "veto_prob": 0.1, "quality": 0.5, "probs": {}, "latency_ms": 5,
+            "model": "jev-latest",
+        },
+    )
+    trenches._jev_blocked.clear()
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(
+        trenches,
+        "check_token",
+        lambda mint: SimpleNamespace(
+            blocking=False,
+            verdict=SimpleNamespace(value="ok"),
+            risk_score=5,
+            summary=lambda: "ok (score 5)",
+            sellability=SimpleNamespace(price_impact_pct=0.2),
+        ),
+    )
     monkeypatch.setattr(labs, "ENABLED", True)
     labs.clear_seen()
     trenches.reset_counters()

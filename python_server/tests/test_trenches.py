@@ -347,6 +347,7 @@ def test_scan_sniper_buys_only_after_tape_lifts(monkeypatch, tmp_path):
     monkeypatch.setattr(decision_store, "STORE_DIR", tmp_path / "store")
     trenches.reset_counters()
     paper.reset(starting_cash_usd=1000.0)
+    _wire_chair(monkeypatch, _chair(action="hold"))
     create_px = 1e-6
     mint = "MintHot11111111111111111111111111111"
     monkeypatch.setattr(trenches, "_sol_usd", lambda: 150.0)
@@ -545,3 +546,124 @@ def test_execute_signal_and_cluster_sell(tmp_path, monkeypatch):
     assert len(closed) == 1
     assert paper.snapshot()["open_count"] == 0
     assert paper.snapshot()["closed_count"] == 1
+
+
+def _snipe_row():
+    return {
+        "mint": "SnipeMint11111111111111111111111111111",
+        "pool": "Pool111111111111111111111111111111111",
+        "symbol": "SNIPE",
+        "liquidity_usd": 5000.0,
+        "price_usd": 1e-6,
+        "age_sec": 20.0,
+        "buyers_unique": 6,
+        "buys": 10,
+        "sells": 1,
+        "real_sol": 12.0,
+        "peak_real_sol": 12.0,
+        "lift_pct": 18.0,
+        "size_usd": 20.0,
+    }
+
+
+def test_jev_gate_covers_launch_strategy(monkeypatch):
+    _wire_chair(monkeypatch, _chair(action="avoid", veto=True))
+    row = _cluster_row()
+    proceed, reason = trenches._jev_cluster_gate(
+        row, ["a", "b"], None, None, strategy="launch"
+    )
+    assert proceed is False
+    assert reason.startswith("jev_veto")
+
+
+def test_jev_gate_covers_snipe_tape(monkeypatch):
+    _wire_chair(monkeypatch, _chair(action="avoid", veto=True))
+    proceed, reason = trenches._jev_cluster_gate(
+        _snipe_row(), [], None, None, strategy="snipe"
+    )
+    assert proceed is False
+    assert reason.startswith("jev_veto")
+
+
+def test_jev_gate_snipe_hold_proceeds(monkeypatch):
+    _wire_chair(monkeypatch, _chair(action="hold"))
+    proceed, _ = trenches._jev_cluster_gate(
+        _snipe_row(), [], None, None, strategy="snipe"
+    )
+    assert proceed is True
+
+
+def test_jev_gate_flag_off_per_strategy(monkeypatch):
+    from decision import jev as jev_mod
+
+    def boom(*a, **k):
+        raise AssertionError("chair must not be called")
+
+    monkeypatch.setattr(jev_mod, "chair_review", boom)
+    monkeypatch.setattr(trenches, "JEV_SNIPER_GATE", False)
+    trenches._jev_blocked.clear()
+    proceed, reason = trenches._jev_cluster_gate(
+        _snipe_row(), [], None, None, strategy="snipe"
+    )
+    assert proceed is True
+    assert reason == "jev_gate_off"
+
+
+def _safe_report(blocking=False, verdict="ok"):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        blocking=blocking,
+        verdict=SimpleNamespace(value=verdict),
+        risk_score=90 if blocking else 5,
+        summary=lambda: f"{verdict} (score {90 if blocking else 5})",
+        sellability=SimpleNamespace(price_impact_pct=0.2),
+    )
+
+
+def _wire_gate0(monkeypatch, report=None):
+    monkeypatch.setattr(
+        trenches, "check_token", lambda mint: report or _safe_report()
+    )
+
+
+def test_snipe_gated_open_blocks_on_veto(monkeypatch):
+    _wire_chair(monkeypatch, _chair(action="avoid", veto=True))
+    _wire_gate0(monkeypatch)
+    row = dict(_snipe_row())
+    out = trenches._snipe_gated_open(
+        row, _tape={"lift_pct": 18.0}, strategy="snipe", size=20.0, hold=45.0
+    )
+    assert out["status"] == "skipped"
+    assert "jev_veto" in out["reason"]
+
+
+def test_snipe_gated_open_blocks_on_gate0(monkeypatch):
+    from decision import jev as jev_mod
+
+    def boom(*a, **k):
+        raise AssertionError("chair must not be reached past a Gate0 block")
+
+    monkeypatch.setattr(jev_mod, "chair_review", boom)
+    _wire_gate0(monkeypatch, _safe_report(blocking=True, verdict="danger"))
+    out = trenches._snipe_gated_open(
+        dict(_snipe_row()), _tape={}, strategy="snipe", size=20.0, hold=45.0
+    )
+    assert out["status"] == "skipped"
+    assert out["reason"].startswith("snipe_gate0_")
+
+
+def test_snipe_gated_open_passes_through_on_hold(monkeypatch, tmp_path):
+    from decision import store as decision_store
+
+    monkeypatch.setattr(decision_store, "STORE_DIR", tmp_path / "store")
+    paper.reset(starting_cash_usd=1000.0)
+    _wire_chair(monkeypatch, _chair(action="hold"))
+    _wire_gate0(monkeypatch)
+    monkeypatch.setattr(trenches, "confirm_entry_price", lambda mint, pool=None, gecko_usd=0: (1e-6, "ok"))
+    row = dict(_snipe_row())
+    out = trenches._snipe_gated_open(
+        row, _tape={"lift_pct": 18.0}, strategy="snipe", size=20.0, hold=45.0,
+        confirm_dex=False,
+    )
+    assert out["status"] == "opened"

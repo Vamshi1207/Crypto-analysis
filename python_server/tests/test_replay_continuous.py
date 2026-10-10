@@ -14,6 +14,15 @@ from decision.schema import Action, DecideMode
 pytestmark = pytest.mark.corpus
 
 
+def _pick_or_skip(**kw):
+    """Corpus-dependent tests skip when the local CandleData extract has
+    no continuous window (mirrors the corpus_tokens fixture)."""
+    try:
+        return pick_continuous_live_token(**kw)
+    except RuntimeError as exc:
+        pytest.skip(f"no continuous corpus window: {exc}")
+
+
 def test_longest_continuous_run_prefers_regular_gaps():
     # 10 regular 15s bars, then a hole, then 3 more.
     base = 1_000_000_000_000
@@ -28,7 +37,7 @@ def test_longest_continuous_run_prefers_regular_gaps():
 
 
 def test_pick_continuous_live_token_has_regular_gaps():
-    picked = pick_continuous_live_token(min_bars=64, tail=128, scan_limit=20)
+    picked = _pick_or_skip(min_bars=64, tail=128, scan_limit=20)
     assert picked["live_bars"] >= 64
     tf = picked["timeframe"]
     candles = picked["live_token"]["timeframes"][tf]
@@ -41,7 +50,7 @@ def test_pick_continuous_live_token_has_regular_gaps():
 def test_decide_on_continuous_live_window():
     os.environ["FORECAST_DISABLE_CHRONOS"] = "1"
     os.environ["FORECAST_DISABLE_TIMESFM"] = "1"
-    picked = pick_continuous_live_token(min_bars=128, tail=256, scan_limit=20)
+    picked = _pick_or_skip(min_bars=128, tail=256, scan_limit=20)
     card = decide(
         address=picked["address"],
         live_token=picked["live_token"],

@@ -15,6 +15,7 @@ print, stay with a runner, hard-cap a stall.
 
 from __future__ import annotations
 
+import functools
 import os
 import threading
 import time
@@ -74,12 +75,23 @@ CLUSTER_DEAD_SEC = _env_float("CLUSTER_DEAD_SEC", 0.0)
 CLUSTER_STOP_USD = _env_float("CLUSTER_STOP_USD", 0.0)
 # Require DexScreener 5m % change ≥ this before opening (0 = off).
 CLUSTER_MIN_M5_PCT = _env_float("CLUSTER_MIN_M5_PCT", 0.0)
-# JEV chair gate on cluster opens (0 = off, today's behavior). Veto or
+# JEV chair gate on trenches opens (0 = off, today's behavior). Veto or
 # avoid from the chair blocks the open; hold/buy (or an offline chair)
 # proceeds. Blocks are remembered per mint so a rejected name is not
-# re-asked every tick.
+# re-asked every tick. Arb fills stay out by design: a 250ms judgment
+# call would cost more than it saves in a millisecond quote race.
 JEV_CLUSTER_GATE = os.getenv("JEV_CLUSTER_GATE", "1").strip() == "1"
+JEV_LAUNCH_GATE = os.getenv("JEV_LAUNCH_GATE", "1").strip() == "1"
+JEV_SNIPER_GATE = os.getenv("JEV_SNIPER_GATE", "1").strip() == "1"
 JEV_CLUSTER_RECHECK_SEC = _env_float("JEV_CLUSTER_RECHECK_SEC", 300.0)
+
+
+def _strategy_gate_on(strategy: str) -> bool:
+    return {
+        "cluster": JEV_CLUSTER_GATE,
+        "launch": JEV_LAUNCH_GATE,
+        "snipe": JEV_SNIPER_GATE,
+    }.get(strategy or "", False)
 _jev_blocked: dict[str, float] = {}
 MAX_PER_TICK = _env_int("TRENCHES_MAX_PER_TICK", 2)
 # Create-event sniper: watch the landed create, buy only if the tape lifts.
@@ -410,9 +422,9 @@ def _scan(*, do_cluster: bool = True) -> dict[str, Any]:
                 continue
         dead = CLUSTER_DEAD_SEC if is_cluster and CLUSTER_DEAD_SEC > 0 else None
         stop_usd = CLUSTER_STOP_USD if is_cluster and CLUSTER_STOP_USD > 0 else None
-        if is_cluster:
+        if is_cluster or strategy == "launch":
             proceed, jev_reason = _jev_cluster_gate(
-                row, buyers, m5_pct, safety_report
+                row, buyers, m5_pct, safety_report, strategy=strategy
             )
             if not proceed:
                 skipped += 1
@@ -605,6 +617,16 @@ def _scan_sniper() -> tuple[int, int, int, int, list[dict[str, Any]]]:
             continue
         snipe_lanes = labs.snipe_lanes()
         if snipe_lanes:
+            tape_ctx = {
+                "buyers_unique": unique,
+                "buys": buys,
+                "sells": sells,
+                "real_sol": round(real_sol, 2),
+                "peak_real_sol": round(peak_real, 2),
+                "lift_pct": round(snipe_lift_pct(create_px, last_px), 2),
+                "age_sec": round(age, 1),
+            }
+            gated_open = functools.partial(_snipe_gated_open, _tape=tape_ctx)
             for lane in snipe_lanes:
                 opened_n = sum(1 for h in hits if h.get("lane") == lane.id)
                 hit = labs.consider_snipe(
@@ -617,7 +639,7 @@ def _scan_sniper() -> tuple[int, int, int, int, list[dict[str, Any]]]:
                     curve_drop_pct=SNIPER_CURVE_DROP_PCT,
                     max_per_tick_already=opened_n,
                     max_per_tick=SNIPER_MAX_PER_TICK,
-                    open_fn=_open,
+                    open_fn=gated_open,
                 )
                 if hit:
                     opens += 1
@@ -656,7 +678,22 @@ def _scan_sniper() -> tuple[int, int, int, int, list[dict[str, Any]]]:
             "seen_at": watch.get("seen_at"),
             "source": "pump_create",
             "creator": watch.get("creator"),
+            "buyers_unique": unique,
+            "buys": buys,
+            "sells": sells,
+            "real_sol": round(real_sol, 2),
+            "peak_real_sol": round(peak_real, 2),
+            "lift_pct": round(lift, 2),
+            "size_usd": size,
         }
+        proceed, jev_reason = _jev_cluster_gate(row, [], None, None, strategy="snipe")
+        if not proceed:
+            skipped += 1
+            pipeline_log.emit(
+                "trenches", "skip", mint=mint, symbol=row.get("symbol"),
+                reason=jev_reason, strategy="snipe",
+            )
+            continue
         result = _open(
             row,
             strategy="snipe",
@@ -881,13 +918,16 @@ def _jev_cluster_gate(
     buyers: list[str],
     m5_pct: Optional[float],
     safety_report: Optional[Any] = None,
+    *,
+    strategy: str = "cluster",
 ) -> tuple[bool, str]:
-    """Ask the JEV chair before a cluster open. Returns (proceed, reason).
+    """Ask the JEV chair before a trenches open. Returns (proceed, reason).
 
-    State is evidence the desk already paid for, never re-fetched: the
-    Gate 0 safety report (verdict, score, flags, sell price impact) and a
-    code-computed edge estimate (m5 momentum minus the round-trip cost —
-    arithmetic stays in code per the docs, the model judges the trade).
+    Covers the cluster, launch, and snipe entry paths; each has its own
+    kill switch (``JEV_<STRATEGY>_GATE``). State is evidence the desk
+    already paid for, never re-fetched: the Gate 0 safety report, a
+    code-computed edge estimate where one exists, and the tape that
+    fired the entry (buyers / lift / curve SOL).
     Fail-open: a disabled/unavailable chair proceeds exactly as before.
     A blocked mint stays blocked for ``JEV_CLUSTER_RECHECK_SEC`` without
     re-asking (bounds API cost); the mint is NOT added to ``_seen_mints``
@@ -897,7 +937,7 @@ def _jev_cluster_gate(
 
     from decision import costs
 
-    if not JEV_CLUSTER_GATE:
+    if not _strategy_gate_on(strategy):
         return True, "jev_gate_off"
     mint = str(row.get("mint") or "")
     symbol = str(row.get("symbol") or mint[:6])
@@ -909,7 +949,7 @@ def _jev_cluster_gate(
         from decision import jev as jev_mod
     except Exception:  # noqa: BLE001 — chair unavailable, trade as before
         return True, "jev_unavailable"
-    n_buyers = len(buyers)
+    n_buyers = len(buyers) if buyers else int(row.get("buyers_unique") or 0)
     liq = row.get("liquidity_usd")
     price_impact = None
     try:
@@ -932,13 +972,24 @@ def _jev_cluster_gate(
             safety_line = str(summary)[:220]
     except Exception:  # noqa: BLE001 — summary is decoration, not load-bearing
         pass
-    card = SimpleNamespace(
-        summary=lambda: (
-            f"cluster candidate {symbol} ({mint[:8]}): {n_buyers} unique "
+    if strategy == "snipe":
+        evidence = (
+            f"snipe candidate {symbol} ({mint[:8]}): lift "
+            f"{row.get('lift_pct')}% over curve in {row.get('age_sec')}s, "
+            f"{n_buyers} unique buyers "
+            f"(buys {row.get('buys')}/sells {row.get('sells')}), real SOL "
+            f"{row.get('real_sol')} (peak {row.get('peak_real_sol')}), size "
+            f"${row.get('size_usd')}. Safety: {safety_line}"
+        )
+    else:
+        evidence = (
+            f"{strategy} candidate {symbol} ({mint[:8]}): {n_buyers} unique "
             f"buyers in {CLUSTER_WINDOW_SEC:.0f}s, m5 {m5_pct}%, edge "
             f"{edge_pct}% after costs, liquidity ${liq}, age "
             f"{row.get('age_min')}m. Safety: {safety_line}"
-        ),
+        )
+    card = SimpleNamespace(
+        summary=lambda: evidence,
         action=SimpleNamespace(value="buy"),
         action_confidence=0.5,
         direction=SimpleNamespace(value="long"),
@@ -969,6 +1020,43 @@ def _jev_cluster_gate(
         _jev_blocked[mint] = now
         return False, f"jev_avoid: {review.get('reason', '')}"[:200]
     return True, f"jev_{review.get('action', 'hold')}"
+
+
+def _snipe_gated_open(row: dict[str, Any], *, _tape: Optional[dict[str, Any]], **kw: Any) -> dict[str, Any]:
+    """``open_fn`` for the labs snipe-lane path with safety + JEV gate.
+
+    The lane path calls ``open_fn`` directly (no Gate 0, no pre-gate), so
+    both live here: a ``check_token`` screen first (blocking verdicts
+    skip outright), then the shared entry gate with the report attached
+    so the chair judges real safety evidence, then the real ``_open``.
+    """
+    merged = {**row, **(_tape or {})}
+    mint = str(merged.get("mint") or "")
+    symbol = str(merged.get("symbol") or mint[:6])
+    try:
+        report = check_token(mint)
+    except Exception as exc:  # noqa: BLE001 — fail closed, like _gate0
+        reason = f"snipe_gate0_error: {exc}"[:200]
+        pipeline_log.emit(
+            "trenches", "skip", mint=mint, symbol=symbol,
+            reason=reason, strategy="snipe",
+        )
+        return {"status": "skipped", "reason": reason}
+    if report.blocking or report.verdict == SafetyVerdict.DANGER:
+        reason = f"snipe_gate0_{report.verdict.value if hasattr(report.verdict, 'value') else report.verdict}"
+        pipeline_log.emit(
+            "trenches", "skip", mint=mint, symbol=symbol,
+            reason=reason, strategy="snipe",
+        )
+        return {"status": "skipped", "reason": reason}
+    ok, why = _jev_cluster_gate(merged, [], None, report, strategy="snipe")
+    if not ok:
+        pipeline_log.emit(
+            "trenches", "skip", mint=merged.get("mint"), symbol=merged.get("symbol"),
+            reason=why, strategy="snipe",
+        )
+        return {"status": "skipped", "reason": why}
+    return _open(merged, **kw)
 
 
 def _open(
