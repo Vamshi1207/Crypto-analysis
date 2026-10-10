@@ -1,0 +1,8 @@
+# Optional zero-shot forecast backends (large: pulls PyTorch + model weights).
+# Install inside the container when you want TimesFM / Chronos in the ensemble:
+#   pip install -r requirements-forecast.txt
+#
+# Until then, /decide uses the statistical backend + conformal residuals.
+torch
+chronos-forecasting
+timesfm[torch]

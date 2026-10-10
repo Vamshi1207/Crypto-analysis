@@ -9,3 +9,16 @@ extension/.ipynb_checkpoints/
 python_server/.DS_Store
 python_server/.Trash-0/
 .continue/
+
+# Secrets and credentials. Tunables are tracked in .env.settings.
+.env
+.env.*
+!.env.example
+!.env.settings
+.gemini/
+
+# Decision engine runtime data
+python_server/data/**
+!python_server/data/.gitkeep
+python_server/store/**
+!python_server/store/.gitkeep
