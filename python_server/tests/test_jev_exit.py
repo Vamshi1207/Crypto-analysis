@@ -99,3 +99,25 @@ def test_monitor_off_makes_no_chair_call(monkeypatch):
     paper.reset()
     paper._state.open.append(_lot())
     assert paper.mark_and_maybe_exit(address="Pool9", mark_price=0.99) == []
+
+
+def test_monitor_reviews_early_on_adverse_slide(monkeypatch):
+    from decision import jev as jev_mod
+
+    _quiet(monkeypatch)
+    calls = []
+    monkeypatch.setattr(
+        jev_mod,
+        "exit_review",
+        lambda s: calls.append(s) or {"exit": False, "p": 0.1, "latency_ms": 5, "model": "t"},
+    )
+    paper.reset()
+    paper._state.open.append(_lot())
+    assert paper.mark_and_maybe_exit(address="Pool9", mark_price=0.99) == []
+    assert len(calls) == 1
+    # Small drift: wait for the recheck window.
+    assert paper.mark_and_maybe_exit(address="Pool9", mark_price=0.985) == []
+    assert len(calls) == 1
+    # $2+ slide since the last review: judged at this mark, not next minute.
+    assert paper.mark_and_maybe_exit(address="Pool9", mark_price=0.90) == []
+    assert len(calls) == 2

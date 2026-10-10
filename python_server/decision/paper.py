@@ -72,12 +72,15 @@ MAX_OPEN_LOTS_PER_ADDRESS = _env_int("PAPER_MAX_OPEN_LOTS_PER_ADDRESS", 2)
 BLOCK_ADD_ON_IF_OPEN_LOSING = os.getenv("PAPER_BLOCK_ADD_ON_IF_OPEN_LOSING", "1").strip() == "1"
 BLOCK_REPEAT_MINT_AFTER_STOP = os.getenv("PAPER_BLOCK_REPEAT_MINT_AFTER_STOP", "1").strip() == "1"
 # JEV exit monitor on open lots (0 = off; stops/trails own exits alone).
-# The chair may force-exit a loser early; each lot is re-asked at most
-# every JEV_EXIT_RECHECK_SEC once held past JEV_EXIT_MIN_HOLD_SEC.
+# The chair may force-exit a loser early. Each lot is re-asked at most
+# every JEV_EXIT_RECHECK_SEC once held past JEV_EXIT_MIN_HOLD_SEC — plus
+# immediately when pnl slides JEV_EXIT_PNL_DROP_USD since the last review,
+# so rugs get judged at the next mark instead of the next minute.
 JEV_EXIT_MONITOR = os.getenv("JEV_EXIT_MONITOR", "1").strip() == "1"
 JEV_EXIT_RECHECK_SEC = _env_float("JEV_EXIT_RECHECK_SEC", 60.0)
 JEV_EXIT_MIN_HOLD_SEC = _env_float("JEV_EXIT_MIN_HOLD_SEC", 10.0)
-_jev_exit_checked: dict[str, float] = {}
+JEV_EXIT_PNL_DROP_USD = _env_float("JEV_EXIT_PNL_DROP_USD", 2.0)
+_jev_exit_checked: dict[str, tuple[float, float]] = {}
 
 
 @dataclass
@@ -1552,10 +1555,12 @@ def _maybe_jev_exit(address: str, mark_price: float, now: float) -> list[dict[st
         held = now - opened if opened else 0.0
         if held < JEV_EXIT_MIN_HOLD_SEC:
             continue
-        last = _jev_exit_checked.get(pos.id, 0.0)
-        if now - last < JEV_EXIT_RECHECK_SEC:
+        pnl_now = float(getattr(pos, "last_mark_pnl_usd", 0.0) or 0.0)
+        last_ts, last_pnl = _jev_exit_checked.get(pos.id, (0.0, pnl_now))
+        slide = last_pnl - pnl_now
+        if now - last_ts < JEV_EXIT_RECHECK_SEC and slide < JEV_EXIT_PNL_DROP_USD:
             continue
-        _jev_exit_checked[pos.id] = now
+        _jev_exit_checked[pos.id] = (now, pnl_now)
         try:
             review = jev_mod.exit_review(_exit_state(pos, mark_price, held))
         except Exception:  # noqa: BLE001 — never break the mark loop

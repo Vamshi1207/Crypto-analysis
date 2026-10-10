@@ -115,6 +115,59 @@ def test_parse_missing_veto_answers_is_unsure():
     assert v.veto_prob == pytest.approx(0.5)
 
 
+def _state_card(packet):
+    from types import SimpleNamespace
+
+    card = SimpleNamespace(
+        summary=lambda: "test card",
+        action=SimpleNamespace(value="buy"),
+        action_confidence=0.6,
+        direction=SimpleNamespace(value="up"),
+        cost_adjusted_edge_pct=0.4,
+        expected_return_pct=None,
+        forecast=None,
+        timeframe="1",
+        token={"address": "M", "name": "T"},
+        notes={},
+    )
+    return jev.build_state(card, packet, [])
+
+
+def test_build_state_adds_indicator_buckets():
+    from types import SimpleNamespace
+
+    packet = SimpleNamespace(
+        market=None,
+        safety=None,
+        orderflow={},
+        timeframes={
+            "1": SimpleNamespace(
+                indicators={
+                    "rsi": 75.0,
+                    "macd_hist": 0.02,
+                    "plus_di": 30.0,
+                    "minus_di": 10.0,
+                    "adx": 30.0,
+                }
+            )
+        },
+    )
+    state = _state_card(packet)
+    ind = state["indicators"]
+    assert ind is not None
+    assert ind["score"] > 0.5
+    assert ind["rsi"] == "overbought"
+    assert ind["macd"] == "positive"
+    assert ind["trend"] == "up-strong"
+
+
+def test_build_state_no_indicators_when_snapshot_missing():
+    from types import SimpleNamespace
+
+    packet = SimpleNamespace(market=None, safety=None, orderflow={}, timeframes={})
+    assert _state_card(packet)["indicators"] is None
+
+
 def test_parse_score_normalizes_wide_scale():
     """A 3-step score may return 0..2 — normalize to 0..1."""
     payload = {"answers": {"quality": {"score": 1.6}}}
