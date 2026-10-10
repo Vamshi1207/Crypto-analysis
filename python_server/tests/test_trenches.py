@@ -4,10 +4,18 @@ from __future__ import annotations
 
 import time
 
+import pytest
+
 from decision import paper
 from decision import snipe_feed
 from decision import trenches
 from decision.config import WRAPPED_SOL_MINT
+
+
+@pytest.fixture(autouse=True)
+def _no_onchain_curve(monkeypatch):
+    """Unit tests never hit Helius RPC; exact-path tests stub per case."""
+    monkeypatch.setattr(trenches, "_curve_state", lambda mint: None)
 
 
 def test_parse_swaps_counts_wallet_buy_and_sell():
@@ -753,3 +761,59 @@ def test_copy_skips_without_leaders(monkeypatch):
     monkeypatch.setattr(trenches, "COPY_MIN_LEADERS", 1)
     monkeypatch.setattr(trenches, "_buys", {})
     assert trenches._copy_leaders("M1") == []
+
+
+def test_toxic_flow_needs_sample_and_supermajority(monkeypatch):
+    monkeypatch.setattr(trenches, "TOX_MIN_SWAPS", 6)
+    monkeypatch.setattr(trenches, "TOX_MAX_SELL_FRAC", 0.6)
+    assert trenches.toxic_flow(1, 4) == (False, "")
+    assert trenches.toxic_flow(2, 8)[0] is True
+    assert trenches.toxic_flow(8, 2)[0] is False
+
+
+def test_flow_toxicity_counts_sides(monkeypatch):
+    now = time.time()
+    evs = (
+        [{"side": "buy", "mint": "M", "wallet": f"b{i}", "ts": now - 5} for i in range(8)]
+        + [{"side": "sell", "mint": "M", "wallet": "s1", "ts": now - 5} for _ in range(2)]
+    )
+    monkeypatch.setattr(trenches, "_mint_swaps", lambda mint: evs)
+    tox = trenches.flow_toxicity("M", window_s=120.0)
+    assert tox["swaps"] == 10 and tox["sells"] == 2
+    assert tox["toxic"] is False
+
+
+def test_open_refuses_completed_curve(monkeypatch, tmp_path):
+    from decision import store as decision_store
+
+    monkeypatch.setattr(decision_store, "STORE_DIR", tmp_path / "store")
+    paper.reset(starting_cash_usd=1000.0)
+    monkeypatch.setattr(
+        trenches, "_curve_state",
+        lambda mint: {"complete": True, "sol_quoted": True, "v_tok": 0,
+                      "v_sol": 0, "real_tok": 0, "real_sol": 0},
+    )
+    out = trenches._open(
+        dict(_cluster_row()), strategy="cluster", size=40.0, hold=300.0,
+        confirm_dex=False,
+    )
+    assert out["status"] == "skipped"
+    assert out["reason"] == "curve_complete"
+
+
+def test_open_uses_exact_impact(monkeypatch, tmp_path):
+    from decision import store as decision_store
+
+    monkeypatch.setattr(decision_store, "STORE_DIR", tmp_path / "store")
+    paper.reset(starting_cash_usd=1000.0)
+    monkeypatch.setattr(
+        trenches, "_curve_state",
+        lambda mint: {"complete": False, "sol_quoted": True,
+                      "v_tok": 1.073e15, "v_sol": 30e9,
+                      "real_tok": 793.1e12, "real_sol": 0.0},
+    )
+    out = trenches._open(
+        dict(_cluster_row()), strategy="cluster", size=40.0, hold=300.0,
+        confirm_dex=False,
+    )
+    assert out["status"] in ("opened", "pending")

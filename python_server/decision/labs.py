@@ -261,6 +261,9 @@ def consider_snipe(
         "seen_at": watch.get("seen_at"),
         "source": "pump_create",
         "creator": watch.get("creator"),
+        "buyers_unique": unique,
+        "buys": buys,
+        "sells": sells,
     }
     with paper.use_lane(lane.id):
         result = open_fn(

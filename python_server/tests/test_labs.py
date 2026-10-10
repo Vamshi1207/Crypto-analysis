@@ -4,10 +4,17 @@ from __future__ import annotations
 
 import time
 
+import pytest
+
 from decision import labs
 from decision import paper
 from decision import snipe_feed
 from decision import trenches
+
+
+@pytest.fixture(autouse=True)
+def _no_onchain_curve(monkeypatch):
+    monkeypatch.setattr(trenches, "_curve_state", lambda mint: None)
 
 
 def test_primary_lane_is_the_hold_book_when_idle(monkeypatch):

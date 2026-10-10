@@ -97,6 +97,33 @@ COPY_STOP_USD = _env_float("COPY_STOP_USD", 1.60)
 PUMP_CURVE_GUARD = os.getenv("PUMP_CURVE_GUARD", "1").strip() == "1"
 PUMP_CURVE_MAX_IMPACT_PCT = _env_float("PUMP_CURVE_MAX_IMPACT_PCT", 10.0)
 PUMP_CURVE_MAX_LIQ_FRAC = _env_float("PUMP_CURVE_MAX_LIQ_FRAC", 0.05)
+# Exact on-chain curve reads (Helius getAccountInfo, cached). When a
+# curve account resolves, its real reserves replace the Dex-anchored
+# estimates and completed curves refuse outright. 0 = estimates only.
+ONCHAIN_CURVE = os.getenv("ONCHAIN_CURVE", "1").strip() == "1"
+CURVE_CACHE_SEC = _env_float("CURVE_CACHE_SEC", 300.0)
+_curve_cache: dict[str, tuple[float, Optional[dict[str, Any]]]] = {}
+
+
+def _curve_state(mint: str) -> Optional[dict[str, Any]]:
+    """Exact on-chain curve state, cached; None when unresolvable."""
+    if not ONCHAIN_CURVE:
+        return None
+    mint = (mint or "").strip()
+    if not mint:
+        return None
+    now = time.time()
+    hit = _curve_cache.get(mint)
+    if hit and now - hit[0] < CURVE_CACHE_SEC:
+        return hit[1]
+    try:
+        from decision import pump_onchain
+
+        curve = pump_onchain.fetch_curve(mint)
+    except Exception:  # noqa: BLE001
+        curve = None
+    _curve_cache[mint] = (now, curve)
+    return curve
 # JEV chair gate on trenches opens (0 = off, today's behavior, per
 # strategy). Veto or avoid from the chair blocks the open; hold/buy (or
 # an offline chair) proceeds. Blocks are remembered per mint so a
@@ -208,6 +235,8 @@ def reset_counters() -> dict[str, Any]:
         _state.last_hits = []
         _seen_mints.clear()
         _jev_blocked.clear()
+        _swaps_cache.clear()
+        _curve_cache.clear()
         _snipe_marks.clear()
         _watches.clear()
         _buys.clear()
@@ -454,9 +483,20 @@ def _scan(*, do_cluster: bool = True) -> dict[str, Any]:
                 continue
         dead = CLUSTER_DEAD_SEC if is_cluster and CLUSTER_DEAD_SEC > 0 else None
         stop_usd = CLUSTER_STOP_USD if is_cluster and CLUSTER_STOP_USD > 0 else None
+        flow = flow_toxicity(mint, window_s=CLUSTER_WINDOW_SEC)
+        if TOXICITY_GATE and flow["toxic"]:
+            skipped += 1
+            pipeline_log.emit(
+                "trenches",
+                "skip",
+                mint=mint,
+                symbol=row.get("symbol"),
+                reason=flow["reason"],
+            )
+            continue
         if is_cluster or strategy == "launch":
             proceed, jev_reason = _jev_cluster_gate(
-                row, buyers, m5_pct, safety_report, strategy=strategy
+                row, buyers, m5_pct, safety_report, strategy=strategy, flow=flow
             )
             if not proceed:
                 skipped += 1
@@ -531,8 +571,17 @@ def _scan(*, do_cluster: bool = True) -> dict[str, Any]:
                         reason=why_m5, m5_pct=m5_pct, strategy="copy",
                     )
                     continue
+            copy_flow = flow_toxicity(mint, window_s=COPY_WINDOW_SEC)
+            if TOXICITY_GATE and copy_flow["toxic"]:
+                skipped += 1
+                pipeline_log.emit(
+                    "trenches", "skip", mint=mint, symbol=row.get("symbol"),
+                    reason=copy_flow["reason"], strategy="copy",
+                )
+                continue
             proceed, jev_reason = _jev_cluster_gate(
-                row, [], m5_pct, safety_report, strategy="copy"
+                row, [], m5_pct, safety_report, strategy="copy",
+                flow=copy_flow,
             )
             if not proceed:
                 skipped += 1
@@ -791,7 +840,18 @@ def _scan_sniper() -> tuple[int, int, int, int, list[dict[str, Any]]]:
             "lift_pct": round(lift, 2),
             "size_usd": size,
         }
-        proceed, jev_reason = _jev_cluster_gate(row, [], None, None, strategy="snipe")
+        snipe_toxic, snipe_why = toxic_flow(buys, sells)
+        if TOXICITY_GATE and snipe_toxic:
+            skipped += 1
+            pipeline_log.emit(
+                "trenches", "skip", mint=mint, symbol=row.get("symbol"),
+                reason=snipe_why, strategy="snipe",
+            )
+            continue
+        proceed, jev_reason = _jev_cluster_gate(
+            row, [], None, None, strategy="snipe",
+            flow={"buys": buys, "sells": sells},
+        )
         if not proceed:
             skipped += 1
             pipeline_log.emit(
@@ -956,11 +1016,7 @@ def unique_buyers_recent(mint: str, *, window_s: float) -> list[str]:
         }
     if not SETTINGS.helius_api_keys:
         return list(existing)
-    try:
-        txs = fetch_helius_transactions(mint, limit=20)
-    except SourceError:
-        return list(existing)
-    for ev in parse_swaps(txs):
+    for ev in _mint_swaps(mint):
         if ev["side"] != "buy" or ev["mint"] != mint:
             continue
         if ev["ts"] < cutoff:
@@ -969,6 +1025,73 @@ def unique_buyers_recent(mint: str, *, window_s: float) -> list[str]:
     with _lock:
         _buys.setdefault(mint, {}).update(existing)
     return list(existing)
+
+
+_swaps_cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
+SWAPS_CACHE_SEC = _env_float("SWAPS_CACHE_SEC", 30.0)
+
+# Order-flow toxicity (VPIN-lite): distribution shows up as sell flow
+# before the price does. Both sides come from the same cached fetch the
+# buyer screen already pays for, so this adds no Helius cost.
+TOXICITY_GATE = os.getenv("TOXICITY_GATE", "1").strip() == "1"
+TOX_MAX_SELL_FRAC = _env_float("TOX_MAX_SELL_FRAC", 0.6)
+TOX_MIN_SWAPS = _env_int("TOX_MIN_SWAPS", 6)
+
+
+def _mint_swaps(mint: str) -> list[dict[str, Any]]:
+    """Recent swap events for a mint (both sides), cached to bound cost."""
+    now = time.time()
+    hit = _swaps_cache.get(mint)
+    if hit and now - hit[0] < SWAPS_CACHE_SEC:
+        return hit[1]
+    events: list[dict[str, Any]] = []
+    if SETTINGS.helius_api_keys:
+        try:
+            txs = fetch_helius_transactions(mint, limit=20)
+            events = [ev for ev in parse_swaps(txs) if ev["mint"] == mint]
+        except SourceError:
+            events = []
+    _swaps_cache[mint] = (now, events)
+    return events
+
+
+def toxic_flow(buys: int, sells: int) -> tuple[bool, str]:
+    """True when sell flow dominates a sufficiently large sample."""
+    n = (buys or 0) + (sells or 0)
+    if n < TOX_MIN_SWAPS:
+        return False, ""
+    frac = sells / n
+    if frac >= TOX_MAX_SELL_FRAC:
+        return True, f"toxic_flow sells {frac:.0%} ({sells}/{n})"
+    return False, ""
+
+
+def flow_toxicity(mint: str, *, window_s: float) -> dict[str, Any]:
+    """Sell-side distribution stats for a mint over the window."""
+    now = time.time()
+    cutoff = now - window_s
+    buys = sells = 0
+    sellers: dict[str, int] = {}
+    for ev in _mint_swaps(mint):
+        if ev["ts"] < cutoff:
+            continue
+        if ev["side"] == "buy":
+            buys += 1
+        elif ev["side"] == "sell":
+            sells += 1
+            sellers[ev["wallet"]] = sellers.get(ev["wallet"], 0) + 1
+    toxic, reason = toxic_flow(buys, sells)
+    top_share = (max(sellers.values()) / sells) if sells else 0.0
+    return {
+        "buys": buys,
+        "sells": sells,
+        "swaps": buys + sells,
+        "sell_frac": round(sells / (buys + sells), 3) if (buys + sells) else 0.0,
+        "sellers": len(sellers),
+        "top_seller_share": round(top_share, 3),
+        "toxic": toxic,
+        "reason": reason,
+    }
 
 
 def cluster_score(buyers_by_wallet: dict[str, float], *, now: Optional[float] = None) -> int:
@@ -1053,6 +1176,7 @@ def _jev_cluster_gate(
     safety_report: Optional[Any] = None,
     *,
     strategy: str = "cluster",
+    flow: Optional[dict[str, Any]] = None,
 ) -> tuple[bool, str]:
     """Ask the JEV chair before a trenches open. Returns (proceed, reason).
 
@@ -1083,6 +1207,8 @@ def _jev_cluster_gate(
     except Exception:  # noqa: BLE001 — chair unavailable, trade as before
         return True, "jev_unavailable"
     n_buyers = len(buyers) if buyers else int(row.get("buyers_unique") or 0)
+    flow = flow or {}
+    n_sells = int(flow.get("sells") or row.get("sells") or 0)
     liq = row.get("liquidity_usd")
     price_impact = None
     try:
@@ -1110,16 +1236,16 @@ def _jev_cluster_gate(
             f"snipe candidate {symbol} ({mint[:8]}): lift "
             f"{row.get('lift_pct')}% over curve in {row.get('age_sec')}s, "
             f"{n_buyers} unique buyers "
-            f"(buys {row.get('buys')}/sells {row.get('sells')}), real SOL "
+            f"(buys {row.get('buys')}/sells {n_sells}), real SOL "
             f"{row.get('real_sol')} (peak {row.get('peak_real_sol')}), size "
             f"${row.get('size_usd')}. Safety: {safety_line}"
         )
     else:
         evidence = (
             f"{strategy} candidate {symbol} ({mint[:8]}): {n_buyers} unique "
-            f"buyers in {CLUSTER_WINDOW_SEC:.0f}s, m5 {m5_pct}%, edge "
-            f"{edge_pct}% after costs, liquidity ${liq}, age "
-            f"{row.get('age_min')}m. Safety: {safety_line}"
+            f"buyers / {n_sells} sellers in {CLUSTER_WINDOW_SEC:.0f}s, m5 "
+            f"{m5_pct}%, edge {edge_pct}% after costs, liquidity ${liq}, "
+            f"age {row.get('age_min')}m. Safety: {safety_line}"
         )
     card = SimpleNamespace(
         summary=lambda: evidence,
@@ -1137,7 +1263,7 @@ def _jev_cluster_gate(
     packet = SimpleNamespace(
         market=SimpleNamespace(liquidity_usd_total=liq, liquidity_usd=liq),
         safety=safety_report,
-        orderflow={"buys_5m": n_buyers, "source": "cluster"},
+        orderflow={"buys_5m": n_buyers, "sells_5m": n_sells, "source": strategy},
     )
     try:
         review = jev_mod.chair_review(card, packet, [])
@@ -1182,6 +1308,18 @@ def _snipe_gated_open(row: dict[str, Any], *, _tape: Optional[dict[str, Any]], *
             reason=reason, strategy="snipe",
         )
         return {"status": "skipped", "reason": reason}
+    try:
+        lane_toxic, lane_why = toxic_flow(
+            int(merged.get("buys") or 0), int(merged.get("sells") or 0)
+        )
+    except (TypeError, ValueError):
+        lane_toxic, lane_why = False, ""
+    if TOXICITY_GATE and lane_toxic:
+        pipeline_log.emit(
+            "trenches", "skip", mint=mint, symbol=symbol,
+            reason=lane_why, strategy="snipe",
+        )
+        return {"status": "skipped", "reason": lane_why}
     ok, why = _jev_cluster_gate(merged, [], None, report, strategy="snipe")
     if not ok:
         pipeline_log.emit(
@@ -1223,16 +1361,37 @@ def _open(
     if PUMP_CURVE_GUARD and strategy in ("cluster", "launch", "snipe", "copy"):
         from decision import pump_curve
 
-        curve_ok, curve_why, _ = pump_curve.guard_buy(
-            size_usd=size,
-            price_usd=price,
-            liquidity_usd=row.get("liquidity_usd"),
-            sol_usd=_sol_usd(),
-            max_impact_pct=PUMP_CURVE_MAX_IMPACT_PCT,
-            max_liq_frac=PUMP_CURVE_MAX_LIQ_FRAC,
-        )
-        if not curve_ok:
-            return {"status": "skipped", "reason": curve_why}
+        sol = _sol_usd()
+        exact = _curve_state(row["mint"])
+        if exact is not None and exact.get("sol_quoted"):
+            if exact.get("complete"):
+                return {"status": "skipped", "reason": "curve_complete"}
+            sol_in = size / sol if sol > 0 else 0.0
+            real_sol = float(exact.get("real_sol") or 0.0)
+            if real_sol > 0 and sol_in > 0.5 * real_sol:
+                return {"status": "skipped", "reason": "curve_thin_exact"}
+            impact = pump_curve.buy_impact_pct(
+                sol_in,
+                float(exact.get("v_tok") or 0.0),
+                float(exact.get("v_sol") or 0.0),
+                float(exact.get("real_tok") or 0.0),
+            )
+            if impact is not None and impact > PUMP_CURVE_MAX_IMPACT_PCT:
+                return {
+                    "status": "skipped",
+                    "reason": f"curve_impact_exact {impact:.1f}%>{PUMP_CURVE_MAX_IMPACT_PCT:g}%",
+                }
+        else:
+            curve_ok, curve_why, _ = pump_curve.guard_buy(
+                size_usd=size,
+                price_usd=price,
+                liquidity_usd=row.get("liquidity_usd"),
+                sol_usd=sol,
+                max_impact_pct=PUMP_CURVE_MAX_IMPACT_PCT,
+                max_liq_frac=PUMP_CURVE_MAX_LIQ_FRAC,
+            )
+            if not curve_ok:
+                return {"status": "skipped", "reason": curve_why}
     result = paper.execute_signal(
         address=row["pool"],
         mint=row["mint"],
