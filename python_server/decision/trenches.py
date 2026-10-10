@@ -79,14 +79,27 @@ CLUSTER_MIN_M5_PCT = _env_float("CLUSTER_MIN_M5_PCT", 0.0)
 # closes: m5>150% entries averaged -$16.4/trade (instant rugs); the edge
 # estimate (m5 minus costs) otherwise reads parabolas as attractive.
 CLUSTER_MAX_M5_PCT = _env_float("CLUSTER_MAX_M5_PCT", 150.0)
-# JEV chair gate on trenches opens (0 = off, today's behavior). Veto or
-# avoid from the chair blocks the open; hold/buy (or an offline chair)
-# proceeds. Blocks are remembered per mint so a rejected name is not
-# re-asked every tick. Arb fills stay out by design: a 250ms judgment
-# call would cost more than it saves in a millisecond quote race.
+# Copy-trading pilot: mirror tracked-leader buys as their own lane.
+# Leaders are watched wallets (CLUSTER_WALLETS); their sells already
+# mirror-close our lots. Entries need COPY_MIN_LEADERS distinct leaders
+# buying the mint inside COPY_WINDOW_SEC, then pass the same screens
+# (Gate 0, m5 bounds, JEV chair) as cluster opens.
+COPY_ENABLED = os.getenv("COPY_ENABLED", "1").strip() == "1"
+COPY_MIN_LEADERS = _env_int("COPY_MIN_LEADERS", 1)
+COPY_WINDOW_SEC = _env_float("COPY_WINDOW_SEC", 120.0)
+COPY_SIZE_USD = _env_float("COPY_SIZE_USD", 40.0)
+COPY_MAX_HOLD_SEC = _env_float("COPY_MAX_HOLD_SEC", 300.0)
+COPY_DEAD_SEC = _env_float("COPY_DEAD_SEC", 90.0)
+COPY_STOP_USD = _env_float("COPY_STOP_USD", 1.60)
+# JEV chair gate on trenches opens (0 = off, today's behavior per
+# strategy). Veto or avoid from the chair blocks the open; hold/buy (or
+# an offline chair) proceeds. Blocks are remembered per mint so a
+# rejected name is not re-asked every tick. Arb fills stay out (their
+# own veto-only gate): computed edge is never second-guessed there.
 JEV_CLUSTER_GATE = os.getenv("JEV_CLUSTER_GATE", "1").strip() == "1"
 JEV_LAUNCH_GATE = os.getenv("JEV_LAUNCH_GATE", "1").strip() == "1"
 JEV_SNIPER_GATE = os.getenv("JEV_SNIPER_GATE", "1").strip() == "1"
+JEV_COPY_GATE = os.getenv("JEV_COPY_GATE", "1").strip() == "1"
 JEV_CLUSTER_RECHECK_SEC = _env_float("JEV_CLUSTER_RECHECK_SEC", 300.0)
 
 
@@ -95,6 +108,7 @@ def _strategy_gate_on(strategy: str) -> bool:
         "cluster": JEV_CLUSTER_GATE,
         "launch": JEV_LAUNCH_GATE,
         "snipe": JEV_SNIPER_GATE,
+        "copy": JEV_COPY_GATE,
     }.get(strategy or "", False)
 _jev_blocked: dict[str, float] = {}
 MAX_PER_TICK = _env_int("TRENCHES_MAX_PER_TICK", 2)
@@ -139,6 +153,8 @@ class TrenchState:
     cluster_fires: int = 0
     cluster_opens: int = 0
     cluster_exits: int = 0
+    copy_fires: int = 0
+    copy_opens: int = 0
     sniper_seen: int = 0
     sniper_opens: int = 0
     sniper_expired: int = 0
@@ -177,12 +193,15 @@ def reset_counters() -> dict[str, Any]:
         _state.cluster_fires = 0
         _state.cluster_opens = 0
         _state.cluster_exits = 0
+        _state.copy_fires = 0
+        _state.copy_opens = 0
         _state.sniper_seen = 0
         _state.sniper_opens = 0
         _state.sniper_expired = 0
         _state.skipped = 0
         _state.last_hits = []
         _seen_mints.clear()
+        _jev_blocked.clear()
         _snipe_marks.clear()
         _watches.clear()
         _buys.clear()
@@ -210,6 +229,8 @@ def status() -> dict[str, Any]:
             "cluster_fires": _state.cluster_fires,
             "cluster_opens": _state.cluster_opens,
             "cluster_exits": _state.cluster_exits,
+            "copy_fires": _state.copy_fires,
+            "copy_opens": _state.copy_opens,
             "sniper_seen": _state.sniper_seen,
             "sniper_opens": _state.sniper_opens,
             "sniper_expired": _state.sniper_expired,
@@ -305,6 +326,8 @@ def scan_once(*, do_cluster: bool = True) -> dict[str, Any]:
                 _state.cluster_fires += int(result.get("cluster_fires") or 0)
                 _state.cluster_opens += int(result.get("cluster_opens") or 0)
                 _state.cluster_exits += int(result.get("cluster_exits") or 0)
+                _state.copy_fires += int(result.get("copy_fires") or 0)
+                _state.copy_opens += int(result.get("copy_opens") or 0)
                 _state.sniper_seen += int(result.get("sniper_seen") or 0)
                 _state.sniper_opens += int(result.get("sniper_opens") or 0)
                 _state.sniper_expired += int(result.get("sniper_expired") or 0)
@@ -317,7 +340,8 @@ def scan_once(*, do_cluster: bool = True) -> dict[str, Any]:
                 duration_ms=pipeline_log.timed_ms(started),
                 **{k: result.get(k) for k in (
                     "launch_seen", "launch_opens", "cluster_fires",
-                    "cluster_opens", "cluster_exits",
+                    "cluster_opens", "cluster_exits", "copy_fires",
+                    "copy_opens",
                     "sniper_seen", "sniper_opens", "sniper_expired", "skipped",
                 )},
             )
@@ -468,6 +492,77 @@ def _scan(*, do_cluster: bool = True) -> dict[str, Any]:
             skipped += 1
 
     _mark_open_lots()
+    copy_fires = 0
+    copy_opens = 0
+    if COPY_ENABLED:
+        for row in candidates:
+            if opened_this_tick >= MAX_PER_TICK:
+                break
+            mint = row["mint"]
+            if mint in _seen_mints:
+                continue
+            leaders = _copy_leaders(mint)
+            if len(leaders) < COPY_MIN_LEADERS:
+                continue
+            copy_fires += 1
+            ok, reason, safety_report = _gate0(mint)
+            if not ok:
+                skipped += 1
+                _seen_mints.add(mint)
+                pipeline_log.emit(
+                    "trenches", "skip", mint=mint, symbol=row.get("symbol"),
+                    reason=reason, strategy="copy",
+                )
+                continue
+            m5_pct = None
+            if CLUSTER_MIN_M5_PCT > 0 or CLUSTER_MAX_M5_PCT > 0:
+                m5_pct = dex_m5_pct(mint, pool=row.get("pool"))
+                ok_m5, why_m5 = _m5_ok(m5_pct)
+                if not ok_m5:
+                    skipped += 1
+                    pipeline_log.emit(
+                        "trenches", "skip", mint=mint, symbol=row.get("symbol"),
+                        reason=why_m5, m5_pct=m5_pct, strategy="copy",
+                    )
+                    continue
+            proceed, jev_reason = _jev_cluster_gate(
+                row, [], m5_pct, safety_report, strategy="copy"
+            )
+            if not proceed:
+                skipped += 1
+                pipeline_log.emit(
+                    "trenches", "skip", mint=mint, symbol=row.get("symbol"),
+                    reason=jev_reason, strategy="copy",
+                )
+                continue
+            dead = COPY_DEAD_SEC if COPY_DEAD_SEC > 0 else None
+            stop_usd = COPY_STOP_USD if COPY_STOP_USD > 0 else None
+            with paper.use_lane(labs.trading_lane("copy")):
+                result = _open(
+                    row,
+                    strategy="copy",
+                    size=COPY_SIZE_USD,
+                    hold=COPY_MAX_HOLD_SEC,
+                    extra={"leaders": leaders, "m5_pct": m5_pct},
+                    dead_after_sec=dead,
+                    stop_loss_usd=stop_usd,
+                )
+            if result.get("status") in {"opened", "pending"}:
+                _seen_mints.add(mint)
+                opened_this_tick += 1
+                copy_opens += 1
+                hits.append(
+                    {
+                        **row,
+                        "strategy": "copy",
+                        "leaders": len(leaders),
+                        "m5_pct": m5_pct,
+                        "status": result.get("status"),
+                    }
+                )
+            else:
+                skipped += 1
+    _mark_open_lots()
     return {
         "status": "ok",
         "launch_seen": launch_seen,
@@ -475,6 +570,8 @@ def _scan(*, do_cluster: bool = True) -> dict[str, Any]:
         "cluster_fires": cluster_fires,
         "cluster_opens": cluster_opens,
         "cluster_exits": cluster_exits,
+        "copy_fires": copy_fires,
+        "copy_opens": copy_opens,
         "sniper_seen": sniper_seen,
         "sniper_opens": sniper_opens,
         "sniper_expired": sniper_expired,
@@ -901,6 +998,16 @@ def _process_watchlist_and_exits() -> int:
                     )
                     exits += len(closed)
     return exits
+
+
+def _copy_leaders(mint: str, *, now: Optional[float] = None) -> list[str]:
+    """Tracked wallets that bought this mint inside the copy window."""
+    if not COPY_ENABLED:
+        return []
+    now = now if now is not None else time.time()
+    cutoff = now - COPY_WINDOW_SEC
+    with _lock:
+        return [w for w, ts in _buys.get(mint, {}).items() if ts >= cutoff]
 
 
 def _buyers_ok(n: int) -> bool:

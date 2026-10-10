@@ -145,6 +145,7 @@ def test_reentry_is_blocked_during_cooldown(monkeypatch):
 def test_cooldown_expires(monkeypatch):
     """Same address becomes tradable again once the quiet period elapses."""
     monkeypatch.setattr(paper, "REENTRY_COOLDOWN_SEC", 120.0)
+    monkeypatch.setattr(paper, "SYMBOL_COOLDOWN_SEC", 0.0)
     paper.set_kill_switch(False)
     card = _card(address="ExpiryPool111")
     address = card.token["address"]

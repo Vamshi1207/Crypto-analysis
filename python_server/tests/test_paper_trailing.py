@@ -15,6 +15,7 @@ def trailing(monkeypatch):
     monkeypatch.setattr(paper, "TRAIL_ARM_USD", 1.0)
     monkeypatch.setattr(paper, "TRAIL_GIVEBACK_PCT", 0.5)
     monkeypatch.setattr(paper, "TRAIL_GIVEBACK_OF_PEAK", 0.35)
+    monkeypatch.setattr(paper, "TRAIL_PARTIAL_PCT", 0.0)
     return paper
 
 
@@ -413,3 +414,32 @@ def test_ghost_then_dump_closes_as_stop_not_trail(trailing, monkeypatch):
     assert closed
     assert "trail" not in (closed[0].get("close_reason") or "")
     paper.reset()
+
+
+def test_partial_banks_half_at_arm_and_trails_rest(monkeypatch):
+    monkeypatch.setattr(paper, "TRAIL_ENABLED", True)
+    monkeypatch.setattr(paper, "TRAIL_ARM_USD", 1.0)
+    monkeypatch.setattr(paper, "TRAIL_GIVEBACK_PCT", 0.5)
+    monkeypatch.setattr(paper, "TRAIL_GIVEBACK_OF_PEAK", 0.35)
+    monkeypatch.setattr(paper, "TRAIL_PARTIAL_PCT", 50.0)
+    monkeypatch.setattr(paper, "TRAIL_PARTIAL_AT_MULT", 1.0)
+    pos = _position()
+    out = paper._trail_exit(pos, 1.2, mark_price=1.021, exit_cost_frac=0.013)
+    assert out is None
+    assert pos.partial_taken is True
+    assert pos.qty == pytest.approx(75.0)
+    assert pos.size_usd == pytest.approx(75.0)
+    assert pos.peak_pnl_usd == pytest.approx(0.6)
+    assert len([f for f in pos.fills if f["side"] == "sell"]) == 1
+
+
+def test_partial_off_leaves_position_whole(monkeypatch):
+    monkeypatch.setattr(paper, "TRAIL_ENABLED", True)
+    monkeypatch.setattr(paper, "TRAIL_ARM_USD", 1.0)
+    monkeypatch.setattr(paper, "TRAIL_GIVEBACK_PCT", 0.5)
+    monkeypatch.setattr(paper, "TRAIL_GIVEBACK_OF_PEAK", 0.35)
+    monkeypatch.setattr(paper, "TRAIL_PARTIAL_PCT", 0.0)
+    pos = _position()
+    assert paper._trail_exit(pos, 1.2, mark_price=1.021, exit_cost_frac=0.013) is None
+    assert pos.partial_taken is False
+    assert pos.qty == pytest.approx(150.0)

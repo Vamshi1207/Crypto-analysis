@@ -71,6 +71,67 @@ ALLOW_ADD_ON = os.getenv("PAPER_ALLOW_ADD_ON", "1").strip() == "1"
 MAX_OPEN_LOTS_PER_ADDRESS = _env_int("PAPER_MAX_OPEN_LOTS_PER_ADDRESS", 2)
 BLOCK_ADD_ON_IF_OPEN_LOSING = os.getenv("PAPER_BLOCK_ADD_ON_IF_OPEN_LOSING", "1").strip() == "1"
 BLOCK_REPEAT_MINT_AFTER_STOP = os.getenv("PAPER_BLOCK_REPEAT_MINT_AFTER_STOP", "1").strip() == "1"
+# Partial scale-out at trail arm: bank PARTIAL_PCT of qty once the mark
+# first reaches PARTIAL_AT_MULT × arm, trail the rest. 0 = off (all-or-nothing).
+TRAIL_PARTIAL_PCT = _env_float("PAPER_TRAIL_PARTIAL_PCT", 0.0)
+TRAIL_PARTIAL_AT_MULT = _env_float("PAPER_TRAIL_PARTIAL_AT_MULT", 1.0)
+# Per-symbol cooldown after any close (copycat tickers re-list as fresh
+# mints, which the mint-level block cannot see). 0 = off.
+SYMBOL_COOLDOWN_SEC = _env_float("PAPER_SYMBOL_COOLDOWN_SEC", 0.0)
+_symbol_cooldown: dict[str, float] = {}
+# Ranked rotation at the open cap: a refused new entry may displace the
+# weakest losing open lot instead of waiting. 0 = off (refuse at cap).
+ROTATION_ENABLED = os.getenv("PAPER_ROTATION", "1").strip() == "1"
+
+
+def _symbol_cooldown_ok(name: Any) -> Optional[str]:
+    """Per-symbol re-entry block (copycat tickers re-list as fresh mints)."""
+    if SYMBOL_COOLDOWN_SEC <= 0:
+        return None
+    key = str(name or "").strip().lower()
+    if not key:
+        return None
+    remain = _symbol_cooldown.get(key, 0.0) - time.time()
+    if remain > 0:
+        return f"symbol_cooldown {remain:.0f}s"
+    return None
+
+
+def _note_symbol_close(name: Any) -> None:
+    if SYMBOL_COOLDOWN_SEC <= 0:
+        return
+    key = str(name or "").strip().lower()
+    if key:
+        _symbol_cooldown[key] = time.time() + SYMBOL_COOLDOWN_SEC
+
+
+def _rotation_displace() -> Optional[str]:
+    """Close the weakest losing open lot to free a cap slot.
+
+    Only displaces clear losers (past half the stop); flat/green lots are
+    never sacrificed for a new signal. Returns the displaced lot id.
+    """
+    if not ROTATION_ENABLED:
+        return None
+    cands = [
+        p for p in _state.open if p.status == "open" and p.pending_exit_at is None
+    ]
+    if not cands:
+        return None
+    weak = min(cands, key=lambda p: float(p.last_mark_pnl_usd or 0.0))
+    stop = float(weak.stop_loss_usd or 0.0)
+    if stop <= 0 or float(weak.last_mark_pnl_usd or 0.0) >= -0.5 * stop:
+        return None
+    exit_frac = (costs.EXIT_FEE_PCT + costs.EXIT_SLIP_PCT) / 100.0
+    if weak.qty <= 0:
+        return None
+    mark = (float(weak.last_mark_pnl_usd) + weak.size_usd * (1.0 + exit_frac)) / weak.qty
+    if mark <= 0:
+        return None
+    closed = mark_and_maybe_exit(
+        address=weak.address, mark_price=mark, force_reason="rotation_displace"
+    )
+    return weak.id if closed else None
 # JEV exit monitor on open lots (0 = off; stops/trails own exits alone).
 # The chair may force-exit a loser early. Each lot is re-asked at most
 # every JEV_EXIT_RECHECK_SEC once held past JEV_EXIT_MIN_HOLD_SEC — plus
@@ -115,6 +176,8 @@ class PaperPosition:
     peak_pnl_usd: float = 0.0
     trail_armed: bool = False
     last_mark_pnl_usd: float = 0.0
+    # Partial scale-out taken at arm (bank some, trail the rest).
+    partial_taken: bool = False
     entry_reason: Optional[str] = None
     max_hold_sec: Optional[float] = None
     # Sniper: $1 arms the trail on a live tape. Instant clip only if not situational.
@@ -149,7 +212,9 @@ class PortfolioState:
     live_trading_blocked: bool = True
 
 
-_lock = threading.Lock()
+# Re-entrant: rotation displacement closes via mark_and_maybe_exit while an
+# entry flow already holds it. Nothing here depends on non-reentrancy.
+_lock = threading.RLock()
 DEFAULT_LANE = "main"
 _active_lane: ContextVar[str] = ContextVar("paper_lane", default=DEFAULT_LANE)
 _books: dict[str, PortfolioState] = {}
@@ -341,6 +406,8 @@ def reset(*, starting_cash_usd: float = 1_000.0) -> dict[str, Any]:
             book = _new_book()
             book.cash_usd = cash
             _books[lid] = book
+        _symbol_cooldown.clear()
+        _jev_exit_checked.clear()
     exec_sim.reset()
     pipeline_log.emit(
         "paper",
@@ -568,6 +635,7 @@ def _book_close_locked(
     pos.closed_at = datetime.now(timezone.utc).isoformat()
     pos.close_reason = reason
     pos.pending_exit_at = None
+    _note_symbol_close(pos.name)
     pos.fills.append(
         asdict(
             PaperFill(
@@ -672,8 +740,13 @@ def execute_signal(
             return {"status": "skipped", "reason": "already open for address"}
         if len(already) >= MAX_OPEN_LOTS_PER_ADDRESS:
             return {"status": "skipped", "reason": f"max {MAX_OPEN_LOTS_PER_ADDRESS} lots"}
+        sym_block = _symbol_cooldown_ok(name)
+        if sym_block:
+            return {"status": "skipped", "reason": sym_block}
         if len(_state.open) >= MAX_OPEN_POSITIONS:
-            return {"status": "refused", "reason": "max open positions"}
+            _rotation_displace()
+            if len(_state.open) >= MAX_OPEN_POSITIONS:
+                return {"status": "refused", "reason": "max open positions"}
         open_notional = sum(p.size_usd for p in _state.open)
         if open_notional + size_usd > MAX_NOTIONAL_USD:
             return {"status": "refused", "reason": "max notional"}
@@ -881,12 +954,26 @@ def _materialize_pending_buy(
         }
 
 def close_by_mint(*, mint: str, mark_price: float, reason: str) -> list[dict[str, Any]]:
-    """Force-close every open lot on ``mint`` (cluster-sell / creator dump)."""
+    """Force-close every open lot on ``mint`` in every lane book.
+
+    Leader-sell mirroring must reach cluster/snipe lots, not just the
+    active lane's book.
+    """
     if mark_price <= 0:
         return []
     mint = (mint or "").strip()
     if not mint:
         return []
+    closed_all: list[dict[str, Any]] = []
+    for lane in known_lanes():
+        with use_lane(lane):
+            closed_all.extend(
+                _close_by_mint_in_lane(mint=mint, mark_price=mark_price, reason=reason)
+            )
+    return closed_all
+
+
+def _close_by_mint_in_lane(*, mint: str, mark_price: float, reason: str) -> list[dict[str, Any]]:
     closed: list[dict[str, Any]] = []
     now = time.time()
     with _lock:
@@ -910,6 +997,7 @@ def close_by_mint(*, mint: str, mark_price: float, reason: str) -> list[dict[str
             pos.realized_pnl_usd = round(pnl, 4)
             pos.closed_at = datetime.now(timezone.utc).isoformat()
             pos.close_reason = reason
+            _note_symbol_close(pos.name)
             _state.closed.append(pos)
             try:
                 decision_store.append("paper", {"event": "close", "position": asdict(pos)})
@@ -1168,11 +1256,16 @@ def _execute_decision_inner(
                 "status": "skipped",
                 "reason": f"re-entry cooldown {cooling:.0f}s remaining",
             }
+        sym_block = _symbol_cooldown_ok(name)
+        if sym_block:
+            return {"status": "skipped", "reason": sym_block}
         conc = _concentration_block(mint=mint, address=address, size=size)
         if conc:
             return {"status": "refused", "reason": conc}
         if len(_state.open) >= MAX_OPEN_POSITIONS:
-            return {"status": "refused", "reason": "max open positions"}
+            _rotation_displace()
+            if len(_state.open) >= MAX_OPEN_POSITIONS:
+                return {"status": "refused", "reason": "max open positions"}
         open_notional = sum(p.size_usd for p in _state.open)
         if open_notional + size > MAX_NOTIONAL_USD:
             return {"status": "refused", "reason": "max notional"}
@@ -1394,12 +1487,12 @@ def mark_and_maybe_exit(
                         pnl = mark_pnl
                 elif pos.bank_at_target:
                     use_trail = TRAIL_ENABLED or situational
-                    trailed = _trail_exit(pos, decision_pnl) if use_trail else None
+                    trailed = _trail_exit(pos, decision_pnl, mark_price=mark_price, exit_cost_frac=exit_cost_frac) if use_trail else None
                     if trailed is not None:
                         pnl, reason = trailed
                         exit_price = _implied_exit_price(pos, pnl, exit_cost_frac)
                 else:
-                    trailed = _trail_exit(pos, decision_pnl) if TRAIL_ENABLED else None
+                    trailed = _trail_exit(pos, decision_pnl, mark_price=mark_price, exit_cost_frac=exit_cost_frac) if TRAIL_ENABLED else None
                     if trailed is not None:
                         pnl, reason = trailed
                         exit_price = _implied_exit_price(pos, pnl, exit_cost_frac)
@@ -1442,6 +1535,7 @@ def mark_and_maybe_exit(
             pos.realized_pnl_usd = round(pnl, 4)
             pos.closed_at = datetime.now(timezone.utc).isoformat()
             pos.close_reason = reason
+            _note_symbol_close(pos.name)
             pos.fills.append(
                 asdict(
                     PaperFill(
@@ -1645,7 +1739,61 @@ def stop_loss_for_size(size_usd: float) -> float:
     return STOP_LOSS_USD
 
 
-def _trail_exit(pos: PaperPosition, mark_pnl: float) -> Optional[tuple[float, str]]:
+def _take_partial(pos: PaperPosition, mark_price: float, exit_cost_frac: float) -> float:
+    """Bank PARTIAL_PCT of qty at the mark; trail the rest on scaled levels.
+
+    Returns the fraction of the position remaining (1.0 when skipped).
+    """
+    frac = min(0.99, max(0.0, TRAIL_PARTIAL_PCT / 100.0))
+    if frac <= 0 or pos.qty <= 0 or mark_price <= 0:
+        return 1.0
+    keep = 1.0 - frac
+    sqty = pos.qty * frac
+    fee = sqty * mark_price * exit_cost_frac
+    proceeds = sqty * mark_price - fee
+    slice_pnl = sqty * (mark_price - pos.entry_price) - fee
+    pos.qty -= sqty
+    pos.size_usd *= keep
+    pos.peak_pnl_usd *= keep
+    pos.last_mark_pnl_usd *= keep
+    pos.target_profit_usd *= keep
+    pos.stop_loss_usd *= keep
+    pos.partial_taken = True
+    _state.cash_usd += proceeds
+    _state.realized_pnl_usd += slice_pnl
+    ts = datetime.now(timezone.utc).isoformat()
+    pos.fills.append(
+        asdict(
+            PaperFill(
+                side="sell",
+                price=mark_price,
+                size_usd=proceeds,
+                fee_usd=fee,
+                slippage_pct=costs.EXIT_SLIP_PCT,
+                ts=ts,
+            )
+        )
+    )
+    pipeline_log.emit(
+        "paper",
+        "partial",
+        address=pos.address,
+        mint=pos.mint,
+        symbol=pos.name,
+        position_id=pos.id,
+        realized_pnl_usd=round(slice_pnl, 4),
+        remaining_qty=pos.qty,
+    )
+    return keep
+
+
+def _trail_exit(
+    pos: PaperPosition,
+    mark_pnl: float,
+    *,
+    mark_price: Optional[float] = None,
+    exit_cost_frac: float = 0.0,
+) -> Optional[tuple[float, str]]:
     """Decide whether a trailing winner should bank now.
 
     Returns ``(pnl, reason)`` when the trail has been hit, else None. Arming is
@@ -1668,7 +1816,16 @@ def _trail_exit(pos: PaperPosition, mark_pnl: float) -> Optional[tuple[float, st
         return None
 
     pos.trail_armed = True
-    pos.peak_pnl_usd = max(pos.peak_pnl_usd, mark_pnl)
+    ref_pnl = mark_pnl
+    if (
+        not pos.partial_taken
+        and TRAIL_PARTIAL_PCT > 0
+        and mark_price
+        and mark_price > 0
+        and mark_pnl >= arm * TRAIL_PARTIAL_AT_MULT
+    ):
+        ref_pnl = mark_pnl * _take_partial(pos, mark_price, exit_cost_frac)
+    pos.peak_pnl_usd = max(pos.peak_pnl_usd, ref_pnl)
     size_giveback = pos.size_usd * TRAIL_GIVEBACK_PCT / 100.0
     peak_giveback = pos.peak_pnl_usd * TRAIL_GIVEBACK_OF_PEAK
     giveback = max(size_giveback, peak_giveback)

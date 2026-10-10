@@ -80,6 +80,7 @@ def test_add_on_can_be_disabled(monkeypatch):
 
 def test_mint_daily_trade_cap_blocks_reentry(monkeypatch):
     monkeypatch.setattr(paper, "MAX_TRADES_PER_MINT_DAY", 2)
+    monkeypatch.setattr(paper, "SYMBOL_COOLDOWN_SEC", 0.0)
     mint = "MintCapAAA1111111111111111111111111111111"
     for i in range(2):
         card = _card(address=f"MintCapAddr{i}", band=(-5.0, 8.0, 20.0))
@@ -100,6 +101,7 @@ def test_mint_daily_loss_cap_blocks_after_bleed(monkeypatch):
     monkeypatch.setattr(paper, "STOP_LOSS_USD", 1.5)
     monkeypatch.setattr(paper, "MAX_DAILY_LOSS_PER_MINT", 1.5)
     monkeypatch.setattr(paper, "STOP_FILL_MODE", "barrier")
+    monkeypatch.setattr(paper, "SYMBOL_COOLDOWN_SEC", 0.0)
     mint = "MintLossBBB2222222222222222222222222222222"
     card = _card(address="MintLossAddr1", band=(-5.0, 8.0, 20.0))
     card.token["mint"] = mint

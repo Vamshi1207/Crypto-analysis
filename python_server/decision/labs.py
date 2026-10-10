@@ -85,8 +85,10 @@ SNIPE_LANES: tuple[SnipeLane, ...] = (
 ARB_LANE = "arb"
 SCALP_LANE = "scalp"
 CLUSTER_LANE = "cluster"
+COPY_LANE = "copy"
 CHANNEL_LANES = (
     {"id": CLUSTER_LANE, "family": "cluster", "label": "Smart-money cluster", "thesis": "Gecko new pools with ≥3 unique buyers, 5m hold"},
+    {"id": COPY_LANE, "family": "copy", "label": "Leader copy", "thesis": "tracked-wallet buys mirrored, isolated cash"},
     {"id": ARB_LANE, "family": "arb", "label": "Jupiter round-trip", "thesis": "SOL→mint→SOL quote, isolated cash"},
     {"id": SCALP_LANE, "family": "scalp", "label": "Forecast scalp", "thesis": "discover + swarm decide, isolated cash"},
 )
@@ -188,6 +190,8 @@ def trading_lane(family: str) -> str:
         return SCALP_LANE
     if family in {"cluster", "launch"}:
         return CLUSTER_LANE
+    if family in {"copy"}:
+        return COPY_LANE
     return paper.DEFAULT_LANE
 
 
