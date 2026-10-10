@@ -60,6 +60,117 @@ def test_cluster_score_needs_three_wallets_in_window():
     assert trenches.cluster_score(buyers, now=now) == 3
 
 
+def _cluster_row(mint="Mint111111111111111111111111111111111"):
+    return {
+        "mint": mint,
+        "pool": "Pool111111111111111111111111111111111",
+        "symbol": "TEST",
+        "liquidity_usd": 20000.0,
+        "price_usd": 1e-5,
+        "age_min": 3.0,
+    }
+
+
+def _chair(action="hold", veto=False):
+    return {
+        "veto": veto,
+        "action": action,
+        "claim": f"jev {action}",
+        "reason": f"jev {action}",
+        "backend": "jev",
+        "confidence": 0.8,
+        "veto_prob": 0.9 if veto else 0.1,
+        "quality": 0.5,
+        "probs": {},
+        "latency_ms": 5,
+        "model": "jev-latest",
+    }
+
+
+def _wire_chair(monkeypatch, review):
+    from decision import jev as jev_mod
+
+    monkeypatch.setattr(trenches, "JEV_CLUSTER_GATE", True)
+    monkeypatch.setattr(jev_mod, "chair_review", lambda *a, **k: review)
+    trenches._jev_blocked.clear()
+
+
+def test_jev_gate_veto_blocks_cluster_open(monkeypatch):
+    _wire_chair(monkeypatch, _chair(action="avoid", veto=True))
+    row = _cluster_row()
+    proceed, reason = trenches._jev_cluster_gate(row, ["a", "b", "c"], 6.0)
+    assert proceed is False
+    assert reason.startswith("jev_veto")
+
+
+def test_jev_gate_avoid_blocks_cluster_open(monkeypatch):
+    _wire_chair(monkeypatch, _chair(action="avoid"))
+    proceed, reason = trenches._jev_cluster_gate(row := _cluster_row(), ["a", "b", "c"], 6.0)
+    assert proceed is False
+    assert reason.startswith("jev_avoid")
+
+
+def test_jev_gate_hold_and_buy_proceed(monkeypatch):
+    for action in ("hold", "buy"):
+        _wire_chair(monkeypatch, _chair(action=action))
+        proceed, reason = trenches._jev_cluster_gate(
+            _cluster_row(mint=f"Mint{action}11111111111111111111111111"), ["a", "b", "c"], 6.0
+        )
+        assert proceed is True, reason
+
+
+def test_jev_gate_offline_chair_proceeds(monkeypatch):
+    _wire_chair(monkeypatch, None)
+    proceed, reason = trenches._jev_cluster_gate(_cluster_row(), ["a", "b", "c"], 6.0)
+    assert proceed is True
+    assert reason == "jev_offline"
+
+
+def test_jev_gate_block_cools_down_without_reasking(monkeypatch):
+    from decision import jev as jev_mod
+
+    calls = []
+    monkeypatch.setattr(trenches, "JEV_CLUSTER_GATE", True)
+    monkeypatch.setattr(
+        jev_mod, "chair_review", lambda *a, **k: calls.append(1) or _chair(veto=True)
+    )
+    trenches._jev_blocked.clear()
+    row = _cluster_row()
+    assert trenches._jev_cluster_gate(row, ["a", "b", "c"], 6.0)[0] is False
+    assert trenches._jev_cluster_gate(row, ["a", "b", "c"], 6.0) == (False, "jev_cooldown")
+    assert len(calls) == 1
+
+
+def test_jev_gate_state_carries_edge_and_safety(monkeypatch):
+    """Gate0 report passes through as packet safety; edge = m5 − costs."""
+    from types import SimpleNamespace
+
+    from decision import costs as costs_mod
+    from decision import jev as jev_mod
+
+    seen = {}
+
+    def fake_chair(card, packet, opinions):
+        seen["card"] = card
+        seen["packet"] = packet
+        return _chair(action="hold")
+
+    monkeypatch.setattr(trenches, "JEV_CLUSTER_GATE", True)
+    monkeypatch.setattr(jev_mod, "chair_review", fake_chair)
+    trenches._jev_blocked.clear()
+    report = SimpleNamespace(
+        verdict=SimpleNamespace(value="caution"),
+        risk_score=30,
+        summary=lambda: "caution (score 30)",
+        sellability=SimpleNamespace(price_impact_pct=0.5),
+    )
+    ok, reason = trenches._jev_cluster_gate(_cluster_row(), ["a"] * 6, 6.0, report)
+    assert ok is True, reason
+    assert seen["packet"].safety is report
+    expected = round(6.0 - costs_mod.round_trip_cost_pct(price_impact_pct=0.5), 2)
+    assert seen["card"].cost_adjusted_edge_pct == expected
+
+
 def test_list_launch_candidates_keeps_young_liquid_pools(monkeypatch):
     from datetime import datetime, timedelta, timezone
 
@@ -110,6 +221,25 @@ def test_pick_dex_price_prefers_the_entry_pool():
     assert trenches.pick_dex_price(pairs, pool="PoolYoung") == 0.001
     # Without a pool, use the most liquid pair — not the highest mid.
     assert trenches.pick_dex_price(pairs, pool=None) == 0.001
+
+
+def test_dex_m5_pct_reads_chosen_pair(monkeypatch):
+    pairs = [
+        {
+            "pairAddress": "PoolYoung",
+            "priceUsd": "0.001",
+            "liquidity": {"usd": 8000},
+            "priceChange": {"m5": 12.5},
+        }
+    ]
+    monkeypatch.setattr(trenches, "fetch_dexscreener_pairs", lambda mint: pairs)
+    assert trenches.dex_m5_pct("Mint", pool="PoolYoung") == 12.5
+    monkeypatch.setattr(
+        trenches,
+        "fetch_dexscreener_pairs",
+        lambda mint: [{"pairAddress": "X", "priceUsd": "1", "liquidity": {"usd": 1}}],
+    )
+    assert trenches.dex_m5_pct("Mint") is None
 
 
 def test_confirm_entry_price_skips_gecko_dex_gap(monkeypatch):

@@ -66,6 +66,21 @@ CLUSTER_MIN_WALLETS = _env_int("CLUSTER_MIN_WALLETS", 3)
 CLUSTER_WINDOW_SEC = _env_float("CLUSTER_WINDOW_SEC", 90.0)
 CLUSTER_SIZE_USD = _env_float("CLUSTER_SIZE_USD", 80.0)
 CLUSTER_MAX_HOLD_SEC = _env_float("CLUSTER_MAX_HOLD_SEC", 300.0)
+# Scratch if never green by this many seconds (0 = off). Early dead names
+# were the whole −EV; survivors past ~5m were +EV.
+CLUSTER_DEAD_SEC = _env_float("CLUSTER_DEAD_SEC", 0.0)
+# Explicit dollar stop for cluster (0 = paper percent default). Prefer a
+# tight clip over giving losers room — wider stops made v2 worse.
+CLUSTER_STOP_USD = _env_float("CLUSTER_STOP_USD", 0.0)
+# Require DexScreener 5m % change ≥ this before opening (0 = off).
+CLUSTER_MIN_M5_PCT = _env_float("CLUSTER_MIN_M5_PCT", 0.0)
+# JEV chair gate on cluster opens (0 = off, today's behavior). Veto or
+# avoid from the chair blocks the open; hold/buy (or an offline chair)
+# proceeds. Blocks are remembered per mint so a rejected name is not
+# re-asked every tick.
+JEV_CLUSTER_GATE = os.getenv("JEV_CLUSTER_GATE", "1").strip() == "1"
+JEV_CLUSTER_RECHECK_SEC = _env_float("JEV_CLUSTER_RECHECK_SEC", 300.0)
+_jev_blocked: dict[str, float] = {}
 MAX_PER_TICK = _env_int("TRENCHES_MAX_PER_TICK", 2)
 # Create-event sniper: watch the landed create, buy only if the tape lifts.
 SNIPER_ENABLED = os.getenv("SNIPER_ENABLED", "1").strip() == "1"
@@ -199,6 +214,9 @@ def status() -> dict[str, Any]:
                 "cluster_window_sec": CLUSTER_WINDOW_SEC,
                 "cluster_size_usd": CLUSTER_SIZE_USD,
                 "cluster_max_hold_sec": CLUSTER_MAX_HOLD_SEC,
+                "cluster_dead_sec": CLUSTER_DEAD_SEC,
+                "cluster_stop_usd": CLUSTER_STOP_USD,
+                "cluster_min_m5_pct": CLUSTER_MIN_M5_PCT,
                 "sniper_interval_sec": SNIPER_INTERVAL_SEC,
                 "sniper_max_age_sec": SNIPER_MAX_AGE_SEC,
                 "sniper_watch_sec": SNIPER_WATCH_SEC,
@@ -365,7 +383,7 @@ def _scan(*, do_cluster: bool = True) -> dict[str, Any]:
         strategy = "cluster" if is_cluster else "launch"
         size = CLUSTER_SIZE_USD if is_cluster else LAUNCH_SIZE_USD
         hold = CLUSTER_MAX_HOLD_SEC if is_cluster else LAUNCH_MAX_HOLD_SEC
-        ok, reason = _gate0(mint)
+        ok, reason, safety_report = _gate0(mint)
         if not ok:
             skipped += 1
             _seen_mints.add(mint)
@@ -373,16 +391,65 @@ def _scan(*, do_cluster: bool = True) -> dict[str, Any]:
                 "trenches", "skip", mint=mint, symbol=row.get("symbol"), reason=reason
             )
             continue
+        m5_pct: Optional[float] = None
+        if is_cluster and CLUSTER_MIN_M5_PCT > 0:
+            m5_pct = dex_m5_pct(mint, pool=row.get("pool"))
+            if m5_pct is None or m5_pct < CLUSTER_MIN_M5_PCT:
+                skipped += 1
+                pipeline_log.emit(
+                    "trenches",
+                    "skip",
+                    mint=mint,
+                    symbol=row.get("symbol"),
+                    reason=(
+                        f"m5_low {m5_pct if m5_pct is not None else 'none'}"
+                        f"<{CLUSTER_MIN_M5_PCT}"
+                    ),
+                    m5_pct=m5_pct,
+                )
+                continue
+        dead = CLUSTER_DEAD_SEC if is_cluster and CLUSTER_DEAD_SEC > 0 else None
+        stop_usd = CLUSTER_STOP_USD if is_cluster and CLUSTER_STOP_USD > 0 else None
+        if is_cluster:
+            proceed, jev_reason = _jev_cluster_gate(
+                row, buyers, m5_pct, safety_report
+            )
+            if not proceed:
+                skipped += 1
+                pipeline_log.emit(
+                    "trenches",
+                    "skip",
+                    mint=mint,
+                    symbol=row.get("symbol"),
+                    reason=jev_reason,
+                )
+                continue
         with paper.use_lane(labs.trading_lane(strategy)):
-            result = _open(row, strategy=strategy, size=size, hold=hold, extra={"buyers": buyers})
-        if result.get("status") == "opened":
+            result = _open(
+                row,
+                strategy=strategy,
+                size=size,
+                hold=hold,
+                extra={"buyers": buyers, "m5_pct": m5_pct},
+                dead_after_sec=dead,
+                stop_loss_usd=stop_usd,
+            )
+        if result.get("status") in {"opened", "pending"}:
             _seen_mints.add(mint)
             opened_this_tick += 1
             if is_cluster:
                 cluster_opens += 1
             else:
                 launch_opens += 1
-            hits.append({**row, "strategy": strategy, "buyers": len(buyers)})
+            hits.append(
+                {
+                    **row,
+                    "strategy": strategy,
+                    "buyers": len(buyers),
+                    "m5_pct": m5_pct,
+                    "status": result.get("status"),
+                }
+            )
         else:
             skipped += 1
 
@@ -603,7 +670,7 @@ def _scan_sniper() -> tuple[int, int, int, int, list[dict[str, Any]]]:
             abs_hold_sec=SNIPER_ABS_HOLD_SEC,
             stop_loss_usd=SNIPER_STOP_USD,
         )
-        if result.get("status") == "opened":
+        if result.get("status") in {"opened", "pending"}:
             _seen_mints.add(mint)
             _watches.pop(mint, None)
             opens += 1
@@ -797,14 +864,111 @@ def _process_watchlist_and_exits() -> int:
     return exits
 
 
-def _gate0(mint: str) -> tuple[bool, str]:
+def _gate0(mint: str) -> tuple[bool, str, Optional[Any]]:
+    """Gate 0 safety screen. Returns (ok, reason, report) — the report is
+    reused as JEV chair state so safety evidence is judged, not re-fetched."""
     try:
         report = check_token(mint)
     except Exception as exc:  # noqa: BLE001
-        return False, f"gate0_error: {exc}"
+        return False, f"gate0_error: {exc}", None
     if report.blocking or report.verdict == SafetyVerdict.DANGER:
-        return False, f"gate0_{report.verdict.value}"
-    return True, "ok"
+        return False, f"gate0_{report.verdict.value}", report
+    return True, "ok", report
+
+
+def _jev_cluster_gate(
+    row: dict[str, Any],
+    buyers: list[str],
+    m5_pct: Optional[float],
+    safety_report: Optional[Any] = None,
+) -> tuple[bool, str]:
+    """Ask the JEV chair before a cluster open. Returns (proceed, reason).
+
+    State is evidence the desk already paid for, never re-fetched: the
+    Gate 0 safety report (verdict, score, flags, sell price impact) and a
+    code-computed edge estimate (m5 momentum minus the round-trip cost —
+    arithmetic stays in code per the docs, the model judges the trade).
+    Fail-open: a disabled/unavailable chair proceeds exactly as before.
+    A blocked mint stays blocked for ``JEV_CLUSTER_RECHECK_SEC`` without
+    re-asking (bounds API cost); the mint is NOT added to ``_seen_mints``
+    so a better tape can still open it later.
+    """
+    from types import SimpleNamespace
+
+    from decision import costs
+
+    if not JEV_CLUSTER_GATE:
+        return True, "jev_gate_off"
+    mint = str(row.get("mint") or "")
+    symbol = str(row.get("symbol") or mint[:6])
+    now = time.time()
+    blocked_at = _jev_blocked.get(mint, 0.0)
+    if blocked_at and now - blocked_at < JEV_CLUSTER_RECHECK_SEC:
+        return False, "jev_cooldown"
+    try:
+        from decision import jev as jev_mod
+    except Exception:  # noqa: BLE001 — chair unavailable, trade as before
+        return True, "jev_unavailable"
+    n_buyers = len(buyers)
+    liq = row.get("liquidity_usd")
+    price_impact = None
+    try:
+        price_impact = float(getattr(getattr(safety_report, "sellability", None), "price_impact_pct", None))
+    except (TypeError, ValueError, AttributeError):
+        price_impact = None
+    edge_pct = None
+    if m5_pct is not None:
+        try:
+            edge_pct = round(
+                float(m5_pct) - costs.round_trip_cost_pct(price_impact_pct=price_impact),
+                2,
+            )
+        except (TypeError, ValueError):
+            edge_pct = None
+    safety_line = "gate0 passed"
+    try:
+        summary = safety_report.summary() if safety_report is not None else None
+        if summary:
+            safety_line = str(summary)[:220]
+    except Exception:  # noqa: BLE001 — summary is decoration, not load-bearing
+        pass
+    card = SimpleNamespace(
+        summary=lambda: (
+            f"cluster candidate {symbol} ({mint[:8]}): {n_buyers} unique "
+            f"buyers in {CLUSTER_WINDOW_SEC:.0f}s, m5 {m5_pct}%, edge "
+            f"{edge_pct}% after costs, liquidity ${liq}, age "
+            f"{row.get('age_min')}m. Safety: {safety_line}"
+        ),
+        action=SimpleNamespace(value="buy"),
+        action_confidence=0.5,
+        direction=SimpleNamespace(value="long"),
+        cost_adjusted_edge_pct=edge_pct,
+        expected_return_pct=None,
+        forecast=None,
+        timeframe="cluster",
+        token={"address": mint, "name": symbol},
+        safety={},
+        notes={},
+    )
+    packet = SimpleNamespace(
+        market=SimpleNamespace(liquidity_usd_total=liq, liquidity_usd=liq),
+        safety=safety_report,
+        orderflow={"buys_5m": n_buyers, "source": "cluster"},
+    )
+    try:
+        review = jev_mod.chair_review(card, packet, [])
+    except Exception:  # noqa: BLE001 — never break the trading loop
+        pipeline_log.emit("trenches", "jev_error", mint=mint, symbol=symbol)
+        return True, "jev_error"
+    if review is None:
+        return True, "jev_offline"
+    if review.get("veto"):
+        _jev_blocked[mint] = now
+        return False, f"jev_veto: {review.get('reason', '')}"[:200]
+    if review.get("action") == "avoid":
+        _jev_blocked[mint] = now
+        return False, f"jev_avoid: {review.get('reason', '')}"[:200]
+    return True, f"jev_{review.get('action', 'hold')}"
 
 
 def _open(
@@ -851,7 +1015,7 @@ def _open(
         abs_hold_sec=abs_hold_sec,
         stop_loss_usd=stop_loss_usd,
     )
-    if result.get("status") == "opened":
+    if result.get("status") in {"opened", "pending"}:
         pricefeed.track(mint=row["mint"], pool=row["pool"], symbol=str(row.get("symbol") or ""))
         if _token_sink is not None:
             _token_sink(
@@ -913,6 +1077,12 @@ def _mark_open_lots() -> None:
         for lid in (labs.CLUSTER_LANE, labs.SCALP_LANE):
             if lid not in lane_ids:
                 lane_ids.append(lid)
+
+    def _fallback(mint: str, pool: str = "") -> Optional[float]:
+        return dex_price_usd(mint, pool=pool or None)
+
+    paper.drain_pending_buys(fallback_price_fn=_fallback)
+
     for lane_id in lane_ids:
         with paper.use_lane(lane_id):
             snap = paper.snapshot()
@@ -938,6 +1108,8 @@ def _mark_open_lots() -> None:
                 if mark is None and mint:
                     mark = _snipe_marks.get(str(mint))
                 if mark:
+                    if mint:
+                        paper.observe_mark(str(mint), float(mark))
                     force = (
                         _tape_force_reason(tape)
                         if reason in {"snipe", "cluster", "launch"}
@@ -978,29 +1150,59 @@ def confirm_entry_price(
 
 
 def dex_price_usd(mint: str, pool: Optional[str] = None) -> Optional[float]:
+    pair = _pick_dex_pair(mint, pool=pool)
+    if pair is None:
+        return None
+    try:
+        px = float(pair.get("priceUsd") or 0.0)
+    except (TypeError, ValueError):
+        return None
+    return px or None
+
+
+def dex_m5_pct(mint: str, pool: Optional[str] = None) -> Optional[float]:
+    """DexScreener 5-minute % change for the chosen pair, or None if missing."""
+    pair = _pick_dex_pair(mint, pool=pool)
+    if pair is None:
+        return None
+    chg = pair.get("priceChange") or {}
+    try:
+        m5 = chg.get("m5")
+        return float(m5) if m5 is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _pick_dex_pair(mint: str, pool: Optional[str] = None) -> Optional[dict[str, Any]]:
     if not mint:
         return None
     try:
         pairs = fetch_dexscreener_pairs(mint)
     except SourceError:
         return None
-    return pick_dex_price(pairs, pool=pool)
+    return pick_dex_pair(pairs, pool=pool)
 
 
-def pick_dex_price(pairs: list[dict[str, Any]], pool: Optional[str] = None) -> Optional[float]:
-    """Price of ``pool`` if present, else the most liquid Solana pair — not the max mid."""
+def pick_dex_pair(
+    pairs: list[dict[str, Any]], pool: Optional[str] = None
+) -> Optional[dict[str, Any]]:
+    """``pool`` if present, else the most liquid Solana pair — not the max mid."""
     ranked = [p for p in pairs if isinstance(p, dict)]
     if not ranked:
         return None
     pool_l = (pool or "").lower()
-    chosen: Optional[dict[str, Any]] = None
     if pool_l:
         for pair in ranked:
             if str(pair.get("pairAddress") or "").lower() == pool_l:
-                chosen = pair
-                break
+                return pair
+    return max(ranked, key=_pair_liq_usd)
+
+
+def pick_dex_price(pairs: list[dict[str, Any]], pool: Optional[str] = None) -> Optional[float]:
+    """Price of ``pool`` if present, else the most liquid Solana pair — not the max mid."""
+    chosen = pick_dex_pair(pairs, pool=pool)
     if chosen is None:
-        chosen = max(ranked, key=_pair_liq_usd)
+        return None
     try:
         px = float(chosen.get("priceUsd") or 0.0)
     except (TypeError, ValueError):
