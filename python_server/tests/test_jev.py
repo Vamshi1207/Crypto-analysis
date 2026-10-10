@@ -27,6 +27,8 @@ def test_preflight_enabled_needs_key(monkeypatch):
     monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
     monkeypatch.delenv("JEV_API_KEY", raising=False)
     monkeypatch.delenv("JEVX_API_KEY", raising=False)
+    monkeypatch.delenv("OPENCODE_GO_API_KEY", raising=False)
+    monkeypatch.delenv("OPENCODE_API_KEY", raising=False)
     status = jev.preflight()
     assert status.enabled is True
     assert status.ready is False
@@ -35,14 +37,16 @@ def test_preflight_enabled_needs_key(monkeypatch):
 def test_build_questions_shapes_validate():
     """The one strict thing in the JEV API: criteria shapes per type."""
     q = jev.build_questions()
-    assert set(q) == {"action", "veto", "quality"}
+    assert set(q) == {"action", *jev.VETO_QUESTIONS, "quality"}
 
     assert q["action"]["type"] == "choice"
     assert isinstance(q["action"]["criteria"], dict)
     assert set(q["action"]["criteria"]) >= {"buy", "hold", "avoid"}
 
-    assert q["veto"]["type"] == "noul"
-    assert set(q["veto"]["criteria"]) == {"true", "false"}
+    # Atomic veto Nouls: one yes/no judgment each, high value means yes.
+    for name in jev.VETO_QUESTIONS:
+        assert q[name]["type"] == "noul", name
+        assert set(q[name]["criteria"]) == {"true", "false"}, name
 
     assert q["quality"]["type"] == "score"
     assert isinstance(q["quality"]["criteria"], list)
@@ -54,6 +58,23 @@ def test_build_questions_shapes_validate():
         assert qq.get("criteria") is not None, name
 
 
+def test_wrap_questions_maps_all_types():
+    typesafe_sdk = pytest.importorskip("typesafe_sdk")
+    wrapped = jev._wrap_questions(jev.build_questions())
+    assert set(wrapped) == {"action", *jev.VETO_QUESTIONS, "quality"}
+    assert isinstance(wrapped["action"], typesafe_sdk.Choice)
+    for name in jev.VETO_QUESTIONS:
+        assert isinstance(wrapped[name], typesafe_sdk.Noul), name
+    assert isinstance(wrapped["quality"], typesafe_sdk.Score)
+
+
+def _veto_answers(**kw):
+    """Atomic veto answers; unspecified default to unsure (0.5)."""
+    return {
+        name: {"noul": kw.get(name, 0.5)} for name in jev.VETO_QUESTIONS
+    }
+
+
 def test_parse_typesafe_payload():
     payload = {
         "model": "typesafe/jev-1.13.0",
@@ -63,7 +84,7 @@ def test_parse_typesafe_payload():
                 "probabilities": {"buy": 0.1, "hold": 0.25, "avoid": 0.65},
                 "confidence": 0.72,
             },
-            "veto": {"noul": 0.83},
+            **_veto_answers(no_exit=0.83),
             "quality": {"score": 0.2, "confidence": 0.6},
         },
     }
@@ -74,6 +95,24 @@ def test_parse_typesafe_payload():
     assert v.veto_prob == pytest.approx(0.83)
     assert v.quality01 == pytest.approx(0.2)
     assert v.model == "typesafe/jev-1.13.0"
+
+
+def test_parse_veto_takes_max_of_atomic_nouls():
+    payload = {
+        "answers": {
+            "action": {"choice": "hold", "probabilities": {}, "confidence": 0.5},
+            **_veto_answers(no_exit=0.2, safety_block=0.9, chase=0.4, bad_band=0.1),
+            "quality": {"score": 0.5},
+        },
+    }
+    v = jev._parse(payload, latency_ms=1, model="jev-latest")
+    assert v.veto_prob == pytest.approx(0.9)
+
+
+def test_parse_missing_veto_answers_is_unsure():
+    payload = {"answers": {"action": {"choice": "hold"}}}
+    v = jev._parse(payload, latency_ms=1, model="jev-latest")
+    assert v.veto_prob == pytest.approx(0.5)
 
 
 def test_parse_score_normalizes_wide_scale():
@@ -124,6 +163,30 @@ def test_chair_low_confidence_buy_downgrades_to_hold(monkeypatch):
     assert out["veto"] is False
     assert out["action"] == "hold"
     assert "confidence floor" in out["reason"]
+
+
+def test_chair_caution_band_blocks_entry_without_veto(monkeypatch):
+    """Middle veto band: buy→hold, no forced avoid."""
+    monkeypatch.setattr(jev, "VETO_THRESHOLD", 0.70)
+    monkeypatch.setattr(jev, "VETO_CAUTION", 0.40)
+    _stub_verdict(monkeypatch, action="buy", action_confidence=0.9, veto_prob=0.55)
+    out = jev.chair_review(_card(), _packet_with_run(5.0), [])
+    assert out is not None
+    assert out["veto"] is False
+    assert out["action"] == "hold"
+    assert "caution" in out["reason"]
+
+
+def test_chair_caution_band_leaves_hold_alone(monkeypatch):
+    """Caution only gates new entries; a hold stays a hold."""
+    monkeypatch.setattr(jev, "VETO_THRESHOLD", 0.70)
+    monkeypatch.setattr(jev, "VETO_CAUTION", 0.40)
+    _stub_verdict(monkeypatch, action="hold", action_confidence=0.9, veto_prob=0.55)
+    out = jev.chair_review(_card(), _packet_with_run(5.0), [])
+    assert out is not None
+    assert out["veto"] is False
+    assert out["action"] == "hold"
+    assert "caution" not in out["reason"]
 
 
 def test_chair_disabled_returns_none(monkeypatch):

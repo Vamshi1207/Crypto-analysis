@@ -1,12 +1,19 @@
 """JEV System One chair for Gate 3 — typed decisions, not prose.
 
-TypeSafe JEV (released 2026-09-15) is a decision model: it takes a state
-(text or JSON) plus named typed questions and returns JSON only — no text
-to parse. Three primitives:
+TypeSafe JEV is a decision model: it takes a state (text or JSON) plus
+named typed questions and returns JSON only — no text to parse. Three
+primitives (see https://docs.typesafe.ai/primitives):
 
   * ``choice`` — pick one option + probability on every option + confidence
-  * ``noul``   — yes/no as a single 0..1 value (exactly 0.5 = abstain)
-  * ``score``  — continuous value on an ordered low→high scale you supply
+  * ``noul``   — yes/no as a single 0..1 value (exactly 0.5 = unsure)
+  * ``score``  — continuous position on an ordered low→high scale you supply
+
+One call carries six questions over a shared compact state (batching is
+~free per the parallel-questions cookbook): an ``action`` choice, four
+atomic veto Nouls (one condition each — never pack several judgments
+into one Noul), and an entry-``quality`` score. Code combines the
+answers: veto is the max of the four Nouls; a middle band only blocks
+new entries instead of forcing avoid.
 
 Native endpoint is ``POST https://api.typesafe.ai/v1/systemone`` with
 ``{"model": "jev-latest", "state": ..., "questions": {...}}``. The Jevx
@@ -16,11 +23,10 @@ proxy (``POST https://jevx.org/api/v1/decisions``) uses the same
 This module is the cheap/fast tier for the risk chair. It never replaces
 the time-series forecast (stat/chronos/timesfm), Gate 0 on-chain safety,
 or paper execution — it only answers "given this evidence, what should
-the book do?" in ~0.5s for ~$0.00002 instead of a 90s chat-LLM JSON scrape.
+the book do?" in ~0.3s instead of a 90s chat-LLM JSON scrape.
 
-Disabled by default (``JEV_ENABLED=0``). Missing key degrades cleanly to
-the heuristic desk — callers must treat :class:`JevUnavailable` as skip,
-never as retry-hard.
+Missing key degrades cleanly to the heuristic desk — callers must treat
+:class:`JevUnavailable` as skip, never as retry-hard.
 """
 
 from __future__ import annotations
@@ -39,7 +45,15 @@ ENABLED = os.getenv("JEV_ENABLED", "0").strip() == "1"
 TIMEOUT_S = _env_float("JEV_TIMEOUT_S", 8.0)
 MIN_CONFIDENCE = _env_float("JEV_MIN_CONFIDENCE", 0.55)
 VETO_THRESHOLD = _env_float("JEV_VETO_THRESHOLD", 0.70)
+# Middle band: a veto Noul in [VETO_CAUTION, VETO_THRESHOLD) only blocks
+# new entries (buy→hold) instead of forcing avoid. Per the docs' three
+# paths: act / proceed-with-caution / don't act.
+VETO_CAUTION = _env_float("JEV_VETO_CAUTION", 0.40)
 MAX_STATE_CHARS = int(_env_float("JEV_MAX_STATE_CHARS", 4000))
+
+# Atomic veto conditions — one yes/no judgment each. Combined in code as
+# their max; see build_questions() and chair_review().
+VETO_QUESTIONS = ("no_exit", "safety_block", "chase", "bad_band")
 
 
 class JevUnavailable(RuntimeError):
@@ -73,7 +87,13 @@ class JevVerdict:
 
 
 def _api_key() -> str:
-    for name in ("TYPESAFE_API_KEY", "JEV_API_KEY", "JEVX_API_KEY"):
+    for name in (
+        "TYPESAFE_API_KEY",
+        "JEV_API_KEY",
+        "JEVX_API_KEY",
+        "OPENCODE_GO_API_KEY",
+        "OPENCODE_API_KEY",
+    ):
         key = os.getenv(name, "").strip()
         if key:
             return key
@@ -84,6 +104,85 @@ def _is_jevx(endpoint: str) -> bool:
     return "jevx.org" in (endpoint or "").lower()
 
 
+def _is_native_typesafe(endpoint: str) -> bool:
+    return "api.typesafe.ai" in (endpoint or "").lower()
+
+
+def _wrap_questions(questions: dict[str, Any]) -> dict[str, Any]:
+    """Map our state+questions shape onto official typesafe-sdk questions."""
+    from typesafe_sdk import Choice, Noul, Score
+
+    wrapped: dict[str, Any] = {}
+    for name, spec in (questions or {}).items():
+        if not isinstance(spec, dict):
+            continue
+        t = str(spec.get("type") or "").lower()
+        instructions = str(spec.get("instructions") or "")
+        if t == "choice" and isinstance(spec.get("criteria"), dict):
+            wrapped[name] = Choice(
+                instructions=instructions, criteria=dict(spec["criteria"])
+            )
+        elif t == "noul":
+            kw: dict[str, Any] = {"instructions": instructions}
+            if isinstance(spec.get("criteria"), dict):
+                kw["criteria"] = dict(spec["criteria"])
+            wrapped[name] = Noul(**kw)
+        elif t == "score" and isinstance(spec.get("criteria"), list):
+            wrapped[name] = Score(
+                instructions=instructions, criteria=list(spec["criteria"])
+            )
+    return wrapped
+
+
+def _post_via_sdk(
+    state: dict[str, Any],
+    questions: dict[str, Any],
+    *,
+    key: str,
+    model: str,
+    timeout_s: float,
+) -> tuple[dict[str, Any], int]:
+    """Official typesafe-sdk transport for the native endpoint.
+
+    Same wire protocol as the raw httpx path; the response is converted
+    back into the ``{"model", "answers"}`` shape :func:`_parse` expects.
+    Raises :class:`JevUnavailable` (degrades to heuristic) on any failure.
+    """
+    import time
+
+    from typesafe_sdk import TypeSafeClient
+
+    wrapped = _wrap_questions(questions)
+    if not wrapped:
+        raise JevUnavailable("jev: no wrappable questions for classifier")
+    clf = TypeSafeClient(api_key=key, model=model, timeout=float(timeout_s))
+    started = time.perf_counter()
+    try:
+        resp = clf.system_one(state=state, questions=wrapped)
+    except Exception as exc:  # noqa: BLE001 — degraded to heuristic by callers
+        raise JevUnavailable(
+            f"jev request failed: {type(exc).__name__}: {exc}"
+        ) from exc
+    latency_ms = int((time.perf_counter() - started) * 1000)
+    answers: dict[str, Any] = {}
+    for name, ans in dict(getattr(resp, "answers", {}) or {}).items():
+        kind = getattr(ans, "type", None)
+        if kind == "choice":
+            answers[name] = {
+                "choice": getattr(ans, "choice", None),
+                "probabilities": dict(getattr(ans, "probabilities", None) or {}),
+                "confidence": getattr(ans, "confidence", 0.5),
+            }
+        elif kind == "noul":
+            answers[name] = {"noul": getattr(ans, "noul", 0.5)}
+        elif kind == "score":
+            answers[name] = {
+                "score": getattr(ans, "score", 0.5),
+                "confidence": getattr(ans, "confidence", 0.5),
+            }
+    return {"model": getattr(resp, "model", None) or model, "answers": answers}, latency_ms
+
+
 def preflight() -> JevStatus:
     """Cheap, side-effect-free readiness check. Never touches the network."""
     if not ENABLED:
@@ -92,7 +191,7 @@ def preflight() -> JevStatus:
             configured=bool(_api_key()),
             endpoint=ENDPOINT,
             model=MODEL,
-            detail="JEV_ENABLED != 1. Set JEV_ENABLED=1 + TYPESAFE_API_KEY to use the JEV chair.",
+            detail="JEV_ENABLED != 1. Set JEV_ENABLED=1 + key (OPENCODE_GO_API_KEY for Zen free jev-1.13-free, or TYPESAFE_API_KEY) to use the JEV chair.",
         )
     key = _api_key()
     if not key:
@@ -101,7 +200,7 @@ def preflight() -> JevStatus:
             configured=False,
             endpoint=ENDPOINT,
             model=MODEL,
-            detail="JEV enabled but no key. Set TYPESAFE_API_KEY (or JEVX_API_KEY for the jevx proxy) in .env.",
+            detail="JEV enabled but no key. Set OPENCODE_GO_API_KEY (Zen) or TYPESAFE_API_KEY (or JEVX_API_KEY for the jevx proxy) in .env.",
         )
     return JevStatus(
         enabled=True, configured=True, endpoint=ENDPOINT, model=MODEL, detail="ready"
@@ -194,14 +293,22 @@ def build_state(card: Any, packet: Any, opinions: Optional[list[Any]] = None) ->
 
 
 def build_questions() -> dict[str, Any]:
-    """One call carries all three types — they share one state, one charge."""
-    return {
+    """One call carries every type — they share one state, one charge.
+
+    Follows https://docs.typesafe.ai/primitives: one snap judgment per
+    question, literal single-condition Nouls (a high value always means
+    yes), instructions naming the state fields they judge, and the full
+    option list on the Choice. Option order is fixed (buy/hold/avoid) so
+    answers stay comparable run to run.
+    """
+    questions: dict[str, Any] = {
         "action": {
             "type": "choice",
             "instructions": (
                 "As risk chair for a Solana memecoin scalp desk (long-only, "
-                "fake-money practice book), what should the book do? "
-                "Prefer avoid when unsure."
+                "fake-money practice book), what should the book do with "
+                "`token` given `edge_pct`, `liquidity_usd`, "
+                "`safety_verdict`, and `specialists`? Prefer avoid when unsure."
             ),
             "criteria": {
                 "buy": (
@@ -221,20 +328,59 @@ def build_questions() -> dict[str, Any]:
                 ),
             },
         },
-        "veto": {
+        "no_exit": {
             "type": "noul",
-            "instructions": "Should the risk committee veto any entry (force avoid)?",
+            "instructions": (
+                "Is there no safe exit route for `token` — honeypot, sells "
+                "fail, or `price_impact_pct` so high the position cannot be closed?"
+            ),
             "criteria": {
-                "true": (
-                    "Veto: honeypot or no exit, blocking safety, blowoff chase, "
-                    "implausible riskless band, or strong avoid consensus."
-                ),
-                "false": "No veto: entry may proceed under normal sizing rules.",
+                "true": "Cannot reliably sell: honeypot, failed sells, or exit wipes the position.",
+                "false": "A normal market sell can close the position.",
+            },
+        },
+        "safety_block": {
+            "type": "noul",
+            "instructions": (
+                "Does `safety_verdict` or `safety_summary` contain a blocking "
+                "safety flag — honeypot, freeze/mint authority abuse, or "
+                "extreme holder concentration?"
+            ),
+            "criteria": {
+                "true": "A blocking on-chain safety flag is present.",
+                "false": "No blocking safety flag.",
+            },
+        },
+        "chase": {
+            "type": "noul",
+            "instructions": (
+                "Is entering now chasing — a vertical blowoff, over-extended "
+                "move, or singleton spike with no base, per `safety_summary` "
+                "and `orderflow`?"
+            ),
+            "criteria": {
+                "true": "Price already ran; entry would chase the top.",
+                "false": "No blowoff; entry is not chasing.",
+            },
+        },
+        "bad_band": {
+            "type": "noul",
+            "instructions": (
+                "Is the forecast band implausible or downside — `p50` at or "
+                "below zero, or a riskless-looking interval promising profit "
+                "with no downside?"
+            ),
+            "criteria": {
+                "true": "Downside median or implausible risk-free band.",
+                "false": "Band is plausible with real upside and downside.",
             },
         },
         "quality": {
             "type": "score",
-            "instructions": "Entry quality from stay-out to high-quality.",
+            "instructions": (
+                "Entry quality from stay-out to high-quality, judging "
+                "`edge_pct`, `liquidity_usd`, `agreement`, and `specialists`."
+            ),
             "criteria": [
                 "Stay out: unsafe or no edge.",
                 "Marginal: weak edge or mixed signals, watch.",
@@ -242,6 +388,7 @@ def build_questions() -> dict[str, Any]:
             ],
         },
     }
+    return questions
 
 
 def _post(
@@ -260,15 +407,31 @@ def _post(
     if not _is_jevx(status.endpoint):
         body["model"] = status.model
 
+    if _is_native_typesafe(status.endpoint):
+        try:
+            return _post_via_sdk(
+                state,
+                questions,
+                key=key,
+                model=status.model,
+                timeout_s=float(timeout_s),
+            )
+        except ImportError:
+            pass  # SDK not installed — fall through to raw httpx
+
     started = time.perf_counter()
     try:
+        headers = {
+            "Authorization": f"Bearer {key}",
+            "Content-Type": "application/json",
+        }
+        session_id = os.getenv("OPENCODE_SESSION_ID", "").strip()
+        if session_id or "opencode.ai" in (status.endpoint or ""):
+            headers["x-opencode-session"] = session_id or "paper-desk"
         with httpx.Client(timeout=httpx.Timeout(timeout_s)) as client:
             resp = client.post(
                 status.endpoint,
-                headers={
-                    "Authorization": f"Bearer {key}",
-                    "Content-Type": "application/json",
-                },
+                headers=headers,
                 json=body,
             )
     except Exception as exc:  # noqa: BLE001 — network failure degrades to heuristic
@@ -279,6 +442,10 @@ def _post(
         raise JevUnavailable("jev: authentication_error — missing or bad key")
     if resp.status_code == 402:
         raise JevUnavailable("jev: insufficient_credits — top up, degrading to heuristic")
+    if resp.status_code == 403:
+        raise JevUnavailable(
+            "jev: forbidden — free-tier key used outside OpenCode or model not enabled, degrading to heuristic"
+        )
     if resp.status_code == 400:
         detail = (resp.text or "")[:300]
         raise JevUnavailable(f"jev: invalid_request — {detail}")
@@ -296,13 +463,36 @@ def _post(
     return payload, latency_ms
 
 
+def _veto_max(answers: dict[str, Any]) -> tuple[float, str]:
+    """Combine the atomic veto Nouls in code: their max wins.
+
+    Missing answers count as 0.5 (unsure), never as a veto. Returns the
+    winning probability and which question produced it.
+    """
+    best_p = 0.0
+    best_q = ""
+    for name in VETO_QUESTIONS:
+        ans = answers.get(name)
+        if not isinstance(ans, dict):
+            continue
+        try:
+            p = float(ans.get("noul", 0.5))
+        except (TypeError, ValueError):
+            continue
+        p = max(0.0, min(1.0, p))
+        if p >= best_p:
+            best_p, best_q = p, name
+    if not best_q:
+        return 0.5, ""
+    return round(best_p, 3), best_q
+
+
 def _parse(payload: dict[str, Any], *, latency_ms: int, model: str) -> JevVerdict:
     answers = payload.get("answers")
     if not isinstance(answers, dict):
         answers = payload
 
     action_ans = answers.get("action") if isinstance(answers.get("action"), dict) else {}
-    veto_ans = answers.get("veto") if isinstance(answers.get("veto"), dict) else {}
     quality_ans = (
         answers.get("quality") if isinstance(answers.get("quality"), dict) else {}
     )
@@ -319,10 +509,7 @@ def _parse(payload: dict[str, Any], *, latency_ms: int, model: str) -> JevVerdic
     except (TypeError, ValueError):
         action_conf = 0.5
 
-    try:
-        veto_prob = float(veto_ans.get("noul", 0.5))
-    except (TypeError, ValueError):
-        veto_prob = 0.5
+    veto_prob, _veto_source = _veto_max(answers)
 
     # Score scale has 3 steps; normalize to 0..1 regardless of 0..1 or 0..2 return.
     quality01 = 0.5
@@ -422,9 +609,13 @@ def chair_review(
 
     Returns ``None`` when JEV is disabled/unconfigured so callers fall back
     to the heuristic desk. Thresholds gate the proposal so a low-confidence
-    model cannot force trades on its own:
+    model cannot force trades on its own — the docs' three paths
+    (act / caution / don't act):
 
-    * veto only when ``veto_prob >= JEV_VETO_THRESHOLD`` (0.5 abstains never veto)
+    * veto (force avoid) only when max veto Noul ``>= JEV_VETO_THRESHOLD``
+      (0.5 unsure never vetoes)
+    * caution: a veto Noul in ``[JEV_VETO_CAUTION, JEV_VETO_THRESHOLD)``
+      blocks new entries (buy→hold) without forcing avoid
     * buy only when ``action_confidence >= JEV_MIN_CONFIDENCE``
     """
     from decision import pipeline_log
@@ -441,12 +632,29 @@ def chair_review(
             pass
         return None
 
+    raw_answers = verdict.raw.get("answers", {}) if isinstance(verdict.raw, dict) else {}
+    _, veto_source = _veto_max(raw_answers if isinstance(raw_answers, dict) else {})
+
     abstained = verdict.veto_prob == 0.5
     veto = (not abstained) and verdict.veto_prob >= VETO_THRESHOLD
+    caution = (
+        not veto
+        and verdict.action == "buy"
+        and VETO_CAUTION <= verdict.veto_prob < VETO_THRESHOLD
+    )
 
     if veto:
         proposed = "avoid"
-        reason = f"jev veto p={verdict.veto_prob:.2f} (threshold {VETO_THRESHOLD:.2f})"
+        reason = (
+            f"jev veto[{veto_source or 'veto'}] "
+            f"p={verdict.veto_prob:.2f} (threshold {VETO_THRESHOLD:.2f})"
+        )
+    elif caution:
+        proposed = "hold"
+        reason = (
+            f"jev caution[{veto_source or 'veto'}] "
+            f"p={verdict.veto_prob:.2f} — entry blocked, watch"
+        )
     elif verdict.action == "buy" and verdict.action_confidence < MIN_CONFIDENCE:
         proposed = "hold"
         reason = (

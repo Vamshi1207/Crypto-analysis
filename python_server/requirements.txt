@@ -11,6 +11,10 @@ httpx
 pydantic>=2
 cachetools
 
+# JEV chair transport (official SDK for the native endpoint;
+# raw httpx fallback covers Zen proxy / jevx when this is absent).
+typesafe-sdk==0.7.4
+
 # Tests
 pytest
 
