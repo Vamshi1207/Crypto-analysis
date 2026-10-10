@@ -667,3 +667,21 @@ def test_snipe_gated_open_passes_through_on_hold(monkeypatch, tmp_path):
         confirm_dex=False,
     )
     assert out["status"] == "opened"
+
+
+def test_m5_bounds_keep_momentum_reject_blowoff(monkeypatch):
+    monkeypatch.setattr(trenches, "CLUSTER_MIN_M5_PCT", 5.0)
+    monkeypatch.setattr(trenches, "CLUSTER_MAX_M5_PCT", 150.0)
+    assert trenches._m5_ok(30.0) == (True, "")
+    assert trenches._m5_ok(None) == (True, "")
+    ok, why = trenches._m5_ok(2.0)
+    assert ok is False and why.startswith("m5_low")
+    ok, why = trenches._m5_ok(772.0)
+    assert ok is False and why.startswith("m5_high")
+
+
+def test_m5_bounds_off_disables_both(monkeypatch):
+    monkeypatch.setattr(trenches, "CLUSTER_MIN_M5_PCT", 0.0)
+    monkeypatch.setattr(trenches, "CLUSTER_MAX_M5_PCT", 0.0)
+    assert trenches._m5_ok(0.01)[0] is True
+    assert trenches._m5_ok(9999.0)[0] is True

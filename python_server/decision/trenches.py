@@ -75,6 +75,10 @@ CLUSTER_DEAD_SEC = _env_float("CLUSTER_DEAD_SEC", 0.0)
 CLUSTER_STOP_USD = _env_float("CLUSTER_STOP_USD", 0.0)
 # Require DexScreener 5m % change ≥ this before opening (0 = off).
 CLUSTER_MIN_M5_PCT = _env_float("CLUSTER_MIN_M5_PCT", 0.0)
+# Refuse parabolic blowoffs above this 5m % (0 = off). Backtest over 118
+# closes: m5>150% entries averaged -$16.4/trade (instant rugs); the edge
+# estimate (m5 minus costs) otherwise reads parabolas as attractive.
+CLUSTER_MAX_M5_PCT = _env_float("CLUSTER_MAX_M5_PCT", 150.0)
 # JEV chair gate on trenches opens (0 = off, today's behavior). Veto or
 # avoid from the chair blocks the open; hold/buy (or an offline chair)
 # proceeds. Blocks are remembered per mint so a rejected name is not
@@ -404,19 +408,17 @@ def _scan(*, do_cluster: bool = True) -> dict[str, Any]:
             )
             continue
         m5_pct: Optional[float] = None
-        if is_cluster and CLUSTER_MIN_M5_PCT > 0:
+        if is_cluster and (CLUSTER_MIN_M5_PCT > 0 or CLUSTER_MAX_M5_PCT > 0):
             m5_pct = dex_m5_pct(mint, pool=row.get("pool"))
-            if m5_pct is None or m5_pct < CLUSTER_MIN_M5_PCT:
+            ok_m5, why_m5 = _m5_ok(m5_pct)
+            if not ok_m5:
                 skipped += 1
                 pipeline_log.emit(
                     "trenches",
                     "skip",
                     mint=mint,
                     symbol=row.get("symbol"),
-                    reason=(
-                        f"m5_low {m5_pct if m5_pct is not None else 'none'}"
-                        f"<{CLUSTER_MIN_M5_PCT}"
-                    ),
+                    reason=why_m5,
                     m5_pct=m5_pct,
                 )
                 continue
@@ -899,6 +901,24 @@ def _process_watchlist_and_exits() -> int:
                     )
                     exits += len(closed)
     return exits
+
+
+def _buyers_ok(n: int) -> bool:
+    return n >= CLUSTER_MIN_WALLETS
+
+
+def _m5_ok(m5_pct: Optional[float]) -> tuple[bool, str]:
+    """Lower bound keeps momentum; upper bound rejects blowoffs.
+
+    Missing Dex data (None) never blocks — other screens still apply.
+    """
+    if m5_pct is None:
+        return True, ""
+    if CLUSTER_MIN_M5_PCT > 0 and m5_pct < CLUSTER_MIN_M5_PCT:
+        return False, f"m5_low {m5_pct}<{CLUSTER_MIN_M5_PCT}"
+    if CLUSTER_MAX_M5_PCT > 0 and m5_pct > CLUSTER_MAX_M5_PCT:
+        return False, f"m5_high {m5_pct}>{CLUSTER_MAX_M5_PCT}"
+    return True, ""
 
 
 def _gate0(mint: str) -> tuple[bool, str, Optional[Any]]:
