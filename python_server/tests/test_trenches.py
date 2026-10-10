@@ -685,3 +685,71 @@ def test_m5_bounds_off_disables_both(monkeypatch):
     monkeypatch.setattr(trenches, "CLUSTER_MAX_M5_PCT", 0.0)
     assert trenches._m5_ok(0.01)[0] is True
     assert trenches._m5_ok(9999.0)[0] is True
+
+
+def test_copy_leaders_counts_windowed_buys(monkeypatch):
+    import time as _time
+
+    monkeypatch.setattr(trenches, "COPY_ENABLED", True)
+    monkeypatch.setattr(trenches, "COPY_WINDOW_SEC", 120.0)
+    now = _time.time()
+    monkeypatch.setattr(
+        trenches, "_buys", {"M1": {"w1": now - 10, "w2": now - 5000}}
+    )
+    assert trenches._copy_leaders("M1", now=now) == ["w1"]
+    assert trenches._copy_leaders("MISSING", now=now) == []
+
+
+def test_copy_opens_on_leader_buy(monkeypatch, tmp_path):
+    import time as _time
+
+    from decision import jev as jev_mod
+    from decision import labs as labs_mod
+    from decision import store as decision_store
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(decision_store, "STORE_DIR", tmp_path / "store")
+    monkeypatch.setattr(labs_mod, "ENABLED", True)
+    monkeypatch.setattr(trenches, "COPY_ENABLED", True)
+    monkeypatch.setattr(trenches, "COPY_MIN_LEADERS", 1)
+    monkeypatch.setattr(trenches, "SNIPER_ENABLED", False)
+    monkeypatch.setattr(
+        jev_mod, "chair_review",
+        lambda *a, **k: {
+            "veto": False, "action": "hold", "claim": "jev hold",
+            "reason": "jev hold", "backend": "jev", "confidence": 0.8,
+            "veto_prob": 0.1, "quality": 0.5, "probs": {}, "latency_ms": 5,
+            "model": "jev-latest",
+        },
+    )
+    monkeypatch.setattr(
+        trenches, "check_token",
+        lambda mint: SimpleNamespace(
+            blocking=False, verdict=SimpleNamespace(value="ok"),
+            risk_score=5, summary=lambda: "ok",
+            sellability=SimpleNamespace(price_impact_pct=0.2),
+        ),
+    )
+    monkeypatch.setattr(trenches, "dex_m5_pct", lambda mint, pool=None: 10.0)
+    monkeypatch.setattr(
+        trenches, "confirm_entry_price", lambda mint, pool=None, gecko_usd=0: (1e-5, "ok")
+    )
+    mint = "CopyMint11111111111111111111111111111"
+    row = dict(_cluster_row(mint))
+    monkeypatch.setattr(trenches, "list_launch_candidates", lambda: [row])
+    monkeypatch.setattr(trenches, "unique_buyers_recent", lambda *a, **k: [])
+    trenches.reset_counters()
+    monkeypatch.setattr(trenches, "_buys", {mint: {"leader1": _time.time()}})
+    paper.reset(starting_cash_usd=1000.0)
+    result = trenches._scan(do_cluster=True)
+    assert result["copy_fires"] == 1
+    assert result["copy_opens"] == 1
+    with paper.use_lane("copy"):
+        assert paper.snapshot()["open_count"] == 1
+
+
+def test_copy_skips_without_leaders(monkeypatch):
+    monkeypatch.setattr(trenches, "COPY_ENABLED", True)
+    monkeypatch.setattr(trenches, "COPY_MIN_LEADERS", 1)
+    monkeypatch.setattr(trenches, "_buys", {})
+    assert trenches._copy_leaders("M1") == []
