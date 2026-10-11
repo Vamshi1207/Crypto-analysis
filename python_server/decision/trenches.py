@@ -1577,7 +1577,7 @@ def _mark_open_lots() -> None:
         if lane.id not in lane_ids:
             lane_ids.append(lane.id)
     if labs.ENABLED:
-        for lid in (labs.CLUSTER_LANE, labs.SCALP_LANE):
+        for lid in (labs.CLUSTER_LANE, labs.SCALP_LANE, labs.COPY_LANE):
             if lid not in lane_ids:
                 lane_ids.append(lid)
 
@@ -1602,7 +1602,7 @@ def _mark_open_lots() -> None:
                     continue
                 tape = tape_map.get(str(mint or "")) or {}
                 mark = None
-                if reason in {"snipe", "cluster", "launch"} and mint:
+                if reason in {"snipe", "cluster", "launch", "copy"} and mint:
                     mark = _snipe_marks.get(str(mint))
                     if mark is None:
                         mark = float(tape.get("last_px") or 0.0) or None
@@ -1615,7 +1615,7 @@ def _mark_open_lots() -> None:
                         paper.observe_mark(str(mint), float(mark))
                     force = (
                         _tape_force_reason(tape)
-                        if reason in {"snipe", "cluster", "launch"}
+                        if reason in {"snipe", "cluster", "launch", "copy"}
                         else None
                     )
                     paper.mark_and_maybe_exit(

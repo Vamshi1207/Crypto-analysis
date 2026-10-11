@@ -838,6 +838,53 @@ def test_copy_skips_without_leaders(monkeypatch):
     assert trenches._copy_leaders("M1") == []
 
 
+def test_mark_open_lots_reaches_copy_lane(monkeypatch):
+    """Copy-lane lots must be marked for exits like every other lane.
+
+    Regression: _mark_open_lots built its lane list without the copy lane, so
+    copy positions opened and never closed (stuck until a leader-sell that, with
+    no CLUSTER_WALLETS, never came).
+    """
+    from datetime import datetime, timedelta, timezone
+
+    from decision import labs as labs_mod
+
+    monkeypatch.setattr(labs_mod, "ENABLED", True)
+    paper.reset(starting_cash_usd=1000.0)
+    opened = (datetime.now(timezone.utc) - timedelta(seconds=120)).isoformat()
+    with paper.use_lane("copy"):
+        paper._state.open.append(
+            paper.PaperPosition(
+                id="c1",
+                address="PoolC",
+                mint="MintC11111111111111111111111111111",
+                name="COPY",
+                entry_price=1.0,
+                size_usd=40.0,
+                qty=40.0,
+                opened_at=opened,
+                target_profit_usd=1.0,
+                stop_loss_usd=1.6,
+                entry_reason="copy",
+                dead_after_sec=90.0,
+                max_hold_sec=300.0,
+            )
+        )
+
+    monkeypatch.setattr(snipe_feed, "tapes", lambda sol_usd=150: {})
+    monkeypatch.setattr(trenches, "_snipe_marks", {})
+    monkeypatch.setattr(trenches, "dex_price_usd", lambda mint, pool=None: 1.0)
+    marked = []
+    monkeypatch.setattr(
+        paper,
+        "mark_and_maybe_exit",
+        lambda address, mark_price, force_reason=None: marked.append(address) or [],
+    )
+
+    trenches._mark_open_lots()
+    assert "PoolC" in marked
+
+
 def test_toxic_flow_needs_sample_and_supermajority(monkeypatch):
     monkeypatch.setattr(trenches, "TOX_MIN_SWAPS", 6)
     monkeypatch.setattr(trenches, "TOX_MAX_SELL_FRAC", 0.6)
