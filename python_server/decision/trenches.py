@@ -127,13 +127,18 @@ def _curve_state(mint: str) -> Optional[dict[str, Any]]:
 # JEV chair gate on trenches opens (0 = off, today's behavior, per
 # strategy). Veto or avoid from the chair blocks the open; hold/buy (or
 # an offline chair) proceeds. Blocks are remembered per mint so a
-# rejected name is not re-asked every tick. Arb fills stay out (their
-# own veto-only gate): computed edge is never second-guessed there.
+# rejected name is not re-asked every tick. A sniper proceed is reused
+# for the watch window so both lanes and later ticks share one call.
+# Arb fills stay out (their own veto-only gate): computed edge is never
+# second-guessed there.
 JEV_CLUSTER_GATE = os.getenv("JEV_CLUSTER_GATE", "1").strip() == "1"
 JEV_LAUNCH_GATE = os.getenv("JEV_LAUNCH_GATE", "1").strip() == "1"
 JEV_SNIPER_GATE = os.getenv("JEV_SNIPER_GATE", "1").strip() == "1"
 JEV_COPY_GATE = os.getenv("JEV_COPY_GATE", "1").strip() == "1"
 JEV_CLUSTER_RECHECK_SEC = _env_float("JEV_CLUSTER_RECHECK_SEC", 300.0)
+# 0 = SNIPER_WATCH_SEC. Positive overrides how long a sniper proceed
+# is reused without another chair call.
+JEV_SNIPER_PROCEED_SEC = _env_float("JEV_SNIPER_PROCEED_SEC", 0.0)
 
 
 def _strategy_gate_on(strategy: str) -> bool:
@@ -143,7 +148,17 @@ def _strategy_gate_on(strategy: str) -> bool:
         "snipe": JEV_SNIPER_GATE,
         "copy": JEV_COPY_GATE,
     }.get(strategy or "", False)
+
+
+def _snipe_proceed_ttl() -> float:
+    if JEV_SNIPER_PROCEED_SEC > 0:
+        return JEV_SNIPER_PROCEED_SEC
+    return SNIPER_WATCH_SEC
+
+
 _jev_blocked: dict[str, float] = {}
+# mint → (ts, reason) for a real sniper proceed. Offline/error is not cached.
+_jev_proceed: dict[str, tuple[float, str]] = {}
 MAX_PER_TICK = _env_int("TRENCHES_MAX_PER_TICK", 2)
 # Create-event sniper: watch the landed create, buy only if the tape lifts.
 SNIPER_ENABLED = os.getenv("SNIPER_ENABLED", "1").strip() == "1"
@@ -235,6 +250,7 @@ def reset_counters() -> dict[str, Any]:
         _state.last_hits = []
         _seen_mints.clear()
         _jev_blocked.clear()
+        _jev_proceed.clear()
         _swaps_cache.clear()
         _curve_cache.clear()
         _snipe_marks.clear()
@@ -1188,7 +1204,8 @@ def _jev_cluster_gate(
     Fail-open: a disabled/unavailable chair proceeds exactly as before.
     A blocked mint stays blocked for ``JEV_CLUSTER_RECHECK_SEC`` without
     re-asking (bounds API cost); the mint is NOT added to ``_seen_mints``
-    so a better tape can still open it later.
+    so a better tape can still open it later. A sniper proceed is reused
+    for the watch window (both lanes, later ticks) and is not a block.
     """
     from types import SimpleNamespace
 
@@ -1202,6 +1219,10 @@ def _jev_cluster_gate(
     blocked_at = _jev_blocked.get(mint, 0.0)
     if blocked_at and now - blocked_at < JEV_CLUSTER_RECHECK_SEC:
         return False, "jev_cooldown"
+    if strategy == "snipe" and mint:
+        cached = _jev_proceed.get(mint)
+        if cached and now - cached[0] < _snipe_proceed_ttl():
+            return True, cached[1]
     try:
         from decision import jev as jev_mod
     except Exception:  # noqa: BLE001 — chair unavailable, trade as before
@@ -1273,12 +1294,17 @@ def _jev_cluster_gate(
     if review is None:
         return True, "jev_offline"
     if review.get("veto"):
+        _jev_proceed.pop(mint, None)
         _jev_blocked[mint] = now
         return False, f"jev_veto: {review.get('reason', '')}"[:200]
     if review.get("action") == "avoid":
+        _jev_proceed.pop(mint, None)
         _jev_blocked[mint] = now
         return False, f"jev_avoid: {review.get('reason', '')}"[:200]
-    return True, f"jev_{review.get('action', 'hold')}"
+    reason = f"jev_{review.get('action', 'hold')}"
+    if strategy == "snipe" and mint:
+        _jev_proceed[mint] = (now, reason)
+    return True, reason
 
 
 def _snipe_gated_open(row: dict[str, Any], *, _tape: Optional[dict[str, Any]], **kw: Any) -> dict[str, Any]:

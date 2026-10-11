@@ -101,6 +101,7 @@ def _wire_chair(monkeypatch, review):
     monkeypatch.setattr(trenches, "JEV_CLUSTER_GATE", True)
     monkeypatch.setattr(jev_mod, "chair_review", lambda *a, **k: review)
     trenches._jev_blocked.clear()
+    trenches._jev_proceed.clear()
 
 
 def test_jev_gate_veto_blocks_cluster_open(monkeypatch):
@@ -143,6 +144,7 @@ def test_jev_gate_block_cools_down_without_reasking(monkeypatch):
         jev_mod, "chair_review", lambda *a, **k: calls.append(1) or _chair(veto=True)
     )
     trenches._jev_blocked.clear()
+    trenches._jev_proceed.clear()
     row = _cluster_row()
     assert trenches._jev_cluster_gate(row, ["a", "b", "c"], 6.0)[0] is False
     assert trenches._jev_cluster_gate(row, ["a", "b", "c"], 6.0) == (False, "jev_cooldown")
@@ -166,6 +168,7 @@ def test_jev_gate_state_carries_edge_and_safety(monkeypatch):
     monkeypatch.setattr(trenches, "JEV_CLUSTER_GATE", True)
     monkeypatch.setattr(jev_mod, "chair_review", fake_chair)
     trenches._jev_blocked.clear()
+    trenches._jev_proceed.clear()
     report = SimpleNamespace(
         verdict=SimpleNamespace(value="caution"),
         risk_score=30,
@@ -601,6 +604,74 @@ def test_jev_gate_snipe_hold_proceeds(monkeypatch):
     assert proceed is True
 
 
+def test_snipe_proceed_is_shared_across_lanes(monkeypatch):
+    from decision import jev as jev_mod
+
+    calls = []
+    monkeypatch.setattr(trenches, "JEV_SNIPER_GATE", True)
+    monkeypatch.setattr(
+        jev_mod, "chair_review", lambda *a, **k: calls.append(1) or _chair(action="hold")
+    )
+    trenches._jev_blocked.clear()
+    trenches._jev_proceed.clear()
+    row = _snipe_row()
+    first = trenches._jev_cluster_gate(row, [], None, None, strategy="snipe")
+    second = trenches._jev_cluster_gate(row, [], None, None, strategy="snipe")
+    assert first == (True, "jev_hold")
+    assert second == (True, "jev_hold")
+    assert len(calls) == 1
+
+
+def test_snipe_proceed_reasks_after_watch(monkeypatch):
+    from decision import jev as jev_mod
+
+    calls = []
+    clock = {"now": 1_000.0}
+    monkeypatch.setattr(trenches, "JEV_SNIPER_GATE", True)
+    monkeypatch.setattr(trenches, "JEV_SNIPER_PROCEED_SEC", 10.0)
+    monkeypatch.setattr(trenches.time, "time", lambda: clock["now"])
+    monkeypatch.setattr(
+        jev_mod, "chair_review", lambda *a, **k: calls.append(1) or _chair(action="buy")
+    )
+    trenches._jev_blocked.clear()
+    trenches._jev_proceed.clear()
+    row = _snipe_row()
+    assert trenches._jev_cluster_gate(row, [], None, None, strategy="snipe")[0] is True
+    clock["now"] = 1_011.0
+    assert trenches._jev_cluster_gate(row, [], None, None, strategy="snipe") == (True, "jev_buy")
+    assert len(calls) == 2
+
+
+def test_snipe_offline_is_not_cached(monkeypatch):
+    from decision import jev as jev_mod
+
+    calls = []
+    monkeypatch.setattr(trenches, "JEV_SNIPER_GATE", True)
+    monkeypatch.setattr(jev_mod, "chair_review", lambda *a, **k: calls.append(1) or None)
+    trenches._jev_blocked.clear()
+    trenches._jev_proceed.clear()
+    row = _snipe_row()
+    assert trenches._jev_cluster_gate(row, [], None, None, strategy="snipe") == (True, "jev_offline")
+    assert trenches._jev_cluster_gate(row, [], None, None, strategy="snipe") == (True, "jev_offline")
+    assert len(calls) == 2
+
+
+def test_cluster_proceed_still_reasks(monkeypatch):
+    from decision import jev as jev_mod
+
+    calls = []
+    monkeypatch.setattr(trenches, "JEV_CLUSTER_GATE", True)
+    monkeypatch.setattr(
+        jev_mod, "chair_review", lambda *a, **k: calls.append(1) or _chair(action="hold")
+    )
+    trenches._jev_blocked.clear()
+    trenches._jev_proceed.clear()
+    row = _cluster_row()
+    assert trenches._jev_cluster_gate(row, ["a", "b", "c"], 6.0)[0] is True
+    assert trenches._jev_cluster_gate(row, ["a", "b", "c"], 6.0)[0] is True
+    assert len(calls) == 2
+
+
 def test_jev_gate_flag_off_per_strategy(monkeypatch):
     from decision import jev as jev_mod
 
@@ -610,6 +681,7 @@ def test_jev_gate_flag_off_per_strategy(monkeypatch):
     monkeypatch.setattr(jev_mod, "chair_review", boom)
     monkeypatch.setattr(trenches, "JEV_SNIPER_GATE", False)
     trenches._jev_blocked.clear()
+    trenches._jev_proceed.clear()
     proceed, reason = trenches._jev_cluster_gate(
         _snipe_row(), [], None, None, strategy="snipe"
     )
