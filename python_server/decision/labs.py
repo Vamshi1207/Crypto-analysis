@@ -6,16 +6,36 @@ spray-and-scratch sniper cannot hide what the 40% rip book is doing.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 from dataclasses import asdict, dataclass
 from typing import Any, Optional
 
 from decision import paper
 from decision import sizing as sizing_mod
-from decision.pumpfun import snipe_lift_pct
-from decision import snipe_desk
+from decision.engines.sniper.pumpfun import snipe_lift_pct
+from decision.engines.sniper import desk as snipe_desk
 
 ENABLED = os.getenv("LABS_ENABLED", "1").strip() == "1"
+
+
+def lane_config_hash(lane: SnipeLane) -> str:
+    """Stable SHA-256 of a lane's frozen parameters (16 hex chars).
+
+    Every result is tagged with this so trades can never be silently
+    re-attributed to a differently-tuned lane. Edit ``SNIPE_LANES`` and the
+    hash changes, breaking aggregation across configs on purpose.
+    """
+    payload = json.dumps(asdict(lane), sort_keys=True, default=str)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def hash_for_lane(lane_id: str) -> Optional[str]:
+    for lane in SNIPE_LANES:
+        if lane.id == lane_id:
+            return lane_config_hash(lane)
+    return None
 
 
 @dataclass(frozen=True)
@@ -40,9 +60,10 @@ class SnipeLane:
     max_lift_pct: float = 40.0
 
 
-# Same Pump tape, two books. Logs: sniper scratches are -EV once ghost
-# rips are stripped. Cluster-style hold (300s, trail, no dead_tape) was
-# +$2.30/trade across 266 fills. That is the money book.
+# Same Pump tape, two books. NOTE: any +$N/trade figure quoted here is an
+# in-sample estimate and must NOT be read as evidence of edge — promotion now
+# requires out-of-sample significance via decision/validation.py (frozen
+# params, n floor, positive expectancy, t >= z_crit). See experiments.json.
 SNIPE_LANES: tuple[SnipeLane, ...] = (
     SnipeLane(
         id="hold",
@@ -111,6 +132,7 @@ def lane_meta() -> list[dict[str, Any]]:
             "family": "snipe",
             "label": lane.label,
             "thesis": lane.thesis,
+            "config_hash": lane_config_hash(lane),
             "params": {k: v for k, v in asdict(lane).items() if k not in {"id", "label", "thesis"}},
         }
         for lane in SNIPE_LANES
@@ -134,32 +156,26 @@ def snipe_lanes() -> tuple[SnipeLane, ...]:
 
 
 def primary_lane_id() -> str:
-    """Dashboard /portfolio book: the live leader, else the hold book.
+    """Dashboard /portfolio book: the first lane that clears the significance
+    gate, else the hold book.
 
-    Open lots beat closed PnL so a busy cluster book is not hidden behind a
-    scratch sniper that already booked a couple of dollars.
+    Promotion is by out-of-sample statistical significance (n ≥ floor, positive
+    expectancy, t ≥ z_crit), never by raw realized PnL or open-lot count. A lane
+    that only looks busy cannot hide behind a lane that actually proved an edge.
     """
     if not ENABLED:
         return paper.DEFAULT_LANE
     preferred = SNIPE_LANES[0].id if SNIPE_LANES else paper.DEFAULT_LANE
     board = paper.lane_board()
-    active = [
-        row
-        for row in (board.get("lanes") or [])
-        if row.get("id") != paper.DEFAULT_LANE
-        and ((row.get("closed_count") or 0) or (row.get("open_count") or 0))
-    ]
-    if not active:
-        return preferred
-    active.sort(
-        key=lambda row: (
-            int(row.get("open_count") or 0),
-            int(row.get("closed_count") or 0),
-            float(row.get("realized_pnl_usd") or 0.0),
-        ),
+    lanes = [row for row in (board.get("lanes") or []) if row.get("id") != paper.DEFAULT_LANE]
+    significant = sorted(
+        [row for row in lanes if row.get("significant")],
+        key=lambda r: float(r.get("realized_pnl_usd") or 0.0),
         reverse=True,
     )
-    return str(active[0]["id"])
+    if significant:
+        return str(significant[0]["id"])
+    return preferred
 
 
 def already_seen(lane_id: str, mint: str) -> bool:
@@ -299,6 +315,7 @@ def consider_snipe(
         **row,
         "strategy": "snipe",
         "lane": lane.id,
+        "config_hash": lane_config_hash(lane),
         "buyers": unique,
         "lift_pct": round(lift, 2),
         "entry_why": desk.why,

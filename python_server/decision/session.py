@@ -9,9 +9,11 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from decision import arb, discover, paper, pipeline_log
+from decision import paper, pipeline_log
 from decision import trenches
 from decision import store as decision_store
+from decision.engines.arb import engine as arb
+from decision.engines.finder import discover
 
 KINDS = (
     "decisions",

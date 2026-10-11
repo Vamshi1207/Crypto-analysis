@@ -27,6 +27,23 @@ def disable_fill_audit(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def disable_exec_sim(monkeypatch):
+    """Latency fills need a live mark buffer; unit tests stay instant-open."""
+    from decision import exec_sim
+
+    monkeypatch.setattr(exec_sim, "ENABLED", False)
+    exec_sim.reset()
+
+
+@pytest.fixture(autouse=True)
+def disable_rug_detect(monkeypatch):
+    """Confirmed-rug checks hit Helius/Gecko; unit tests stay offline."""
+    from decision import rug_detect
+
+    monkeypatch.setattr(rug_detect, "ENABLED", False)
+
+
+@pytest.fixture(autouse=True)
 def isolated_store(tmp_path, monkeypatch):
     """Redirect the append-only log to a temp dir for every test.
 
@@ -65,7 +82,7 @@ def paper_concentration_headroom(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def clear_snipe_desk():
-    from decision import snipe_desk
+    from decision.engines.sniper import desk as snipe_desk
 
     snipe_desk.clear()
     yield

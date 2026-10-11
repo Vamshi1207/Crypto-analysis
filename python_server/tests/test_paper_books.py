@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import threading
 from datetime import datetime, timedelta, timezone
+
+import pytest
 
 from decision import paper
 
@@ -109,3 +112,30 @@ def test_close_by_mint_hits_all_lanes():
         assert len(paper._state.open) == 0
     with paper.use_lane("main"):
         assert len(paper._state.open) == 0
+
+
+def test_lane_book_creation_is_race_free():
+    """Concurrent first-touch of the same lane must create exactly one book."""
+    paper.reset()
+    lane = "race_lane"
+    errors: list[BaseException] = []
+
+    def touch() -> None:
+        try:
+            with paper.use_lane(lane):
+                book = paper._cur()
+                book.cash_usd += 1.0
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=touch) for _ in range(32)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert not errors
+    assert lane in paper._books
+    with paper.use_lane(lane):
+        # 32 increments of 1.0 must all have landed on the same book.
+        assert paper._cur().cash_usd == pytest.approx(1000.0 + 32.0)

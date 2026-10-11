@@ -22,7 +22,7 @@ from typing import Any, Optional
 
 from decision import pipeline_log
 from decision.config import SETTINGS
-from decision.pumpfun import (
+from decision.engines.sniper.pumpfun import (
     PUMP_PROGRAM,
     VIRTUAL_SOL_LAMPORTS,
     VIRTUAL_TOKEN_RAW,

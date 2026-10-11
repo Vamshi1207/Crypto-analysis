@@ -59,8 +59,12 @@ REENTRY_COOLDOWN_SEC = _env_float("PAPER_REENTRY_COOLDOWN_SEC", 0.0)
 #   barrier — exit at the price that realizes exactly -stop_loss_usd (limit-stop ideal)
 #   mark    — exit at the jumped mark (live-like; can blow past the dollar stop)
 STOP_FILL_MODE = os.getenv("PAPER_STOP_FILL_MODE", "barrier").strip().lower()
-# Absolute floor even in mark mode: never book worse than this fraction of size.
-MAX_LOSS_PCT = _env_float("PAPER_MAX_LOSS_PCT", 8.0)
+# Absolute floor in mark mode: never book worse than this fraction of size.
+# 0 = off (honest — a real rug books its full loss). >0 caps a stop-out gap to
+# that fraction, which *understates* real rug losses; only opt in when you have
+# reason to believe a single ghost print is the more common failure mode. A
+# value of 100 (or >= size) is equivalent to off.
+MAX_LOSS_PCT = _env_float("PAPER_MAX_LOSS_PCT", 0.0)
 # Concentration: 0 = unlimited (analysis / portfolio cash decide). Loss cap still applies.
 MAX_TRADES_PER_MINT_DAY = _env_int("PAPER_MAX_TRADES_PER_MINT_DAY", 0)
 MAX_NOTIONAL_PER_MINT_DAY = _env_float("PAPER_MAX_NOTIONAL_PER_MINT_DAY", 0.0)
@@ -228,8 +232,13 @@ def _cur() -> PortfolioState:
     lane = _active_lane.get() or DEFAULT_LANE
     book = _books.get(lane)
     if book is None:
-        book = _new_book()
-        _books[lane] = book
+        # Create-if-missing under the lock: two threads first-touching the same
+        # lane must not race two books (ContextVar is per-thread, _books is not).
+        with _lock:
+            book = _books.get(lane)
+            if book is None:
+                book = _new_book()
+                _books[lane] = book
     return book
 
 
@@ -260,6 +269,24 @@ def use_lane(lane: str) -> Iterator[str]:
 
 def active_lane() -> str:
     return _active_lane.get() or DEFAULT_LANE
+
+
+def _lane_tag() -> dict[str, Any]:
+    """Durable attribution for a stored fill: the lane and its frozen config hash.
+
+    Tagged on every open/close so a trade can never be silently re-attributed to
+    a differently-tuned lane when the store is replayed for validation.
+    """
+    tag: dict[str, Any] = {"lane": active_lane()}
+    try:
+        from decision import labs
+
+        h = labs.hash_for_lane(active_lane())
+        if h:
+            tag["config_hash"] = h
+    except Exception:  # noqa: BLE001
+        pass
+    return tag
 
 
 def known_lanes() -> list[str]:
@@ -342,13 +369,23 @@ def snapshot() -> dict[str, Any]:
 
 
 def lane_board() -> dict[str, Any]:
-    """Side-by-side PnL for every isolated paper book."""
+    """Side-by-side PnL for every isolated paper book.
+
+    Each lane row carries a statistical readout (expectancy, t-stat, 95% CI,
+    max drawdown) and a ``significant`` gate flag. Promotion must use that flag,
+    never raw realized PnL — a busy lane that lost money must not hide behind a
+    scratch book that booked a couple of dollars.
+    """
     try:
         from decision import labs
 
         meta = {row["id"]: row for row in labs.lane_meta()}
     except Exception:
         meta = {}
+    try:
+        from decision import validation
+    except Exception:  # noqa: BLE001
+        validation = None
     lanes: list[dict[str, Any]] = []
     for lid in known_lanes():
         with use_lane(lid):
@@ -358,22 +395,26 @@ def lane_board() -> dict[str, Any]:
             losses = sum(1 for x in pnls if x < 0)
             n = len(pnls)
             info = meta.get(lid) or {"id": lid, "family": lid, "label": lid, "thesis": ""}
-            lanes.append(
-                {
-                    **info,
-                    "cash_usd": round(book.cash_usd, 4),
-                    "realized_pnl_usd": round(book.realized_pnl_usd, 4),
-                    "open_count": len(book.open),
-                    "closed_count": n,
-                    "wins": wins,
-                    "losses": losses,
-                    "flats": n - wins - losses,
-                    "win_rate": round(wins / n, 4) if n else None,
-                    "avg_pnl_usd": round(sum(pnls) / n, 4) if n else None,
-                    "arb_fills": book.arb_fills,
-                    "arb_realized_pnl_usd": round(book.arb_realized_pnl_usd, 4),
-                }
-            )
+            row: dict[str, Any] = {
+                **info,
+                "cash_usd": round(book.cash_usd, 4),
+                "realized_pnl_usd": round(book.realized_pnl_usd, 4),
+                "open_count": len(book.open),
+                "closed_count": n,
+                "wins": wins,
+                "losses": losses,
+                "flats": n - wins - losses,
+                "win_rate": round(wins / n, 4) if n else None,
+                "avg_pnl_usd": round(sum(pnls) / n, 4) if n else None,
+                "arb_fills": book.arb_fills,
+                "arb_realized_pnl_usd": round(book.arb_realized_pnl_usd, 4),
+            }
+            if validation is not None:
+                ev = validation.evaluate_lane([{"realized_pnl_usd": p} for p in pnls])
+                row["stats"] = ev["stats"]
+                row["significant"] = ev["significant"]
+                row["significance_reason"] = ev["reason"]
+            lanes.append(row)
     ranked = sorted(lanes, key=lambda r: (r.get("realized_pnl_usd") or 0.0), reverse=True)
     return {
         "lanes": ranked,
@@ -428,9 +469,25 @@ def observe_mark(mint: str, price: float) -> None:
 def drain_pending_buys(
     *, fallback_price_fn: Optional[Any] = None
 ) -> list[dict[str, Any]]:
-    """Materialize buys whose on-chain latency window has elapsed."""
+    """Materialize buys whose on-chain latency window has elapsed.
+
+    Also polls Dex once for *waiting* buys (still inside the latency window) so
+    the submit→land window accumulates real mids instead of resolving on a
+    single fallback print.
+    """
     if not exec_sim.ENABLED:
         return []
+    # Seed the land window while waiting, mirroring drain_pending_exits.
+    if fallback_price_fn is not None:
+        for pending in exec_sim.waiting_buys():
+            if not pending.mint:
+                continue
+            try:
+                fb = fallback_price_fn(pending.mint, pending.address)
+            except Exception:  # noqa: BLE001
+                fb = None
+            if fb and fb > 0:
+                exec_sim.observe(pending.mint, float(fb))
     filled: list[dict[str, Any]] = []
     for pending in exec_sim.due_buys():
         fb = None
@@ -650,7 +707,7 @@ def _book_close_locked(
     )
     _state.closed.append(pos)
     _state.open = [p for p in _state.open if p.id != pos.id]
-    record = {"event": "close", "position": asdict(pos)}
+    record = {"event": "close", **_lane_tag(), "position": asdict(pos)}
     try:
         decision_store.append("paper", record)
         from decision import scoreboard
@@ -833,7 +890,7 @@ def execute_signal(
         record = {
             "event": "open",
             "strategy": strategy,
-            "lane": active_lane(),
+            **_lane_tag(),
             "position": asdict(pos),
             "extra": extra or {},
         }
@@ -924,7 +981,7 @@ def _materialize_pending_buy(
         record = {
             "event": "open",
             "strategy": pending.strategy,
-            "lane": active_lane(),
+            **_lane_tag(),
             "position": asdict(pos),
             "extra": extra,
         }
@@ -1000,7 +1057,7 @@ def _close_by_mint_in_lane(*, mint: str, mark_price: float, reason: str) -> list
             _note_symbol_close(pos.name)
             _state.closed.append(pos)
             try:
-                decision_store.append("paper", {"event": "close", "position": asdict(pos)})
+                decision_store.append("paper", {"event": "close", **_lane_tag(), "position": asdict(pos)})
             except OSError:
                 pass
             pipeline_log.emit(
@@ -1310,6 +1367,7 @@ def _execute_decision_inner(
             "event": "open",
             "add_on": add_on,
             "open_lots_for_address": len(already) + 1,
+            **_lane_tag(),
             "position": asdict(pos),
             "card_summary": card.summary(),
         }
@@ -1549,7 +1607,7 @@ def mark_and_maybe_exit(
                 )
             )
             _state.closed.append(pos)
-            record = {"event": "close", "position": asdict(pos)}
+            record = {"event": "close", **_lane_tag(), "position": asdict(pos)}
             try:
                 decision_store.append("paper", record)
                 from decision import scoreboard
@@ -1698,12 +1756,29 @@ def _resolve_stop_exit(
         barrier = mark_price
 
     if STOP_FILL_MODE == "mark":
-        floor = -pos.size_usd * (MAX_LOSS_PCT / 100.0)
-        pnl = max(mark_pnl, floor)
-        if pnl > mark_pnl + 1e-9:
-            # Circuit breaker: gap exceeded max loss %.
-            exit_price = pos.entry_price * (1.0 + exit_cost_frac + pnl / max(pos.size_usd, 1e-9))
-            return exit_price, pnl, f"stop_loss ${pnl:.2f} (gap capped; mark was ${mark_pnl:.2f})"
+        # Only cap a stop-out gap when MAX_LOSS_PCT is a real fraction (0 < x < 100).
+        # 0 or >=100 means "honest": book the full mark, rug and all.
+        cap_on = 0.0 < MAX_LOSS_PCT < 100.0
+        if cap_on:
+            floor = -pos.size_usd * (MAX_LOSS_PCT / 100.0)
+            if mark_pnl < floor:
+                # Gap exceeded the cap. Ghost wick or real rug? Book the full
+                # mark only on positive confirmation; otherwise cap.
+                confirmed, evidence = _rug_confirmed(pos, mark_price)
+                if confirmed:
+                    return (
+                        mark_price,
+                        mark_pnl,
+                        f"stop_loss ${mark_pnl:.2f} (confirmed rug: {evidence})",
+                    )
+                exit_price = pos.entry_price * (
+                    1.0 + exit_cost_frac + floor / max(pos.size_usd, 1e-9)
+                )
+                return (
+                    exit_price,
+                    floor,
+                    f"stop_loss ${floor:.2f} (gap capped; {evidence}; mark was ${mark_pnl:.2f})",
+                )
         return mark_price, mark_pnl, f"stop_loss ${mark_pnl:.2f}"
 
     # Default: barrier fill. Report what the mark would have done.
@@ -1712,6 +1787,28 @@ def _resolve_stop_exit(
         -stop,
         f"stop_loss $-{stop:.2f} (barrier; mark would be ${mark_pnl:.2f})",
     )
+
+
+def _rug_confirmed(pos: PaperPosition, mark_price: float) -> tuple[bool, str]:
+    """Positive confirmation that a gapped mark is a real on-chain dump.
+
+    Fail-closed: any failure to confirm (network error, no key, no signal)
+    returns ``(False, reason)``, so the caller caps instead of booking a ghost
+    wick as a full loss.
+    """
+    try:
+        from decision import rug_detect
+    except Exception:  # noqa: BLE001
+        return False, "rug_detect unavailable"
+    try:
+        res = rug_detect.confirmed_rug(
+            mint=str(pos.mint or ""),
+            pool=str(pos.address or ""),
+            gapped_price=float(mark_price),
+        )
+    except Exception as exc:  # noqa: BLE001
+        return False, f"rug_detect error {type(exc).__name__}"
+    return bool(res.get("confirmed")), str(res.get("evidence") or "no evidence")
 
 
 def _implied_exit_price(pos: PaperPosition, pnl: float, exit_cost_frac: float) -> float:

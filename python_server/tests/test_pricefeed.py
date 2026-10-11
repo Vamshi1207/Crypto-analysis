@@ -9,7 +9,10 @@ from decision import pricefeed
 
 def _seed(mint: str, prices: list[float], *, step: float = 5.0) -> None:
     pricefeed.track(mint=mint, pool="Pool1", symbol="MEME")
-    base = time.time() - step * len(prices)
+    # Floor the base to a minute boundary so the seeded samples can never
+    # straddle a "1" (60s) bucket — otherwise the timeframe tests flip on the
+    # wall clock's position inside the minute.
+    base = (time.time() // 60) * 60 - step * len(prices)
     with pricefeed._lock:  # noqa: SLF001 - direct seed keeps the test off the network
         row = pricefeed._tracks[mint]  # noqa: SLF001
         row.samples.clear()

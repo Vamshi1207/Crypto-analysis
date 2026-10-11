@@ -6,7 +6,8 @@ import time
 
 import pytest
 
-from decision import discover, ohlcv_remote, paper
+from decision import ohlcv_remote, paper
+from decision.engines.finder import discover
 from decision.config import WRAPPED_SOL_MINT
 from decision.schema import SafetyReport, SafetyVerdict
 

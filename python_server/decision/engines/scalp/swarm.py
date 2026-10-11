@@ -23,7 +23,7 @@ DECIDE_OBSERVE = os.getenv("SWARM_DECIDE_OBSERVE", "1").strip() == "1"
 RUN_SAFETY = os.getenv("SWARM_RUN_SAFETY", "0" if paper_risk_on() else "1").strip() == "1"
 
 try:
-    from decision import discover as discover_mod
+    from decision.engines.finder import discover as discover_mod
 except Exception:  # pragma: no cover
     discover_mod = None  # type: ignore
 

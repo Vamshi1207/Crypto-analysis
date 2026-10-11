@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from decision import arb
+from decision.engines.arb import engine as arb
 from decision.config import WRAPPED_SOL_MINT
 
 
@@ -374,7 +374,7 @@ def test_round_trip_survives_list_quote(monkeypatch):
 
 
 def test_pick_tf_prefers_5s():
-    from decision.swarm import _pick_tf
+    from decision.engines.scalp.swarm import _pick_tf
 
     token = {
         "timeframes": {

@@ -27,11 +27,11 @@ from decision import paper
 from decision import pipeline_log
 from decision import pricefeed
 from decision import sizing as sizing_mod
-from decision import snipe_feed
-from decision.config import SETTINGS, WRAPPED_SOL_MINT, _env_float, _env_int
 from decision import labs
-from decision import snipe_desk
-from decision.pumpfun import (
+from decision.config import SETTINGS, SOL_USD_FALLBACK, WRAPPED_SOL_MINT, _env_float, _env_int
+from decision.engines.sniper import feed as snipe_feed
+from decision.engines.sniper import desk as snipe_desk
+from decision.engines.sniper.pumpfun import (
     CreatorBook,
     curve_gave_back,
     initial_price_usd,
@@ -76,9 +76,10 @@ CLUSTER_DEAD_SEC = _env_float("CLUSTER_DEAD_SEC", 0.0)
 CLUSTER_STOP_USD = _env_float("CLUSTER_STOP_USD", 0.0)
 # Require DexScreener 5m % change ≥ this before opening (0 = off).
 CLUSTER_MIN_M5_PCT = _env_float("CLUSTER_MIN_M5_PCT", 0.0)
-# Refuse parabolic blowoffs above this 5m % (0 = off). Backtest over 118
-# closes: m5>150% entries averaged -$16.4/trade (instant rugs); the edge
-# estimate (m5 minus costs) otherwise reads parabolas as attractive.
+# Refuse parabolic blowoffs above this 5m % (0 = off). Historical in-sample
+# note (not out-of-sample evidence): m5>150% entries averaged -$16.4/trade over
+# 118 closes (instant rugs); the edge estimate (m5 minus costs) otherwise reads
+# parabolas as attractive.
 CLUSTER_MAX_M5_PCT = _env_float("CLUSTER_MAX_M5_PCT", 150.0)
 # Copy-trading pilot: mirror tracked-leader buys as their own lane.
 # Leaders are watched wallets (CLUSTER_WALLETS); their sells already
@@ -755,11 +756,11 @@ def list_sniper_candidates() -> list[dict[str, Any]]:
 
 def _sol_usd() -> float:
     try:
-        from decision.arb import _estimate_sol_usd
+        from decision.engines.arb.engine import _estimate_sol_usd
 
         return float(_estimate_sol_usd())
     except Exception:  # noqa: BLE001
-        return 150.0
+        return float(SOL_USD_FALLBACK)
 
 
 def _ingest_pump_creates() -> int:
@@ -981,7 +982,11 @@ def _scan_sniper() -> tuple[int, int, int, int, list[dict[str, Any]]]:
             })
         else:
             skipped += 1
-    return added + len(_watches), opens, skipped, expired, hits
+    # ``added`` is the count of creates newly ingested this tick; ``len(_watches)``
+    # is surfaced separately via status()["sniper_watching"]. Do not add the two
+    # — the old ``added + len(_watches)`` double-counted still-watching mints
+    # every tick and made "sniper_seen" meaningless as a cumulative metric.
+    return added, opens, skipped, expired, hits
 
 
 def _snipe_hard_block(mint: str) -> tuple[bool, str]:

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
-from decision import arb, discover, paper, session
+from decision import paper, session
 from decision import store as decision_store
+from decision.engines.arb import engine as arb
+from decision.engines.finder import discover
 
 
 def test_archive_today_moves_jsonl(isolated_store):

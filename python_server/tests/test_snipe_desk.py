@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from decision import snipe_desk
+from decision.engines.sniper import desk as snipe_desk
 
 
 def _review(**kwargs):

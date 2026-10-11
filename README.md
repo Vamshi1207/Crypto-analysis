@@ -20,7 +20,7 @@ The crown jewel of the platform. Sniping requires sub-millisecond reactions with
 Instead of testing one set of parameters at a time, the platform spins up isolated parallel environments ("Lanes").
 - Each lane starts with its own isolated $1000 paper balance.
 - **Tight Tape, Wide Tape, Dollar Tape:** Various experimental configurations running side-by-side on the exact same token feed.
-- **The Master Book:** A consolidated strategy that dynamically inherits the most profitable parameters from all other active labs, providing a "best-of-the-best" equity curve visible directly on the Dashboard.
+- **The Master Book:** The parallel lane that has cleared the statistical gate (see "Validation", below). A lane is promoted only when, with frozen parameters and enough closed trades, its expectancy is significantly positive *out of sample* — not because it happened to print the highest PnL on the shared tape.
 
 ### 3. Scalping (AI Forecast / Swarm)
 Continuously pulls DexScreener/Gecko candidates, runs Gate 0 safety, hydrates candles into the live buffer, and executes standard technical analysis & machine-learning forecasts. 
@@ -41,7 +41,7 @@ Hunts for price-gap (buy low/sell high) opportunities across multiple DEX pools.
 | **Sitting cash** | Fake money not currently in a trade. |
 | **Profit locked in** | Wins/losses from trades already sold (fees included). |
 | **Open gain/loss** | If you sold open trades *right now*, roughly how much you’d be up/down. |
-| **Master Book** | The smartest parallel testing lane running our most proven sniper parameters. |
+| **Master Book** | The parallel lane that has cleared the out-of-sample significance gate (not just the one that looks best today). |
 | **Quick trade (scalp)** | Buy a coin, sell soon; aim for about **$1 net** on a ~$40 size after fees. |
 | **Expected edge** | Forecast upside **minus** fees. Positive is hopeful; it still must clear the ~$1 target. |
 | **Chart agree? (TA)** | Do RSI/MACD-style signals support a buy, or fight it? |
@@ -95,6 +95,30 @@ Cheap checks first; expensive ones later:
 | Indicators | Chart agree? | Block buys that fight the tape. |
 | Gate 3 | Risk / vibe | Skip blow-offs and messy disagreement. |
 | Phase 4 | Paper execute | Fake buy/sell with stops, take-profit, cool-downs. |
+
+---
+
+## Validation (how results get trusted)
+
+The parallel labs exist to answer one question with evidence: does a *frozen* lane
+config have positive expectancy **out of sample**? The rules that keep the answer
+honest:
+
+- **Frozen parameters.** Lane configs are hashed (`decision/labs.lane_config_hash`)
+  and recorded in `experiments.json`. Every paper open/close is tagged with its
+  lane + config hash in the store. Editing a lane changes its hash, so results can
+  never be silently re-attributed to a differently-tuned lane.
+- **Forward-only.** A lane is only promoted once it clears the gate in
+  `decision/validation.py` on tape recorded *after* the config was frozen:
+  enough closed trades (`n ≥ 30`), positive expectancy, and a t-statistic that
+  clears `z_crit` at `α=0.05`.
+- **Selection bias is the bug.** Running many lanes on one tape and promoting the
+  best is multiple-comparisons overfitting, not evidence. The dashboard's "Master
+  Book" (`labs.primary_lane_id`) now promotes only a *statistically significant*
+  lane, never the one with the highest in-sample PnL or the most open lots.
+
+In-sample notes in code comments (e.g. "m5>150% averaged -$16/trade") are
+historical observations, not out-of-sample evidence; do not treat them as edge.
 
 ---
 

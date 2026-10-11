@@ -8,8 +8,8 @@ import pytest
 
 from decision import paper
 from decision import sizing as sizing_mod
-from decision import snipe_feed
 from decision import trenches
+from decision.engines.sniper import feed as snipe_feed
 from decision.config import WRAPPED_SOL_MINT
 
 

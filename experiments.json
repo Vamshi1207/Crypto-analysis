@@ -1,0 +1,50 @@
+{
+  "_comment": "Frozen lane parameters for the parallel labs. Edit decision/labs.py SNIPE_LANES and these hashes change; the validation harness refuses to aggregate results across config hashes. Forward-only protocol: a lane is only promoted once it clears the significance gate (decision/validation.py) on tape recorded *after* this freeze.",
+  "frozen_at": "2026-10-11",
+  "lanes": [
+    {
+      "id": "hold",
+      "label": "Hold Book",
+      "config_hash": "06cdc2979ebbe262",
+      "params": {
+        "min_buyers": 3,
+        "min_lift_pct": 8.0,
+        "fast_lift_pct": 12.0,
+        "min_real_sol": 4.0,
+        "min_liq_usd": 600.0,
+        "size_usd": 40.0,
+        "stop_usd": 1.6,
+        "target_usd": 2.0,
+        "take_profit_pct": 0.0,
+        "max_hold_sec": 300.0,
+        "dead_after_sec": 0.0,
+        "abs_hold_sec": 300.0,
+        "bank_at_target": false,
+        "desk_percentile": 0.65,
+        "max_lift_pct": 40.0
+      }
+    },
+    {
+      "id": "snipe",
+      "label": "Scratch Book",
+      "config_hash": "bd11e656934bac01",
+      "params": {
+        "min_buyers": 2,
+        "min_lift_pct": 5.0,
+        "fast_lift_pct": 12.0,
+        "min_real_sol": 2.5,
+        "min_liq_usd": 400.0,
+        "size_usd": 20.0,
+        "stop_usd": 0.8,
+        "target_usd": 2.0,
+        "take_profit_pct": 40.0,
+        "max_hold_sec": 60.0,
+        "dead_after_sec": 8.0,
+        "abs_hold_sec": 120.0,
+        "bank_at_target": true,
+        "desk_percentile": 0.7,
+        "max_lift_pct": 40.0
+      }
+    }
+  ]
+}

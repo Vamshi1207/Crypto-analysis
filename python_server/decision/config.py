@@ -25,6 +25,11 @@ def _env_int(name: str, default: int) -> int:
     return int(_env_float(name, default))
 
 
+# Fallback SOL/USD when DexScreener cannot price WSOL. Single source of truth
+# for both the arb engine and the trenches sniper (formerly 140 vs 150).
+SOL_USD_FALLBACK = _env_float("SOL_USD_FALLBACK", 140.0)
+
+
 def paper_risk_on() -> bool:
     """Paper-only: take more trades so we learn the real drawdown.
 
@@ -100,10 +105,6 @@ class Settings:
             old_idx = self._helius_idx
             self._helius_idx = (self._helius_idx + 1) % len(self.helius_api_keys)
             print(f"[config] Rotated Helius key from idx {old_idx} to {self._helius_idx}")
-
-    @property
-    def using_public_rpc(self) -> bool:
-        return not self.helius_api_keys and not self.solana_rpc_url
 
 def load_settings() -> Settings:
     raw_keys = os.getenv("HELIUS_API_KEY", "").split(",")

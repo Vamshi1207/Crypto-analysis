@@ -16,7 +16,7 @@ DEFAULT_TAIL = _env_int("PACKET_OHLCV_TAIL", 256)
 
 def _est_round_trip_cost_pct(
     *,
-    slippage_bps: Optional[float],
+    slippage_bps: Optional[float] = None,
     price_impact_pct: Optional[float] = None,
 ) -> float:
     """All-in cost for a round trip, in percent of notional.
@@ -101,8 +101,10 @@ def packet_from_candles(
 
     snap = market or (safety.market if safety else MarketSnapshot())
     slip = None
+    impact_pct = None
     if safety and safety.sellability.price_impact_pct is not None:
-        slip = safety.sellability.price_impact_pct * 100.0  # pct → bps
+        impact_pct = safety.sellability.price_impact_pct
+        slip = impact_pct * 100.0  # percent → basis points for the packet field
 
     return MarketPacket(
         address=address,
@@ -115,7 +117,7 @@ def packet_from_candles(
         safety=safety,
         market=snap,
         est_slippage_bps=slip,
-        est_round_trip_cost_pct=_est_round_trip_cost_pct(slippage_bps=slip),
+        est_round_trip_cost_pct=_est_round_trip_cost_pct(price_impact_pct=impact_pct),
         source=source,
     )
 

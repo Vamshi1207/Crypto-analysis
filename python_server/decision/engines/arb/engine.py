@@ -22,7 +22,7 @@ from decision import labs
 from decision import paper
 from decision import pipeline_log
 from decision import store as decision_store
-from decision.config import WRAPPED_SOL_MINT, _env_float, _env_int
+from decision.config import SOL_USD_FALLBACK as CONFIG_SOL_USD_FALLBACK, WRAPPED_SOL_MINT, _env_float, _env_int
 from decision.sources import (
     NoRouteError,
     SourceError,
@@ -78,7 +78,7 @@ MAX_JUPITER_IMPACT_PCT = _env_float("ARB_MAX_JUPITER_IMPACT_PCT", 3.0)
 JUPITER_IMPACT_LEGS = _env_float("ARB_JUPITER_IMPACT_LEGS", 2.0)
 # Also try SOL→mint Jupiter quote when we can price SOL.
 REQUIRE_BUY_ROUTE = os.getenv("ARB_REQUIRE_BUY_ROUTE", "1").strip() == "1"
-SOL_USD_FALLBACK = _env_float("ARB_SOL_USD_FALLBACK", 140.0)
+SOL_USD_FALLBACK = _env_float("ARB_SOL_USD_FALLBACK", CONFIG_SOL_USD_FALLBACK)
 # Quote Jupiter A→B→A on every mint, not only when Dex shows two pools.
 CIRCULAR_ENABLED = os.getenv("ARB_CIRCULAR", "1").strip() == "1"
 MAX_CIRCULAR_PER_TICK = _env_int("ARB_MAX_CIRCULAR_PER_TICK", 4)

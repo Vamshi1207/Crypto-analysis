@@ -8,8 +8,8 @@ import pytest
 
 from decision import labs
 from decision import paper
-from decision import snipe_feed
 from decision import trenches
+from decision.engines.sniper import feed as snipe_feed
 
 
 @pytest.fixture(autouse=True)
@@ -22,7 +22,7 @@ def test_primary_lane_is_the_hold_book_when_idle(monkeypatch):
     assert labs.primary_lane_id() == "hold"
 
 
-def test_primary_lane_prefers_open_lots_over_closed_pnl(monkeypatch):
+def test_primary_lane_prefers_significant_over_raw_pnl(monkeypatch):
     monkeypatch.setattr(labs, "ENABLED", True)
     monkeypatch.setattr(
         paper,
@@ -34,29 +34,61 @@ def test_primary_lane_prefers_open_lots_over_closed_pnl(monkeypatch):
                     "open_count": 0,
                     "closed_count": 5,
                     "realized_pnl_usd": 10.0,
+                    "significant": False,
                 },
                 {
                     "id": "cluster",
-                    "open_count": 2,
-                    "closed_count": 0,
-                    "realized_pnl_usd": 0.0,
+                    "open_count": 0,
+                    "closed_count": 30,
+                    "realized_pnl_usd": 4.0,
+                    "significant": True,
                 },
                 {
                     "id": "hold",
                     "open_count": 0,
                     "closed_count": 0,
                     "realized_pnl_usd": 0.0,
+                    "significant": False,
                 },
                 {
                     "id": "main",
                     "open_count": 1,
                     "closed_count": 0,
                     "realized_pnl_usd": 0.0,
+                    "significant": False,
                 },
             ]
         },
     )
+    # A high-PnL-but-insignificant lane must not beat a proven-significant one.
     assert labs.primary_lane_id() == "cluster"
+
+
+def test_primary_lane_falls_back_to_hold_when_none_significant(monkeypatch):
+    monkeypatch.setattr(labs, "ENABLED", True)
+    monkeypatch.setattr(
+        paper,
+        "lane_board",
+        lambda: {
+            "lanes": [
+                {
+                    "id": "snipe",
+                    "open_count": 0,
+                    "closed_count": 5,
+                    "realized_pnl_usd": 10.0,
+                    "significant": False,
+                },
+                {
+                    "id": "main",
+                    "open_count": 1,
+                    "closed_count": 0,
+                    "realized_pnl_usd": 0.0,
+                    "significant": False,
+                },
+            ]
+        },
+    )
+    assert labs.primary_lane_id() == "hold"
 
 
 def test_lane_books_do_not_share_cash():

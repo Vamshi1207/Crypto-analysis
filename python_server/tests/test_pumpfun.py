@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import base64
 
-from decision import pumpfun
+from decision.engines.sniper import pumpfun
 
 
 def test_parse_create_logs_reads_anchor_event():

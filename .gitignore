@@ -22,3 +22,12 @@ python_server/data/**
 !python_server/data/.gitkeep
 python_server/store/**
 !python_server/store/.gitkeep
+
+# Logs (runtime output; keep them out of the repo)
+logs.txt
+*.log
+logs/
+
+# Agent-harness / tooling artifacts (not trading code)
+.agents/
+skills-lock.json

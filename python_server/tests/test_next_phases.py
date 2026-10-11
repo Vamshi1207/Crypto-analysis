@@ -54,6 +54,61 @@ def test_mark_mode_still_gaps_but_caps_max_loss(monkeypatch):
     assert "gap capped" in (pos.get("close_reason") or "")
 
 
+def test_mark_mode_books_full_rug_when_cap_off(monkeypatch):
+    """MAX_LOSS_PCT=0 (default) must book the full mark, not hide a rug."""
+    monkeypatch.setattr(paper, "STOP_FILL_MODE", "mark")
+    monkeypatch.setattr(paper, "MAX_LOSS_PCT", 0.0)
+    card = _card(address="GapHonestPool", band=(-5.0, 8.0, 20.0))
+    opened = paper.execute_decision(card, mark_price=100.0)
+    assert opened["status"] == "opened"
+    size = opened["position"]["size_usd"]
+    entry = opened["position"]["entry_price"]
+
+    # -50% gap with the cap off: the booked PnL reflects the real mark.
+    closed = paper.mark_and_maybe_exit(address="GapHonestPool", mark_price=entry * 0.50)
+    assert closed
+    pos = closed[0]
+    assert pos["realized_pnl_usd"] < -size * 0.08
+    assert "gap capped" not in (pos.get("close_reason") or "")
+    assert "stop_loss" in (pos.get("close_reason") or "")
+
+
+def test_confirmed_rug_books_full_mark_past_cap(monkeypatch):
+    """A gapped stop that is confirmed on-chain books the full loss, not the cap."""
+    monkeypatch.setattr(paper, "STOP_FILL_MODE", "mark")
+    monkeypatch.setattr(paper, "MAX_LOSS_PCT", 8.0)
+    monkeypatch.setattr(paper, "_rug_confirmed", lambda pos, px: (True, "on-chain sells 1"))
+    card = _card(address="GapConfirmedPool", band=(-5.0, 8.0, 20.0))
+    opened = paper.execute_decision(card, mark_price=100.0)
+    assert opened["status"] == "opened"
+    size = opened["position"]["size_usd"]
+    entry = opened["position"]["entry_price"]
+
+    closed = paper.mark_and_maybe_exit(address="GapConfirmedPool", mark_price=entry * 0.50)
+    assert closed
+    pos = closed[0]
+    assert pos["realized_pnl_usd"] < -size * 0.08
+    assert "confirmed rug" in (pos.get("close_reason") or "")
+
+
+def test_unconfirmed_ghost_wick_caps(monkeypatch):
+    """An unconfirmed gapped mark is treated as a ghost wick and capped."""
+    monkeypatch.setattr(paper, "STOP_FILL_MODE", "mark")
+    monkeypatch.setattr(paper, "MAX_LOSS_PCT", 8.0)
+    monkeypatch.setattr(paper, "_rug_confirmed", lambda pos, px: (False, "unconfirmed"))
+    card = _card(address="GapGhostPool", band=(-5.0, 8.0, 20.0))
+    opened = paper.execute_decision(card, mark_price=100.0)
+    assert opened["status"] == "opened"
+    size = opened["position"]["size_usd"]
+    entry = opened["position"]["entry_price"]
+
+    closed = paper.mark_and_maybe_exit(address="GapGhostPool", mark_price=entry * 0.50)
+    assert closed
+    pos = closed[0]
+    assert pos["realized_pnl_usd"] >= -size * 0.08 - 0.01
+    assert "gap capped" in (pos.get("close_reason") or "")
+
+
 def test_add_on_allowed_when_analysis_buys_again(monkeypatch):
     monkeypatch.setattr(paper, "ALLOW_ADD_ON", True)
     monkeypatch.setattr(paper, "MAX_OPEN_POSITIONS", 5)

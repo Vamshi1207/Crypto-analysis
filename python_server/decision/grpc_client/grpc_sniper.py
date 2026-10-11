@@ -8,7 +8,7 @@ import os
 import base64
 from typing import Optional, Any
 from decision.grpc_client.stream import YellowstoneStream
-from decision.pumpfun import PUMP_PROGRAM, parse_create_event
+from decision.engines.sniper.pumpfun import PUMP_PROGRAM, parse_create_event
 from decision import fast_execute
 from decision import pipeline_log
 

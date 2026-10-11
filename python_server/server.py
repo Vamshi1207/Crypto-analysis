@@ -740,7 +740,7 @@ def swarm_endpoint():
     """Start/stop continuous decide→paper swarm over live token_data."""
     if request.method == "OPTIONS":
         return _build_cors_preflight_response()
-    from decision import swarm
+    from decision.engines.scalp import swarm
 
     if request.method == "GET":
         return jsonify(swarm.status())
@@ -765,7 +765,7 @@ def discover_endpoint():
     """Start/stop/force headless Solana discovery into token_data."""
     if request.method == "OPTIONS":
         return _build_cors_preflight_response()
-    from decision import discover
+    from decision.engines.finder import discover
 
     if request.method == "GET":
         return jsonify(discover.status())
@@ -893,7 +893,7 @@ def arb_endpoint():
     """Paper-only cross-pool quote arbitrage (parallel to directional swarm)."""
     if request.method == "OPTIONS":
         return _build_cors_preflight_response()
-    from decision import arb
+    from decision.engines.arb import engine as arb
 
     if request.method == "GET":
         return jsonify(arb.status())
@@ -1039,7 +1039,10 @@ def health():
     agy_status = agy_cli.preflight()
     from decision import forecast as forecast_mod
     from decision import calibrate as calibrate_mod
-    from decision import arb, discover, jev as jev_mod, paper, pipeline_log, pricefeed, swarm
+    from decision import jev as jev_mod, paper, pipeline_log, pricefeed
+    from decision.engines.arb import engine as arb
+    from decision.engines.finder import discover
+    from decision.engines.scalp import swarm
     from decision import trenches
     from decision import fill_audit
     from decision import session as decision_session
@@ -1179,7 +1182,10 @@ def _build_cors_preflight_response():
 
 def _configure_background_channels() -> None:
     """Bind discover + paper-arb to the shared live buffer; optionally auto-start."""
-    from decision import arb, discover, pricefeed, swarm, trenches
+    from decision import pricefeed, trenches
+    from decision.engines.arb import engine as arb
+    from decision.engines.finder import discover
+    from decision.engines.scalp import swarm
 
     def _set_token(address: str, token: dict) -> None:
         token_data[address] = token
@@ -1204,6 +1210,15 @@ def _configure_background_channels() -> None:
     if fill_audit.ENABLED:
         fill_audit.start()
         print("fill_audit: comparing paper closes to Dex/Gecko/Helius tape", flush=True)
+    from decision import paper as paper_mod
+
+    if paper_mod.exec_sim.ENABLED:
+        started = paper_mod.start_exec_resolver()
+        print(
+            f"exec_sim: resolver tick={started.get('tick_sec')}s "
+            f"latency={paper_mod.exec_sim.LATENCY_SEC}s",
+            flush=True,
+        )
     if os.getenv("SWARM_ENABLED", "0").strip() == "1":
         interval = float(os.getenv("SWARM_INTERVAL_SEC", "12") or 12)
         swarm_mode = (os.getenv("SWARM_MODE") or "fast").strip() or "fast"

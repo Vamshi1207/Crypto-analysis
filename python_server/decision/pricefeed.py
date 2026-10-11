@@ -232,11 +232,23 @@ def sample_once() -> dict[str, Any]:
                     row.last_volume_h24 = vol_h24
                 row.samples.append((now, price, bucket_vol))
                 sampled += 1
+            try:
+                from decision import paper as paper_mod
+
+                paper_mod.observe_mark(mint, float(price))
+            except Exception:  # noqa: BLE001
+                pass
 
     with _lock:
         _stats["ticks"] = int(_stats["ticks"]) + 1
         _stats["samples"] = int(_stats["samples"]) + sampled
         _stats["last_tick_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    try:
+        from decision import paper as paper_mod
+
+        paper_mod.drain_pending_buys()
+    except Exception:  # noqa: BLE001
+        pass
     return {"status": "ok", "sampled": sampled, "batches": batches, "tracked": len(mints)}
 
 

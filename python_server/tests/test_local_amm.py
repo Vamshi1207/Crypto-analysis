@@ -1,5 +1,5 @@
 import unittest
-from decision import local_amm
+from decision.engines.arb import amm as local_amm
 
 class TestLocalAMM(unittest.TestCase):
     def test_cpmm_math(self):
