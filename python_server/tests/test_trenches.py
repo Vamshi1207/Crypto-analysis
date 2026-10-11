@@ -7,6 +7,7 @@ import time
 import pytest
 
 from decision import paper
+from decision import sizing as sizing_mod
 from decision import snipe_feed
 from decision import trenches
 from decision.config import WRAPPED_SOL_MINT
@@ -401,7 +402,9 @@ def test_scan_sniper_buys_only_after_tape_lifts(monkeypatch, tmp_path):
     assert snap["open_count"] == 1
     pos = snap["open"][0]
     assert pos["entry_reason"] == "snipe"
-    assert pos["stop_loss_usd"] == trenches.SNIPER_STOP_USD
+    # Dynamic risk sizing: stop is sized from the tape, not the flat lane stop.
+    assert sizing_mod.MIN_RISK_USD <= pos["stop_loss_usd"] <= sizing_mod.MAX_RISK_USD
+    assert sizing_mod.MIN_SIZE_USD <= pos["size_usd"] <= sizing_mod.MAX_SIZE_USD
     assert pos["size_usd"] < trenches.SNIPER_SIZE_USD
     trenches.reset_counters()
     paper.reset()

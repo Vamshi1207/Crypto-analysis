@@ -11,6 +11,7 @@ from dataclasses import asdict, dataclass
 from typing import Any, Optional
 
 from decision import paper
+from decision import sizing as sizing_mod
 from decision.pumpfun import snipe_lift_pct
 from decision import snipe_desk
 
@@ -243,13 +244,24 @@ def consider_snipe(
     liq_usd = real_sol * sol_usd
     if liq_usd < lane.min_liq_usd:
         return None
-    size = snipe_desk.size_for(
+    flat_size = snipe_desk.size_for(
         lane.size_usd,
         desk,
         lift_pct=lift,
         unique_buyers=unique,
         real_sol=real_sol,
     )
+    plan = sizing_mod.plan_size(
+        strategy="snipe",
+        base_risk_usd=lane.stop_usd,
+        flat_size_usd=flat_size,
+        flat_stop_usd=lane.stop_usd,
+        liquidity_usd=liq_usd,
+        safety_score=None,
+        vol_proxy=lift / 100.0,
+        conviction_mult=min(desk.size_mult, 1.0),
+    )
+    size = plan.size_usd
     row = {
         "mint": mint,
         "pool": watch.get("pool") or mint,
@@ -277,7 +289,7 @@ def consider_snipe(
             take_profit_pct=lane.take_profit_pct,
             dead_after_sec=lane.dead_after_sec,
             abs_hold_sec=lane.abs_hold_sec,
-            stop_loss_usd=lane.stop_usd,
+            stop_loss_usd=plan.stop_usd,
         )
     if result.get("status") != "opened":
         return None
@@ -291,6 +303,8 @@ def consider_snipe(
         "lift_pct": round(lift, 2),
         "entry_why": desk.why,
         "size_usd": size,
+        "risk_usd": plan.risk_usd,
+        "size_why": plan.why,
         "desk": {
             "composite": desk.composite,
             "threshold": desk.threshold,

@@ -26,6 +26,7 @@ from typing import Any, Callable, Optional
 from decision import paper
 from decision import pipeline_log
 from decision import pricefeed
+from decision import sizing as sizing_mod
 from decision import snipe_feed
 from decision.config import SETTINGS, WRAPPED_SOL_MINT, _env_float, _env_int
 from decision import labs
@@ -154,6 +155,52 @@ def _snipe_proceed_ttl() -> float:
     if JEV_SNIPER_PROCEED_SEC > 0:
         return JEV_SNIPER_PROCEED_SEC
     return SNIPER_WATCH_SEC
+
+
+def _tape_conviction(lift_pct: float | None, buyers: int, real_sol: float = 0.0) -> float:
+    """Tape-strength conviction tier, mirroring the snipe_size steps."""
+    lift = lift_pct or 0.0
+    if lift >= 25.0 and buyers >= 4:
+        return 1.0
+    if lift >= 12.0 or buyers >= 3 or real_sol >= 5.0:
+        return 0.75
+    return 0.5
+
+
+def _m5_conviction(m5_pct: float | None) -> float:
+    if m5_pct is None:
+        return 0.6
+    if m5_pct >= 15.0:
+        return 1.0
+    if m5_pct >= 8.0:
+        return 0.75
+    return 0.5
+
+
+def _size_for_open(
+    *,
+    strategy: str,
+    base_risk_usd: float,
+    flat_size_usd: float,
+    flat_stop_usd: float | None,
+    row: dict[str, Any],
+    safety_report: Optional[Any],
+    vol_proxy: float,
+    conviction_mult: float,
+) -> Any:
+    """One shared risk model for every trenches lane (sizing.py)."""
+    score, impact = sizing_mod.report_features(safety_report)
+    return sizing_mod.plan_size(
+        strategy=strategy,
+        base_risk_usd=base_risk_usd,
+        flat_size_usd=flat_size_usd,
+        flat_stop_usd=flat_stop_usd,
+        liquidity_usd=row.get("liquidity_usd"),
+        price_impact_pct=impact,
+        safety_score=score,
+        vol_proxy=vol_proxy,
+        conviction_mult=conviction_mult,
+    )
 
 
 _jev_blocked: dict[str, float] = {}
@@ -524,15 +571,27 @@ def _scan(*, do_cluster: bool = True) -> dict[str, Any]:
                     reason=jev_reason,
                 )
                 continue
+        plan = _size_for_open(
+            strategy=strategy,
+            base_risk_usd=(
+                sizing_mod.RISK_CLUSTER_USD if is_cluster else sizing_mod.RISK_LAUNCH_USD
+            ),
+            flat_size_usd=size,
+            flat_stop_usd=stop_usd,
+            row=row,
+            safety_report=safety_report,
+            vol_proxy=abs(m5_pct or 0.0) / 100.0,
+            conviction_mult=_m5_conviction(m5_pct),
+        )
         with paper.use_lane(labs.trading_lane(strategy)):
             result = _open(
                 row,
                 strategy=strategy,
-                size=size,
+                size=plan.size_usd,
                 hold=hold,
-                extra={"buyers": buyers, "m5_pct": m5_pct},
+                extra={"buyers": buyers, "m5_pct": m5_pct, "risk_usd": plan.risk_usd},
                 dead_after_sec=dead,
-                stop_loss_usd=stop_usd,
+                stop_loss_usd=plan.stop_usd,
             )
         if result.get("status") in {"opened", "pending"}:
             _seen_mints.add(mint)
@@ -608,15 +667,25 @@ def _scan(*, do_cluster: bool = True) -> dict[str, Any]:
                 continue
             dead = COPY_DEAD_SEC if COPY_DEAD_SEC > 0 else None
             stop_usd = COPY_STOP_USD if COPY_STOP_USD > 0 else None
+            plan = _size_for_open(
+                strategy="copy",
+                base_risk_usd=sizing_mod.RISK_COPY_USD,
+                flat_size_usd=COPY_SIZE_USD,
+                flat_stop_usd=stop_usd,
+                row=row,
+                safety_report=safety_report,
+                vol_proxy=abs(m5_pct or 0.0) / 100.0,
+                conviction_mult=1.0 if len(leaders) >= 2 else 0.75,
+            )
             with paper.use_lane(labs.trading_lane("copy")):
                 result = _open(
                     row,
                     strategy="copy",
-                    size=COPY_SIZE_USD,
+                    size=plan.size_usd,
                     hold=COPY_MAX_HOLD_SEC,
-                    extra={"leaders": leaders, "m5_pct": m5_pct},
+                    extra={"leaders": leaders, "m5_pct": m5_pct, "risk_usd": plan.risk_usd},
                     dead_after_sec=dead,
-                    stop_loss_usd=stop_usd,
+                    stop_loss_usd=plan.stop_usd,
                 )
             if result.get("status") in {"opened", "pending"}:
                 _seen_mints.add(mint)
@@ -875,10 +944,20 @@ def _scan_sniper() -> tuple[int, int, int, int, list[dict[str, Any]]]:
                 reason=jev_reason, strategy="snipe",
             )
             continue
+        plan = _size_for_open(
+            strategy="snipe",
+            base_risk_usd=sizing_mod.RISK_SNIPE_USD,
+            flat_size_usd=size,
+            flat_stop_usd=SNIPER_STOP_USD,
+            row=row,
+            safety_report=None,
+            vol_proxy=lift / 100.0,
+            conviction_mult=_tape_conviction(lift, unique, real_sol),
+        )
         result = _open(
             row,
             strategy="snipe",
-            size=size,
+            size=plan.size_usd,
             hold=SNIPER_MAX_HOLD_SEC,
             confirm_dex=False,
             bank_at_target=True,
@@ -886,7 +965,7 @@ def _scan_sniper() -> tuple[int, int, int, int, list[dict[str, Any]]]:
             take_profit_pct=SNIPER_TARGET_PCT,
             dead_after_sec=SNIPER_DEAD_SEC,
             abs_hold_sec=SNIPER_ABS_HOLD_SEC,
-            stop_loss_usd=SNIPER_STOP_USD,
+            stop_loss_usd=plan.stop_usd,
         )
         if result.get("status") in {"opened", "pending"}:
             _seen_mints.add(mint)
