@@ -17,6 +17,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
+from decision.config import _env_float, _env_int
 from decision.engines.sniper.pumpfun import snipe_lift_pct, snipe_size, snipe_veto
 
 PEER_WINDOW = 80
@@ -24,21 +25,40 @@ WARMUP_N = 16
 # Risk floor: 1-buyer blowoffs and empty curves never clear the desk.
 MIN_UNIQUE = 3
 MIN_REAL_SOL = 2.5
-WARMUP_BUYERS = 4
-WARMUP_LIFT_PCT = 8.0
+# Env-tunable warmup floors + percentile bar. Defaults are deliberately looser
+# than the old hard-coded "top 30%": the desk now trades the top ~45–55% of
+# creates, which is still selective but no longer silently starves.
+WARMUP_BUYERS = _env_int("SNIPER_DESK_WARMUP_BUYERS", 3)
+WARMUP_LIFT_PCT = _env_float("SNIPER_DESK_WARMUP_LIFT_PCT", 6.0)
 WARMUP_MAX_LIFT_PCT = 35.0
-WARMUP_SOL = 4.0
+WARMUP_SOL = _env_float("SNIPER_DESK_WARMUP_SOL", 3.0)
 # Last session bought 50–104% rips (Soul, LUCK, DATBOI) and ate the creator dump.
 # Lift is a *late* signal on Pump; cap it and score a sweet spot instead.
 DEFAULT_MAX_LIFT_PCT = 40.0
 LOSING_MAX_LIFT_PCT = 30.0
-DEFAULT_PERCENTILE = 0.70
-STARVE_LOOSEN = 0.55
+DEFAULT_PERCENTILE = _env_float("SNIPER_DESK_PERCENTILE", 0.60)
+STARVE_LOOSEN = _env_float("SNIPER_DESK_STARVE_LOOSEN", 0.50)
 
 _lock = threading.Lock()
 _peers: deque[dict[str, float]] = deque(maxlen=PEER_WINDOW)
 _last_buy_at: float = 0.0
 _observes_since_buy: int = 0
+# Telemetry: why each create was (or was not) taken, plus the last few reviews.
+_outcomes: dict[str, int] = {}
+_recent_reviews: deque[dict[str, Any]] = deque(maxlen=200)
+
+
+def _note_outcome(why: str, composite: float, threshold: float) -> None:
+    with _lock:
+        _outcomes[why] = _outcomes.get(why, 0) + 1
+        _recent_reviews.append(
+            {
+                "why": why,
+                "composite": round(float(composite), 3),
+                "threshold": round(float(threshold), 3),
+                "ts": time.time(),
+            }
+        )
 
 
 @dataclass
@@ -58,6 +78,8 @@ def clear() -> None:
         _peers.clear()
         _last_buy_at = 0.0
         _observes_since_buy = 0
+        _outcomes.clear()
+        _recent_reviews.clear()
 
 
 def observe(
@@ -95,6 +117,8 @@ def status() -> dict[str, Any]:
         n = len(_peers)
         idle = _observes_since_buy
         last = _last_buy_at
+        outcomes = dict(_outcomes)
+        recent = list(_recent_reviews)[-20:]
     return {
         "peers": n,
         "warmup": n < WARMUP_N,
@@ -102,10 +126,19 @@ def status() -> dict[str, Any]:
         "threshold": round(_threshold(DEFAULT_PERCENTILE, idle), 4),
         "last_buy_at": last or None,
         "recent_ev_usd": _recent_ev(),
+        "outcomes": outcomes,
+        "recent_reviews": recent,
     }
 
 
-def review(
+def review(**kwargs: Any) -> DeskReview:
+    """Public entry: run the desk, then record the outcome for telemetry."""
+    result = _review_inner(**kwargs)
+    _note_outcome(result.why, result.composite, result.threshold)
+    return result
+
+
+def _review_inner(
     *,
     create_px: float,
     last_px: float,

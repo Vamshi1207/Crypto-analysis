@@ -13,6 +13,7 @@ from dataclasses import asdict, dataclass
 from typing import Any, Optional
 
 from decision import paper
+from decision import pipeline_log
 from decision import sizing as sizing_mod
 from decision.engines.sniper.pumpfun import snipe_lift_pct
 from decision.engines.sniper import desk as snipe_desk
@@ -56,7 +57,7 @@ class SnipeLane:
     dead_after_sec: float
     abs_hold_sec: float
     bank_at_target: bool = True
-    desk_percentile: float = 0.70
+    desk_percentile: float = 0.60
     max_lift_pct: float = 40.0
 
 
@@ -73,7 +74,7 @@ SNIPE_LANES: tuple[SnipeLane, ...] = (
         min_lift_pct=8.0,
         fast_lift_pct=12.0,
         min_real_sol=4.0,
-        min_liq_usd=600.0,
+        min_liq_usd=350.0,
         size_usd=40.0,
         stop_usd=1.60,
         target_usd=2.0,
@@ -82,7 +83,7 @@ SNIPE_LANES: tuple[SnipeLane, ...] = (
         dead_after_sec=0.0,
         abs_hold_sec=300.0,
         bank_at_target=False,
-        desk_percentile=0.65,
+        desk_percentile=0.55,
         max_lift_pct=40.0,
     ),
     SnipeLane(
@@ -93,7 +94,7 @@ SNIPE_LANES: tuple[SnipeLane, ...] = (
         min_lift_pct=5.0,
         fast_lift_pct=12.0,
         min_real_sol=2.5,
-        min_liq_usd=400.0,
+        min_liq_usd=300.0,
         size_usd=20.0,
         stop_usd=0.80,
         target_usd=2.0,
@@ -101,6 +102,7 @@ SNIPE_LANES: tuple[SnipeLane, ...] = (
         max_hold_sec=60.0,
         dead_after_sec=8.0,
         abs_hold_sec=120.0,
+        desk_percentile=0.60,
     ),
 )
 
@@ -259,6 +261,11 @@ def consider_snipe(
         return None
     liq_usd = real_sol * sol_usd
     if liq_usd < lane.min_liq_usd:
+        pipeline_log.emit(
+            "trenches", "skip", mint=mint, symbol=watch.get("symbol"),
+            reason=f"snipe_liq_low {liq_usd:.0f}<{lane.min_liq_usd:.0f}",
+            strategy="snipe", lane=lane.id, composite=desk.composite,
+        )
         return None
     flat_size = snipe_desk.size_for(
         lane.size_usd,
@@ -308,6 +315,11 @@ def consider_snipe(
             stop_loss_usd=plan.stop_usd,
         )
     if result.get("status") != "opened":
+        pipeline_log.emit(
+            "trenches", "skip", mint=mint, symbol=watch.get("symbol"),
+            reason=f"snipe_open_{result.get('status') or 'none'}: {result.get('reason') or ''}"[:200],
+            strategy="snipe", lane=lane.id, composite=desk.composite,
+        )
         return None
     note_seen(lane.id, mint)
     snipe_desk.note_fill()
